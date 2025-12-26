@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html dir="ltr" mozdisallowselectionprint="">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+  <meta name="google" content="notranslate">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge">
+  <title>PDF Viewer</title>
+  <link rel="stylesheet" href="pdf_viewer.css">
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <!-- optional: nếu load được thì textLayer dễ render hơn, còn không vẫn hiện PDF bình thường -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf_viewer.min.js"></script>
+
+  <style>
+    body { margin:0; padding:0; overflow:hidden; font-family:sans-serif; }
+    #outerContainer { width:100%; height:100vh; position:absolute; display:flex; flex-direction:column; }
+    #toolbarContainer { background:#f0f0f0; padding:10px; display:flex; gap:20px; border-bottom:1px solid #ccc; flex-wrap:wrap; }
+    #mainContainer { flex:1; overflow:auto; background:#e0e0e0; display:flex; justify-content:center; padding:10px; }
+    #viewer { background:transparent; }
+    .page { background:white; position:relative; margin-bottom:10px; border:1px solid #ccc; box-shadow:0 0 5px rgba(0,0,0,0.1); }
+
+    #toolbarLeft,#toolbarMiddle,#toolbarRight { display:flex; gap:10px; align-items:center; }
+    .toolbarButton, select, input { padding:5px 10px; border:1px solid #ccc; border-radius:3px; cursor:pointer; font-size:14px; }
+    .toolbarButton:hover { background:#e0e0e0; }
+    input[type="number"] { width: 60px; }
+
+    /* Text layer: không thấy chữ overlay nhưng vẫn select/copy */
+    .textLayer {
+      position: absolute;
+      left: 0;
+      top: 0;
+      z-index: 2;
+    }
+    
+    .textLayer span, .textLayer br { 
+      color: transparent;
+    }
+    
+    .textLayer ::selection { 
+      background: rgba(0,120,255,0.35); 
+    }
+
+    /* Highlight */
+    .vocab-highlight {
+      z-index: 10;
+      position: absolute;
+      background-color: rgba(255,230,0,0.35);
+      border: 1px solid rgba(200,180,0,0.5);
+      cursor: pointer;
+      transition: background-color 0.2s;
+      pointer-events: auto;
+    }
+    
+    .vocab-highlight:hover {
+      background-color: rgba(255,200,0,0.5);
+      border: 1px solid rgba(200,160,0,0.8);
+    }
+    
+    .vocab-tooltip {
+      position: fixed;
+      z-index: 9999;
+      background: white;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      padding: 8px 12px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+      font-size: 13px;
+      max-width: 250px;
+      white-space: normal;
+      word-wrap: break-word;
+    }
+    
+    .tooltip-word {
+      font-weight: bold;
+      margin-bottom: 4px;
+      color: #333;
+    }
+    
+    .tooltip-meaning {
+      color: #555;
+      margin-bottom: 3px;
+    }
+    
+    .tooltip-pronunciation {
+      color: #888;
+      font-size: 12px;
+      font-style: italic;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="outerContainer" class="hiddensplitter">
+    <div id="toolbarContainer">
+      <div id="toolbarLeft">
+        <button id="previous" class="toolbarButton pageUp" title="Previous Page" tabindex="1">&#10094;</button>
+        <div class="splitToolbarButton">
+          <input id="pageNumber" class="toolbarField pageNumber" type="number" title="Page" value="1" min="1" />
+        </div>
+        <button id="next" class="toolbarButton pageDown" title="Next Page" tabindex="2">&#10095;</button>
+      </div>
+
+      <div id="toolbarMiddle">
+        <button id="presentationMode" class="toolbarButton presentationMode" title="Presentation Mode"></button>
+        <button id="openFile" class="toolbarButton open" title="Open"></button>
+        <button id="print" class="toolbarButton print" title="Print"></button>
+        <button id="download" class="toolbarButton download" title="Download"></button>
+      </div>
+
+      <div id="toolbarRight">
+        <button id="scaleSelectContainer" class="scaleSelectContainer">
+          <select id="scaleSelect" title="Zoom">
+            <option value="auto">Automatic</option>
+            <option value="page-actual">Actual Size</option>
+            <option value="page-fit">Fit Page</option>
+            <option value="page-width">Fit Width</option>
+            <option value="page-height">Fit Height</option>
+            <option value="50">50%</option>
+            <option value="75">75%</option>
+            <option value="100">100%</option>
+            <option value="125">125%</option>
+            <option value="150" selected>150%</option>
+            <option value="200">200%</option>
+          </select>
+        </button>
+      </div>
+    </div>
+
+    <div id="mainContainer" class="container">
+      <div id="viewerContainer" tabindex="1">
+        <div id="viewer" class="pdfViewer"></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let pdfjsLib = null;
+    let pdfDoc = null;
+
+    let pageNum = 1;
+    let pageRendering = false;
+    let pageNumPending = null;
+
+    let zoomMode = "fixed";
+    let fixedScale = 1.5;
+
+    let currentHighlights = [];
+
+    function waitForPdfJs() {
+      if (window.pdfjsLib) {
+        pdfjsLib = window.pdfjsLib;
+        pdfjsLib.GlobalWorkerOptions.workerSrc =
+          "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+        return Promise.resolve();
+      }
+      return new Promise(resolve => setTimeout(() => waitForPdfJs().then(resolve), 100));
+    }
+
+    function computeScale(page) {
+      const base = page.getViewport({ scale: 1 });
+      const container = document.getElementById("viewerContainer");
+      const cw = Math.max(100, (container ? container.clientWidth : window.innerWidth) - 24);
+      const ch = Math.max(100, window.innerHeight - 130);
+
+      if (zoomMode === "page-actual") return 1;
+      if (zoomMode === "page-width") return cw / base.width;
+      if (zoomMode === "page-height") return ch / base.height;
+      if (zoomMode === "page-fit") return Math.min(cw / base.width, ch / base.height);
+      return fixedScale;
+    }
+
+    async function tryRenderTextLayer(page, viewport, textLayerDiv) {
+      try {
+        const textContent = await page.getTextContent();
+
+        // 1) Nếu có renderTextLayer (tuỳ build)
+        if (pdfjsLib && typeof pdfjsLib.renderTextLayer === "function") {
+          const task = pdfjsLib.renderTextLayer({
+            textContent,
+            container: textLayerDiv,
+            viewport,
+            textDivs: [],
+            enhanceTextSelection: true,
+          });
+          await (task.promise || task);
+          return true;
+        }
+
+        // 2) Nếu có TextLayerBuilder (từ pdf_viewer.min.js)
+        if (window.pdfjsViewer && window.pdfjsViewer.TextLayerBuilder) {
+          const eventBus = new window.pdfjsViewer.EventBus();
+          const tlb = new window.pdfjsViewer.TextLayerBuilder({
+            textLayerDiv,
+            pageIndex: (page.pageNumber ? page.pageNumber : 1) - 1,
+            viewport,
+            eventBus,
+          });
+          tlb.setTextContent(textContent);
+          await tlb.render();
+          return true;
+        }
+
+        return false;
+      } catch (e) {
+        console.warn("Text layer render failed:", e);
+        return false;
+      }
+    }
+
+    function clearViewer() {
+      document.getElementById("viewer").innerHTML = "";
+    }
+
+    function renderHighlightsForPage(pageDiv, pageNumber) {
+      pageDiv.querySelectorAll(".vocab-highlight").forEach(el => el.remove());
+
+      const list = currentHighlights.filter(h => h.pageNumber === pageNumber);
+      console.log('[RENDER HIGHLIGHTS] pageNumber =', pageNumber, 'highlights count =', list.length);
+      
+      list.forEach(hl => {
+        console.log('[RENDER HIGHLIGHTS] highlight:', {
+          wordKey: hl.wordKey,
+          meaning: hl.meaning,
+          pronunciation: hl.pronunciation,
+          rectsCount: (hl.rects || []).length
+        });
+        (hl.rects || []).forEach(rect => {
+          const d = document.createElement("div");
+          d.className = "vocab-highlight";
+          d.dataset.wordKey = hl.wordKey || "";
+          d.dataset.word = hl.text || "";
+          d.dataset.meaning = hl.meaning || "";
+          d.dataset.pronunciation = hl.pronunciation || "";
+
+          d.style.left = (rect.xPct * 100) + "%";
+          d.style.top = (rect.yPct * 100) + "%";
+          d.style.width = (rect.wPct * 100) + "%";
+          d.style.height = (rect.hPct * 100) + "%";
+
+          // ===== Tooltip =====
+          d.addEventListener("mouseenter", function () {
+            // Xoá tooltip cũ nếu còn
+            document.querySelectorAll(".vocab-tooltip").forEach(el => el.remove());
+
+            const word = this.dataset.word || this.dataset.wordKey || "";
+            const meaning = this.dataset.meaning || "";
+            const pronunciation = this.dataset.pronunciation || "";
+
+            // Tooltip luôn hiện: có nghĩa thì hiện nghĩa, không có thì vẫn hiện word
+            const tooltip = document.createElement("div");
+            tooltip.className = "vocab-tooltip";
+            tooltip.innerHTML = `
+              ${word ? `<div class="tooltip-word">${word}</div>` : ""}
+              ${meaning ? `<div class="tooltip-meaning">${meaning}</div>` : `<div class="tooltip-meaning">(chưa có nghĩa)</div>`}
+              ${pronunciation ? `<div class="tooltip-pronunciation">${pronunciation}</div>` : ""}
+            `;
+
+            document.body.appendChild(tooltip);
+
+            // Tính vị trí sau khi đã append (để có kích thước thật)
+            const targetRect = this.getBoundingClientRect();
+            const tipRect = tooltip.getBoundingClientRect();
+
+            // Ưu tiên nằm bên trên
+            let left = targetRect.left + targetRect.width / 2 - tipRect.width / 2;
+            let top = targetRect.top - tipRect.height - 8;
+
+            // Nếu bị vượt lên trên màn hình thì chuyển xuống dưới
+            if (top < 6) {
+              top = targetRect.bottom + 8;
+            }
+
+            // Kẹp trong viewport theo chiều ngang
+            left = Math.max(6, Math.min(left, window.innerWidth - tipRect.width - 6));
+
+            tooltip.style.left = `${left}px`;
+            tooltip.style.top = `${top}px`;
+
+            this._tooltip = tooltip;
+          });
+
+          d.addEventListener("mouseleave", function () {
+            if (this._tooltip) {
+              this._tooltip.remove();
+              this._tooltip = null;
+            }
+          });
+          // ===== /Tooltip =====
+
+          pageDiv.appendChild(d);
+        });
+      });
+    }
+
+    async function renderPage(num) {
+      pageRendering = true;
+
+      const page = await pdfDoc.getPage(num);
+      const scale = computeScale(page);
+      const viewport = page.getViewport({ scale });
+
+      clearViewer();
+
+      const viewer = document.getElementById("viewer");
+
+      const pageDiv = document.createElement("div");
+      pageDiv.className = "page";
+      pageDiv.setAttribute("data-page-number", num);
+      pageDiv.style.width = viewport.width + "px";
+      pageDiv.style.height = viewport.height + "px";
+      
+      // ===== FIX: Set CSS variable --scale-factor =====
+      pageDiv.style.setProperty('--scale-factor', scale);
+      // ===== END FIX =====
+
+      const canvas = document.createElement("canvas");
+      canvas.style.position = "absolute";
+      canvas.style.left = "0";
+      canvas.style.top = "0";
+      canvas.style.zIndex = "1";
+      canvas.style.width = viewport.width + "px";
+      canvas.style.height = viewport.height + "px";
+
+      const ctx = canvas.getContext("2d");
+
+      const outputScale = window.devicePixelRatio || 1;
+      canvas.width = Math.floor(viewport.width * outputScale);
+      canvas.height = Math.floor(viewport.height * outputScale);
+
+      const transform = outputScale !== 1 ? [outputScale, 0, 0, outputScale, 0, 0] : null;
+
+      pageDiv.appendChild(canvas);
+
+      const textLayerDiv = document.createElement("div");
+      textLayerDiv.className = "textLayer";
+      textLayerDiv.style.width = viewport.width + "px";
+      textLayerDiv.style.height = viewport.height + "px";
+
+      pageDiv.appendChild(textLayerDiv);
+      viewer.appendChild(pageDiv);
+
+      await page.render({ canvasContext: ctx, viewport, transform }).promise;
+      await tryRenderTextLayer(page, viewport, textLayerDiv);
+
+      renderHighlightsForPage(pageDiv, num);
+
+      // Notify parent that page is rendered
+      window.parent.postMessage({ type: "PDF_PAGE_RENDERED", pageNumber: num }, "*");
+
+      pageRendering = false;
+      if (pageNumPending !== null) {
+        const next = pageNumPending;
+        pageNumPending = null;
+        renderPage(next);
+      }
+    }
+
+    function queuePage(num) {
+      if (pageRendering) pageNumPending = num;
+      else renderPage(num);
+    }
+
+    document.getElementById("previous").addEventListener("click", function () {
+      if (!pdfDoc || pageNum <= 1) return;
+      pageNum--;
+      document.getElementById("pageNumber").value = pageNum;
+      queuePage(pageNum);
+    });
+
+    document.getElementById("next").addEventListener("click", function () {
+      if (!pdfDoc || pageNum >= pdfDoc.numPages) return;
+      pageNum++;
+      document.getElementById("pageNumber").value = pageNum;
+      queuePage(pageNum);
+    });
+
+    document.getElementById("pageNumber").addEventListener("change", function () {
+      if (!pdfDoc) return;
+      const num = parseInt(this.value, 10);
+      if (num >= 1 && num <= pdfDoc.numPages) {
+        pageNum = num;
+        queuePage(pageNum);
+      }
+    });
+
+    document.getElementById("scaleSelect").addEventListener("change", function () {
+      const v = this.value;
+      if (v === "auto") zoomMode = "page-width";
+      else if (v === "page-actual" || v === "page-fit" || v === "page-width" || v === "page-height") zoomMode = v;
+      else {
+        const pct = parseInt(v, 10);
+        if (!Number.isNaN(pct)) {
+          zoomMode = "fixed";
+          fixedScale = pct / 100;
+        }
+      }
+      if (pdfDoc) queuePage(pageNum);
+    });
+
+    window.addEventListener("message", function (event) {
+      if (!event.data) return;
+
+      if (event.data.type === "PDF_GO_TO_PAGE" && pdfDoc) {
+        const num = parseInt(event.data.pageNumber, 10);
+        if (num >= 1 && num <= pdfDoc.numPages) {
+          pageNum = num;
+          document.getElementById("pageNumber").value = num;
+          queuePage(pageNum);
+        }
+      }
+
+      if (event.data.type === "PDF_OPEN_BYTES" && event.data.bytes) {
+        waitForPdfJs().then(function () {
+          const uint8Array = new Uint8Array(event.data.bytes);
+          pdfjsLib.getDocument({ data: uint8Array }).promise.then(function (doc) {
+            pdfDoc = doc;
+            pageNum = 1;
+            const input = document.getElementById("pageNumber");
+            input.value = pageNum;
+            input.max = String(pdfDoc.numPages);
+            queuePage(pageNum);
+          }).catch(err => {
+            console.error("Failed to load PDF:", err);
+          });
+        });
+      }
+
+      if (event.data.type === "PDF_SET_HIGHLIGHTS") {
+        currentHighlights = event.data.highlights || [];
+        const pageDiv = document.querySelector('.page[data-page-number="' + pageNum + '"]');
+        if (pageDiv) renderHighlightsForPage(pageDiv, pageNum);
+      }
+    });
+
+    document.addEventListener("mouseup", function () {
+      const selection = window.getSelection();
+      if (!selection) return;
+
+      const text = selection.toString().trim();
+      if (!text) return;
+
+      try {
+        if (selection.rangeCount === 0) return;
+
+        const range = selection.getRangeAt(0);
+        
+        // Tìm pageDiv từ selection
+        const commonAncestor = range.commonAncestorContainer;
+        const pageDiv = commonAncestor.nodeType === 3
+          ? commonAncestor.parentElement && commonAncestor.parentElement.closest(".page")
+          : commonAncestor.closest && commonAncestor.closest(".page");
+
+        if (!pageDiv) return;
+
+        const pageNumber = parseInt(pageDiv.getAttribute("data-page-number") || "0", 10);
+        if (!pageNumber) return;
+
+        // Lấy tọa độ của pageDiv (container chính)
+        const pageRect = pageDiv.getBoundingClientRect();
+        if (pageRect.width === 0 || pageRect.height === 0) return;
+
+        // Tạo một range mới và lấy rects từ đó
+        const rects = range.getClientRects();
+        if (!rects || rects.length === 0) return;
+
+        const pctRects = [];
+        for (let i = 0; i < rects.length; i++) {
+          const r = rects[i];
+          
+          // Tính toán phần trăm chính xác dựa trên pageDiv
+          // Trừ đi offset của pageDiv để có tọa độ tương đối
+          const xPct = (r.left - pageRect.left) / pageRect.width;
+          const yPct = (r.top - pageRect.top) / pageRect.height;
+          const wPct = r.width / pageRect.width;
+          const hPct = r.height / pageRect.height;
+          
+          // Chỉ thêm rect nếu nó nằm trong bounds hợp lý
+          if (wPct > 0 && hPct > 0 && xPct >= -0.01 && xPct <= 1.01) {
+            pctRects.push({ 
+              xPct: Math.max(0, Math.min(1, xPct)),
+              yPct: Math.max(0, Math.min(1, yPct)),
+              wPct,
+              hPct 
+            });
+          }
+        }
+
+        if (pctRects.length > 0) {
+          window.parent.postMessage({ type: "PDF_SELECTION", text, pageNumber, rects: pctRects }, "*");
+        }
+      } catch (err) {
+        console.error("Error processing selection:", err);
+      }
+    });
+
+    window.parent.postMessage({ type: "PDF_VIEWER_READY" }, "*");
+  </script>
+</body>
+</html>

@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react'
+import ErrorBoundary from '../shared/ErrorBoundary'
 import { useLocation } from 'react-router-dom'
 
 declare const window:any
@@ -179,6 +180,21 @@ export default function Study(){
     setPhase((p)=> p === 'review-result' ? 'studying' : p)
   }
 
+  function quitStudy(){
+    try{
+      if (!window.confirm('Bạn có chắc muốn thoát trò chơi?')) return
+    }catch(e){ /* ignore in non-browser env */ }
+    setPhase('idle')
+    setQueue([])
+    setDeck([])
+    setIndex(0)
+    setRevealLevel(0)
+    setInput('')
+    setToReview([])
+    setLastAnswerCorrect(null)
+    setStats({ correct: 0, incorrect: 0, hard: 0, easy: 0 })
+  }
+
   // keyboard handling: enter submits; when in result, 1/2/3 map to choices
   useEffect(()=>{
     function onKey(e:KeyboardEvent){
@@ -214,7 +230,8 @@ export default function Study(){
   const allFiles = getAllFiles(tree)
 
   return (
-    <div>
+    <ErrorBoundary>
+      <div>
       <div className="mb-4">
         <div className="font-semibold">Select files to study</div>
         <div className="space-y-1 mt-2">
@@ -232,7 +249,10 @@ export default function Study(){
 
       {phase !== 'idle' && queue.length>0 && (
         <div className="p-4 border rounded w-full max-w-2xl">
-          <div className="text-sm text-gray-500 mb-2">Progress: {currentPos}/{totalToLearn}</div>
+          <div className="flex justify-between items-center mb-2">
+            <div className="text-sm text-gray-500">Progress: {currentPos}/{totalToLearn}</div>
+            <button className="px-2 py-1 bg-red-500 text-white rounded" onClick={quitStudy}>Thoát</button>
+          </div>
           <div className="text-sm text-gray-500">Meaning: {queue[index].meaning}</div>
 
           {phase === 'studying' && (
@@ -298,6 +318,7 @@ export default function Study(){
           )}
         </div>
       )}
-    </div>
+      </div>
+    </ErrorBoundary>
   )
 }

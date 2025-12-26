@@ -1,4 +1,5 @@
 import React, { useMemo, useState } from "react";
+import ErrorBoundary from './ErrorBoundary'
 import ChooseFileModal from "./ChooseFileModal";
 import {
   useReactTable,
@@ -33,6 +34,22 @@ export default function VocabTable({
   const [selected, setSelected] = useState<Record<number, boolean>>({});
   const [showChooser, setShowChooser] = useState(false);
   const [chooserTree, setChooserTree] = useState<any[]>([]);
+  const [errorMessage, setErrorMessage] = useState<string>('')
+  const [wordFilter, setWordFilter] = useState<string>('')
+  const [meaningFilter, setMeaningFilter] = useState<string>('')
+
+  const filteredRows = useMemo(() => {
+    if (!rows || rows.length === 0) return []
+    const wf = (wordFilter || '').trim().toLowerCase()
+    const mf = (meaningFilter || '').trim().toLowerCase()
+    return rows.filter(r => {
+      const w = (r.word || '').toString().toLowerCase()
+      const m = (r.meaning || '').toString().toLowerCase()
+      if (wf && !w.includes(wf)) return false
+      if (mf && !m.includes(mf)) return false
+      return true
+    })
+  }, [rows, wordFilter, meaningFilter])
 
   const cols = useMemo<ColumnDef<VocabRow>[]>(
     () => [
@@ -80,8 +97,11 @@ export default function VocabTable({
     [selected, onDelete, onSpeak]
   );
 
+  // safe fallback in case HMR leaves `filteredRows` undefined for a moment
+  const safeRows = typeof filteredRows !== 'undefined' ? filteredRows : (rows || [])
+
   const table = useReactTable({
-    data: rows || [],
+    data: safeRows,
     columns: cols,
     getCoreRowModel: getCoreRowModel(),
   });
@@ -92,7 +112,8 @@ export default function VocabTable({
       .map(([k]) => Number(k));
 
     if (indices.length === 0) {
-      alert("Select rows");
+      setErrorMessage('Select rows')
+      setTimeout(() => setErrorMessage(''), 3000)
       return;
     }
 
@@ -113,7 +134,28 @@ export default function VocabTable({
   }
 
   return (
-    <div>
+    <ErrorBoundary>
+      <div>
+      <div className="mb-3 flex gap-2 items-center">
+        <input
+          className="border p-2 rounded text-sm flex-1"
+          placeholder="Search word..."
+          value={wordFilter}
+          onChange={(e)=>setWordFilter(e.target.value)}
+        />
+        <input
+          className="border p-2 rounded text-sm flex-1"
+          placeholder="Search meaning..."
+          value={meaningFilter}
+          onChange={(e)=>setMeaningFilter(e.target.value)}
+        />
+        <button className="px-3 py-1 bg-gray-200 rounded" onClick={() => { setWordFilter(''); setMeaningFilter('') }}>Clear</button>
+      </div>
+      {errorMessage && (
+        <div className="mt-2 p-2 bg-red-100 border border-red-300 rounded text-sm text-red-700">
+          {errorMessage}
+        </div>
+      )}
       <div className="mb-2 flex gap-2">
         <button
           className="px-2 py-1 bg-gray-200"
@@ -173,6 +215,7 @@ export default function VocabTable({
           ))}
         </tbody>
       </table>
-    </div>
+      </div>
+    </ErrorBoundary>
   );
 }

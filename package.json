@@ -4,6 +4,7 @@
   "private": true,
   "main": "src-electron/main.js",
   "scripts": {
+    "postinstall": "node scripts/copy-pdfjs-viewer.mjs",
     "dev": "concurrently \"vite\" \"wait-on http://localhost:5173 && cross-env ELECTRON_START_URL=http://localhost:5173 electron .\"",
     "build": "vite build && electron-builder",
     "preview": "vite preview"
@@ -11,6 +12,7 @@
   "dependencies": {
     "@tanstack/react-table": "^8.8.4",
     "papaparse": "^5.4.1",
+    "pdfjs-dist": "^3.11.174",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "react-router-dom": "^6.14.1"

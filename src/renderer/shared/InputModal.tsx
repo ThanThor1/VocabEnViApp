@@ -12,6 +12,7 @@ export default function InputModal({
   onConfirm: (value: string) => void;
 }) {
   const [value, setValue] = useState("");
+  const [errorMessage, setErrorMessage] = useState<string>('')
 
   useEffect(() => {
     setValue("");
@@ -19,7 +20,8 @@ export default function InputModal({
 
   function handleConfirm() {
     if (!value.trim()) {
-      alert("Please enter a value");
+      setErrorMessage('Please enter a value')
+      setTimeout(() => setErrorMessage(''), 3000)
       return;
     }
     onConfirm(value.trim());
@@ -35,6 +37,9 @@ export default function InputModal({
     <div className="fixed inset-0 flex items-center justify-center bg-black/40 z-50">
       <div className="bg-white p-6 w-96 rounded shadow-lg">
         <h3 className="font-semibold text-lg mb-4">{title}</h3>
+        {errorMessage && (
+          <div className="mb-2 p-2 bg-red-100 border border-red-300 rounded text-sm text-red-700">{errorMessage}</div>
+        )}
         <input
           type="text"
           placeholder={placeholder}

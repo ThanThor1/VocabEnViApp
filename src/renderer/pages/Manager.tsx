@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import ErrorBoundary from "../shared/ErrorBoundary";
+import { useNavigate, useLocation } from "react-router-dom";
 import VocabTable from "../shared/VocabTable";
 import ChooseFileModal from "../shared/ChooseFileModal";
 import InputModal from "../shared/InputModal";
@@ -20,6 +21,8 @@ export default function Manager() {
   const [currentFile, setCurrentFile] = useState<string | null>(null);
   const [rows, setRows] = useState<any[]>([]);
   const [showChoose, setShowChoose] = useState(false);
+  const [showPdfChooser, setShowPdfChooser] = useState(false);
+  const [pdfList, setPdfList] = useState<any[]>([]);
 
   const [word, setWord] = useState("");
   const [meaning, setMeaning] = useState("");
@@ -48,6 +51,7 @@ export default function Manager() {
   } | null>(null);
 
   const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set());
+  const [errorMessage, setErrorMessage] = useState<string>('');
 
   const api = window.api as
     | undefined
@@ -64,6 +68,9 @@ export default function Manager() {
         copyPath?: (srcRel: string, dstRel: string) => Promise<void>;
         movePath?: (srcRel: string, dstRel: string) => Promise<void>;
         renamePath?: (relPath: string, newName: string) => Promise<void>;
+        pdfDelete?: (pdfId: string) => Promise<void>;
+        pdfTrash?: (pdfId: string) => Promise<void>;
+        pdfRestore?: (pdfId: string) => Promise<void>;
       };
 
   async function loadTree() {
@@ -72,6 +79,16 @@ export default function Manager() {
     const t = await listTreeFn();
     setTree(t || []);
   }
+
+  // If navigated here with a selected file (e.g. from PDF panel), open it
+  const location = useLocation();
+  useEffect(() => {
+    const sel: any = (location && (location as any).state) || null;
+    if (sel && sel.selectFile) {
+      openFile(sel.selectFile).catch((e) => console.error(e));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   async function openFile(filePath: string) {
     const readCsv = api?.readCsv;
@@ -160,7 +177,8 @@ export default function Manager() {
       }
     } catch (err) {
       console.error("Error:", err);
-      alert(`Error: ${err instanceof Error ? err.message : String(err)}`);
+      setErrorMessage(`Error: ${err instanceof Error ? err.message : String(err)}`);
+      setTimeout(() => setErrorMessage(''), 5000);
     }
     setShowInputModal(false);
     setInputModalType(null);
@@ -274,6 +292,7 @@ export default function Manager() {
               <div className="text-xs text-gray-500">{item.type === "folder" ? "Folder" : "CSV File"}</div>
             </div>
           </div>
+
         ))}
       </div>
     );
@@ -281,10 +300,26 @@ export default function Manager() {
 
   async function handleDeleteNode(path: string, type: "folder" | "file") {
     try {
+      // Special-case for PDF folders (virtual PDF tree under 'pdf/<pdfId>')
+      if (type === 'folder' && path && path.startsWith('pdf/')) {
+        const pdfId = path.split('/')[1];
+        const pdfTrash = api?.pdfTrash || api?.pdfDelete;
+        if (!pdfTrash) {
+          setErrorMessage('API unavailable');
+          setTimeout(() => setErrorMessage(''), 5000);
+          return;
+        }
+        await pdfTrash(pdfId);
+        // If currentFile pointed inside Data/pdf, clear it
+        if (currentFile && currentFile.includes('/Data/pdf/')) setCurrentFile(null);
+        await loadTree();
+        return;
+      }
       if (type === "file") {
         const deleteFileFn = api?.deleteFile;
         if (!deleteFileFn) {
-          alert('API unavailable');
+          setErrorMessage('API unavailable');
+          setTimeout(() => setErrorMessage(''), 5000);
           return;
         }
         await deleteFileFn(path);
@@ -293,7 +328,8 @@ export default function Manager() {
       } else {
         const deleteFolderFn = api?.deleteFolder;
         if (!deleteFolderFn) {
-          alert('API unavailable');
+          setErrorMessage('API unavailable');
+          setTimeout(() => setErrorMessage(''), 5000);
           return;
         }
         await deleteFolderFn(path);
@@ -303,7 +339,8 @@ export default function Manager() {
       }
     } catch (err) {
       console.error("Error deleting:", err);
-      alert(`Error: ${err instanceof Error ? err.message : String(err)}`);
+      setErrorMessage(`Error: ${err instanceof Error ? err.message : String(err)}`);
+      setTimeout(() => setErrorMessage(''), 5000);
     }
   }
 
@@ -377,7 +414,8 @@ export default function Manager() {
       await loadTree();
     } catch (err) {
       console.error('Paste error', err);
-      alert(`Paste error: ${err instanceof Error ? err.message : String(err)}`);
+      setErrorMessage(`Paste error: ${err instanceof Error ? err.message : String(err)}`);
+      setTimeout(() => setErrorMessage(''), 5000);
     }
     clearContext();
   }
@@ -417,7 +455,8 @@ export default function Manager() {
       await loadTree();
     } catch (err) {
       console.error('Bulk delete error', err);
-      alert(`Error: ${err instanceof Error ? err.message : String(err)}`);
+      setErrorMessage(`Error: ${err instanceof Error ? err.message : String(err)}`);
+      setTimeout(() => setErrorMessage(''), 5000);
     }
   }
 
@@ -453,7 +492,8 @@ export default function Manager() {
     });
     
     if (filesToStudy.length === 0) {
-      alert('Please select at least one file to study');
+      setErrorMessage('Please select at least one file to study');
+      setTimeout(() => setErrorMessage(''), 3000);
       return;
     }
 
@@ -479,7 +519,8 @@ export default function Manager() {
   }
 
   return (
-    <div
+    <ErrorBoundary>
+      <div
       className="flex h-full bg-gray-50"
       onContextMenu={(e) => {
         e.preventDefault();
@@ -527,7 +568,8 @@ export default function Manager() {
               className="bg-blue-500 text-white px-3 py-1.5 rounded text-sm hover:bg-blue-600 transition whitespace-nowrap"
               onClick={async () => {
                 if (!word.trim() || !meaning.trim()) {
-                  alert("Please enter word + meaning");
+                  setErrorMessage("Please enter word + meaning");
+                  setTimeout(() => setErrorMessage(''), 3000);
                   return;
                 }
 
@@ -535,7 +577,8 @@ export default function Manager() {
                 if (currentFile) {
                   const addWord = api?.addWord;
                   if (!addWord) {
-                    alert('API unavailable');
+                    setErrorMessage('API unavailable');
+                    setTimeout(() => setErrorMessage(''), 5000);
                     return;
                   }
                   try {
@@ -551,7 +594,8 @@ export default function Manager() {
                     await openFile(currentFile);
                   } catch (err) {
                     console.error('Add word error', err);
-                    alert(`Error adding word: ${err instanceof Error ? err.message : String(err)}`);
+                    setErrorMessage(`Error adding word: ${err instanceof Error ? err.message : String(err)}`);
+                    setTimeout(() => setErrorMessage(''), 5000);
                   }
                 } else {
                   setShowChoose(true);
@@ -562,6 +606,11 @@ export default function Manager() {
               + Add
             </button>
           </div>
+          {errorMessage && (
+            <div className="mt-2 p-2 bg-red-100 border border-red-300 rounded text-sm text-red-700">
+              {errorMessage}
+            </div>
+          )}
 
           {currentFile ? (
             <div className="text-xs text-gray-500 truncate mt-2" title={currentFile}>
@@ -617,6 +666,50 @@ export default function Manager() {
         />
       )}
 
+      {showPdfChooser && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+          <div className="bg-white rounded shadow-lg w-96 p-4">
+            <div className="flex items-center justify-between mb-3">
+              <div className="font-semibold">Choose PDF Deck</div>
+              <button className="text-sm text-gray-500" onClick={() => setShowPdfChooser(false)}>Close</button>
+            </div>
+            <div className="max-h-64 overflow-y-auto">
+              {pdfList.length === 0 && <div className="text-sm text-gray-500">No PDFs found</div>}
+              {pdfList.map((p:any) => (
+                <div key={p.pdfId} className="flex items-center justify-between p-2 border-b">
+                  <div className="truncate mr-2">
+                    <div className="text-sm font-medium">{p.baseName}</div>
+                    <div className="text-xs text-gray-500">{p.deckCsvPath ? p.deckCsvPath.split(/[/\\]/).pop() : 'No deck'}</div>
+                  </div>
+                  <div className="flex-shrink-0 space-x-2">
+                    <button
+                      className="px-2 py-1 bg-blue-500 text-white text-xs rounded"
+                      onClick={async () => {
+                          if (!p.deckCsvPath) {
+                            setErrorMessage('No deck for this PDF');
+                            setTimeout(() => setErrorMessage(''), 3000);
+                            return;
+                          }
+                          await openFile(p.deckCsvPath);
+                          setShowPdfChooser(false);
+                        }}
+                    >Open Deck</button>
+                    <button
+                      className="px-2 py-1 bg-gray-200 text-xs rounded"
+                      onClick={async () => {
+                        // open PDF reader
+                        navigate('/pdf', { state: { openPdfId: p.pdfId } });
+                        setShowPdfChooser(false);
+                      }}
+                    >Open PDF</button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
       {showInputModal && (
         <InputModal
           title={inputModalTitle}
@@ -667,6 +760,7 @@ export default function Manager() {
           </div>
         </div>
       )}
-    </div>
+      </div>
+    </ErrorBoundary>
   );
 }

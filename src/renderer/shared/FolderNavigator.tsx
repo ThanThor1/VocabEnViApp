@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from "react";
+import ErrorBoundary from './ErrorBoundary'
 
 type TreeNode = {
   name: string;
@@ -117,7 +118,8 @@ export default function FolderNavigator({
   const breadcrumbs = getBreadcrumbs();
 
   return (
-    <div className="flex flex-col h-full">
+    <ErrorBoundary>
+      <div className="flex flex-col h-full">
       {/* Top Navigation Bar */}
       <div className="border-b bg-white p-3 flex items-center gap-2">
         <button
@@ -263,6 +265,7 @@ export default function FolderNavigator({
           </div>
         )}
       </div>
-    </div>
+      </div>
+    </ErrorBoundary>
   );
 }
