@@ -1,60 +1,66 @@
 <!DOCTYPE html>
-<html dir="ltr" mozdisallowselectionprint="">
+<html dir="ltr">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
   <meta name="google" content="notranslate">
   <meta http-equiv="X-UA-Compatible" content="IE=edge">
   <title>PDF Viewer</title>
-  <link rel="stylesheet" href="pdf_viewer.css">
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
-  <!-- optional: nếu load được thì textLayer dễ render hơn, còn không vẫn hiện PDF bình thường -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf_viewer.min.js"></script>
 
   <style>
     body { margin:0; padding:0; overflow:hidden; font-family:sans-serif; }
     #outerContainer { width:100%; height:100vh; position:absolute; display:flex; flex-direction:column; }
     #toolbarContainer { background:#f0f0f0; padding:10px; display:flex; gap:20px; border-bottom:1px solid #ccc; flex-wrap:wrap; }
-    #mainContainer { flex:1; overflow:auto; background:#e0e0e0; display:flex; justify-content:center; padding:10px; }
+    #mainContainer { flex:1; overflow:auto; background:#525659; display:flex; justify-content:center; padding:10px; }
     #viewer { background:transparent; }
-    .page { background:white; position:relative; margin-bottom:10px; border:1px solid #ccc; box-shadow:0 0 5px rgba(0,0,0,0.1); }
+    .page { background:white; position:relative; margin-bottom:15px; box-shadow:0 2px 8px rgba(0,0,0,0.3); }
 
     #toolbarLeft,#toolbarMiddle,#toolbarRight { display:flex; gap:10px; align-items:center; }
-    .toolbarButton, select, input { padding:5px 10px; border:1px solid #ccc; border-radius:3px; cursor:pointer; font-size:14px; }
+    .toolbarButton, select, input { padding:5px 10px; border:1px solid #ccc; border-radius:3px; cursor:pointer; font-size:14px; background:white; }
     .toolbarButton:hover { background:#e0e0e0; }
     input[type="number"] { width: 60px; }
 
-    /* Text layer: không thấy chữ overlay nhưng vẫn select/copy */
     .textLayer {
       position: absolute;
       left: 0;
       top: 0;
+      right: 0;
+      bottom: 0;
+      overflow: hidden;
+      opacity: 0.2;
+      line-height: 1.0;
       z-index: 2;
     }
     
-    .textLayer span, .textLayer br { 
+    .textLayer > span {
       color: transparent;
+      position: absolute;
+      white-space: pre;
+      cursor: text;
+      transform-origin: 0% 0%;
     }
     
     .textLayer ::selection { 
       background: rgba(0,120,255,0.35); 
     }
 
-    /* Highlight */
     .vocab-highlight {
       z-index: 10;
       position: absolute;
-      background-color: rgba(255,230,0,0.35);
-      border: 1px solid rgba(200,180,0,0.5);
+      background-color: rgba(255,235,59,0.4);
+      border: 1px solid rgba(251,192,45,0.6);
       cursor: pointer;
-      transition: background-color 0.2s;
+      transition: all 0.2s;
       pointer-events: auto;
     }
     
     .vocab-highlight:hover {
-      background-color: rgba(255,200,0,0.5);
-      border: 1px solid rgba(200,160,0,0.8);
+      background-color: rgba(255,213,79,0.5);
+      border: 1px solid rgba(251,192,45,0.9);
+      box-shadow: 0 0 8px rgba(251,192,45,0.5);
     }
     
     .vocab-tooltip {
@@ -87,65 +93,85 @@
       font-size: 12px;
       font-style: italic;
     }
+
+    #pageIndicator {
+      position: fixed;
+      right: 12px;
+      bottom: 12px;
+      background: rgba(0,0,0,0.7);
+      color: white;
+      padding: 8px 14px;
+      border-radius: 6px;
+      font-size: 14px;
+      z-index: 10000;
+      pointer-events: none;
+      font-family: monospace;
+    }
+    
+    /* Page placeholder for virtual scrolling */
+    .page-placeholder {
+      background: #e0e0e0;
+      position: relative;
+      margin-bottom: 15px;
+    }
   </style>
 </head>
 
 <body>
-  <div id="outerContainer" class="hiddensplitter">
+  <div id="outerContainer">
     <div id="toolbarContainer">
       <div id="toolbarLeft">
-        <button id="previous" class="toolbarButton pageUp" title="Previous Page" tabindex="1">&#10094;</button>
-        <div class="splitToolbarButton">
-          <input id="pageNumber" class="toolbarField pageNumber" type="number" title="Page" value="1" min="1" />
-        </div>
-        <button id="next" class="toolbarButton pageDown" title="Next Page" tabindex="2">&#10095;</button>
-      </div>
-
-      <div id="toolbarMiddle">
-        <button id="presentationMode" class="toolbarButton presentationMode" title="Presentation Mode"></button>
-        <button id="openFile" class="toolbarButton open" title="Open"></button>
-        <button id="print" class="toolbarButton print" title="Print"></button>
-        <button id="download" class="toolbarButton download" title="Download"></button>
+        <button id="previous" class="toolbarButton" title="Previous Page">◀</button>
+        <input id="pageNumber" type="number" title="Page" value="1" min="1" />
+        <span id="pageCount">/ 0</span>
+        <button id="next" class="toolbarButton" title="Next Page">▶</button>
       </div>
 
       <div id="toolbarRight">
-        <button id="scaleSelectContainer" class="scaleSelectContainer">
-          <select id="scaleSelect" title="Zoom">
-            <option value="auto">Automatic</option>
-            <option value="page-actual">Actual Size</option>
-            <option value="page-fit">Fit Page</option>
-            <option value="page-width">Fit Width</option>
-            <option value="page-height">Fit Height</option>
-            <option value="50">50%</option>
-            <option value="75">75%</option>
-            <option value="100">100%</option>
-            <option value="125">125%</option>
-            <option value="150" selected>150%</option>
-            <option value="200">200%</option>
-          </select>
-        </button>
+        <select id="scaleSelect" title="Zoom">
+          <option value="auto">Auto</option>
+          <option value="page-actual">100%</option>
+          <option value="page-width">Fit Width</option>
+          <option value="50">50%</option>
+          <option value="75">75%</option>
+          <option value="100">100%</option>
+          <option value="125">125%</option>
+          <option value="150" selected>150%</option>
+          <option value="200">200%</option>
+        </select>
       </div>
     </div>
 
-    <div id="mainContainer" class="container">
-      <div id="viewerContainer" tabindex="1">
-        <div id="viewer" class="pdfViewer"></div>
-      </div>
+    <div id="mainContainer">
+      <div id="viewer"></div>
     </div>
   </div>
+
+  <div id="pageIndicator">1 / 1</div>
 
   <script>
     let pdfjsLib = null;
     let pdfDoc = null;
-
     let pageNum = 1;
-    let pageRendering = false;
-    let pageNumPending = null;
-
     let zoomMode = "fixed";
     let fixedScale = 1.5;
-
     let currentHighlights = [];
+    let continuousScroll = true;
+    let pdfIdFromParent = null;
+    
+    // Virtual scrolling state
+    let renderedPages = new Set();
+    let pageHeights = new Map();
+    let estimatedPageHeight = 800;
+    
+    // Debounce/throttle timers
+    let selectionTimeout = null;
+    let pageUpdateTimer = null;
+    let isNavigating = false; // Chỉ dùng cho restore từ localStorage
+    
+    // Intersection Observer for real-time page tracking
+    let pageObserver = null;
+    let visiblePages = new Map(); // Map<pageNum, visibilityRatio>
 
     function waitForPdfJs() {
       if (window.pdfjsLib) {
@@ -157,14 +183,164 @@
       return new Promise(resolve => setTimeout(() => waitForPdfJs().then(resolve), 100));
     }
 
+    function updatePageIndicator() {
+      const indicator = document.getElementById('pageIndicator');
+      if (indicator && pdfDoc) {
+        indicator.textContent = `${pageNum} / ${pdfDoc.numPages}`;
+      }
+    }
+
+    function setCurrentPage(newPage, skipNotify) {
+      if (!pdfDoc) return;
+      
+      const clamped = Math.max(1, Math.min(newPage, pdfDoc.numPages));
+      if (clamped === pageNum) {
+        updatePageIndicator();
+        return;
+      }
+
+      pageNum = clamped;
+      
+      const input = document.getElementById('pageNumber');
+      if (input) input.value = pageNum;
+      
+      updatePageIndicator();
+
+      if (!skipNotify) {
+        // Lưu localStorage ngay lập tức
+        if (pdfIdFromParent) {
+          try {
+            localStorage.setItem('pdf_last_page_' + pdfIdFromParent, String(pageNum));
+            console.log('Saved page:', pageNum);
+          } catch (e) {
+            console.error('Failed to save page:', e);
+          }
+        }
+        
+        // Debounce chỉ cho notify parent
+        if (pageUpdateTimer) clearTimeout(pageUpdateTimer);
+        
+        pageUpdateTimer = setTimeout(() => {
+          window.parent.postMessage({ 
+            type: 'PDF_CURRENT_PAGE', 
+            pageNumber: pageNum, 
+            pdfId: pdfIdFromParent 
+          }, '*');
+        }, 200);
+      }
+    }
+
+    // ===== INTERSECTION OBSERVER - REAL-TIME PAGE TRACKING =====
+    
+    function setupPageObserver() {
+      // Cleanup observer cũ nếu có
+      if (pageObserver) {
+        pageObserver.disconnect();
+      }
+      
+      // CRITICAL: Clear visible pages cache
+      visiblePages.clear();
+      
+      const options = {
+        root: document.getElementById('mainContainer'),
+        rootMargin: '0px',
+        threshold: [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0] // More granular tracking
+      };
+      
+      pageObserver = new IntersectionObserver((entries) => {
+        // Bỏ qua nếu đang navigate (CHỈ cho restore từ localStorage)
+        if (isNavigating) return;
+        
+        entries.forEach(entry => {
+          const entryPageNum = parseInt(entry.target.getAttribute('data-page-number'), 10);
+          if (isNaN(entryPageNum)) return;
+          
+          if (entry.isIntersecting && entry.intersectionRatio > 0) {
+            visiblePages.set(entryPageNum, entry.intersectionRatio);
+          } else {
+            visiblePages.delete(entryPageNum);
+          }
+        });
+        
+        // Tìm page có visibility cao nhất
+        if (visiblePages.size > 0) {
+          let bestPage = null;
+          let bestRatio = 0;
+          
+          visiblePages.forEach((ratio, page) => {
+            if (ratio > bestRatio) {
+              bestRatio = ratio;
+              bestPage = page;
+            }
+          });
+          
+          // Chỉ update nếu tìm được page tốt hơn và khác page hiện tại
+          if (bestPage !== null && bestPage !== pageNum) {
+            setCurrentPage(bestPage);
+          }
+        }
+      }, options);
+    }
+    
+    function observePage(pageDiv) {
+      if (pageObserver && pageDiv) {
+        pageObserver.observe(pageDiv);
+      }
+    }
+    
+    function unobservePage(pageDiv) {
+      if (pageObserver && pageDiv) {
+        pageObserver.unobserve(pageDiv);
+      }
+    }
+
+    // ===== VIRTUAL SCROLLING - TÍNH TOÁN TRANG VISIBLE =====
+    
+    function getVisiblePageRange() {
+      if (!pdfDoc) return { first: 1, last: 1 };
+
+      const container = document.getElementById('mainContainer');
+      if (!container) return { first: pageNum, last: pageNum };
+
+      const scrollTop = container.scrollTop;
+      const viewportHeight = container.clientHeight;
+      
+      let accumulatedHeight = 0;
+      let firstVisible = 1;
+      let lastVisible = 1;
+      let foundFirst = false;
+
+      for (let i = 1; i <= pdfDoc.numPages; i++) {
+        const pageHeight = pageHeights.get(i) || estimatedPageHeight;
+        
+        if (!foundFirst && accumulatedHeight + pageHeight >= scrollTop) {
+          firstVisible = i;
+          foundFirst = true;
+        }
+        
+        if (accumulatedHeight <= scrollTop + viewportHeight) {
+          lastVisible = i;
+        }
+        
+        accumulatedHeight += pageHeight + 15; // 15 = margin-bottom
+        
+        if (accumulatedHeight > scrollTop + viewportHeight) break;
+      }
+
+      return { 
+        first: Math.max(1, firstVisible), 
+        last: Math.min(pdfDoc.numPages, lastVisible) 
+      };
+    }
+
     function computeScale(page) {
       const base = page.getViewport({ scale: 1 });
-      const container = document.getElementById("viewerContainer");
+      const container = document.getElementById("mainContainer");
       const cw = Math.max(100, (container ? container.clientWidth : window.innerWidth) - 24);
       const ch = Math.max(100, window.innerHeight - 130);
 
       if (zoomMode === "page-actual") return 1;
-      if (zoomMode === "page-width") return cw / base.width;
+      if (zoomMode === "page-width" || zoomMode === "auto") return cw / base.width;
       if (zoomMode === "page-height") return ch / base.height;
       if (zoomMode === "page-fit") return Math.min(cw / base.width, ch / base.height);
       return fixedScale;
@@ -174,25 +350,22 @@
       try {
         const textContent = await page.getTextContent();
 
-        // 1) Nếu có renderTextLayer (tuỳ build)
         if (pdfjsLib && typeof pdfjsLib.renderTextLayer === "function") {
           const task = pdfjsLib.renderTextLayer({
-            textContent,
+            textContentSource: textContent,
             container: textLayerDiv,
             viewport,
-            textDivs: [],
-            enhanceTextSelection: true,
+            textDivs: []
           });
           await (task.promise || task);
           return true;
         }
 
-        // 2) Nếu có TextLayerBuilder (từ pdf_viewer.min.js)
         if (window.pdfjsViewer && window.pdfjsViewer.TextLayerBuilder) {
           const eventBus = new window.pdfjsViewer.EventBus();
           const tlb = new window.pdfjsViewer.TextLayerBuilder({
             textLayerDiv,
-            pageIndex: (page.pageNumber ? page.pageNumber : 1) - 1,
+            pageIndex: page.pageNumber - 1,
             viewport,
             eventBus,
           });
@@ -208,23 +381,18 @@
       }
     }
 
-    function clearViewer() {
-      document.getElementById("viewer").innerHTML = "";
-    }
-
     function renderHighlightsForPage(pageDiv, pageNumber) {
+      // Chỉ render highlights cho pages đang visible
+      const rect = pageDiv.getBoundingClientRect();
+      if (rect.bottom < -100 || rect.top > window.innerHeight + 100) {
+        return; // Skip offscreen pages
+      }
+
       pageDiv.querySelectorAll(".vocab-highlight").forEach(el => el.remove());
 
       const list = currentHighlights.filter(h => h.pageNumber === pageNumber);
-      console.log('[RENDER HIGHLIGHTS] pageNumber =', pageNumber, 'highlights count =', list.length);
-      
+
       list.forEach(hl => {
-        console.log('[RENDER HIGHLIGHTS] highlight:', {
-          wordKey: hl.wordKey,
-          meaning: hl.meaning,
-          pronunciation: hl.pronunciation,
-          rectsCount: (hl.rects || []).length
-        });
         (hl.rects || []).forEach(rect => {
           const d = document.createElement("div");
           d.className = "vocab-highlight";
@@ -238,16 +406,13 @@
           d.style.width = (rect.wPct * 100) + "%";
           d.style.height = (rect.hPct * 100) + "%";
 
-          // ===== Tooltip =====
           d.addEventListener("mouseenter", function () {
-            // Xoá tooltip cũ nếu còn
             document.querySelectorAll(".vocab-tooltip").forEach(el => el.remove());
 
             const word = this.dataset.word || this.dataset.wordKey || "";
             const meaning = this.dataset.meaning || "";
             const pronunciation = this.dataset.pronunciation || "";
 
-            // Tooltip luôn hiện: có nghĩa thì hiện nghĩa, không có thì vẫn hiện word
             const tooltip = document.createElement("div");
             tooltip.className = "vocab-tooltip";
             tooltip.innerHTML = `
@@ -258,20 +423,16 @@
 
             document.body.appendChild(tooltip);
 
-            // Tính vị trí sau khi đã append (để có kích thước thật)
             const targetRect = this.getBoundingClientRect();
             const tipRect = tooltip.getBoundingClientRect();
 
-            // Ưu tiên nằm bên trên
             let left = targetRect.left + targetRect.width / 2 - tipRect.width / 2;
             let top = targetRect.top - tipRect.height - 8;
 
-            // Nếu bị vượt lên trên màn hình thì chuyển xuống dưới
             if (top < 6) {
               top = targetRect.bottom + 8;
             }
 
-            // Kẹp trong viewport theo chiều ngang
             left = Math.max(6, Math.min(left, window.innerWidth - tipRect.width - 6));
 
             tooltip.style.left = `${left}px`;
@@ -286,108 +447,220 @@
               this._tooltip = null;
             }
           });
-          // ===== /Tooltip =====
 
           pageDiv.appendChild(d);
         });
       });
     }
 
-    async function renderPage(num) {
-      pageRendering = true;
+    function clearViewer() {
+      document.getElementById("viewer").innerHTML = "";
+      renderedPages.clear();
+      pageHeights.clear();
+      visiblePages.clear();
+    }
 
-      const page = await pdfDoc.getPage(num);
-      const scale = computeScale(page);
-      const viewport = page.getViewport({ scale });
+    // ===== RENDER PAGE WITH VIRTUAL SCROLLING =====
+    
+    async function renderPage(num, pageDiv) {
+      if (!pdfDoc || num < 1 || num > pdfDoc.numPages) return;
+      if (renderedPages.has(num)) return; // Already rendered
 
-      clearViewer();
+      try {
+        const page = await pdfDoc.getPage(num);
+        const scale = computeScale(page);
+        const viewport = page.getViewport({ scale });
 
-      const viewer = document.getElementById("viewer");
+        // Update page div dimensions
+        pageDiv.style.width = viewport.width + "px";
+        pageDiv.style.height = viewport.height + "px";
+        pageDiv.className = "page";
+        pageDiv.setAttribute("data-page-number", num);
+        pageDiv.setAttribute('data-rendered', 'true');
+        
+        // CRITICAL: Set scale-factor CSS variable for text layer alignment
+        pageDiv.style.setProperty('--scale-factor', scale);
+        
+        // Store actual height
+        pageHeights.set(num, viewport.height);
 
-      const pageDiv = document.createElement("div");
-      pageDiv.className = "page";
-      pageDiv.setAttribute("data-page-number", num);
-      pageDiv.style.width = viewport.width + "px";
-      pageDiv.style.height = viewport.height + "px";
-      
-      // ===== FIX: Set CSS variable --scale-factor =====
-      pageDiv.style.setProperty('--scale-factor', scale);
-      // ===== END FIX =====
+        const canvas = document.createElement("canvas");
+        canvas.style.position = "absolute";
+        canvas.style.left = "0";
+        canvas.style.top = "0";
+        canvas.style.zIndex = "1";
+        canvas.style.width = viewport.width + "px";
+        canvas.style.height = viewport.height + "px";
 
-      const canvas = document.createElement("canvas");
-      canvas.style.position = "absolute";
-      canvas.style.left = "0";
-      canvas.style.top = "0";
-      canvas.style.zIndex = "1";
-      canvas.style.width = viewport.width + "px";
-      canvas.style.height = viewport.height + "px";
+        const ctx = canvas.getContext("2d");
 
-      const ctx = canvas.getContext("2d");
+        const outputScale = window.devicePixelRatio || 1;
+        canvas.width = Math.floor(viewport.width * outputScale);
+        canvas.height = Math.floor(viewport.height * outputScale);
 
-      const outputScale = window.devicePixelRatio || 1;
-      canvas.width = Math.floor(viewport.width * outputScale);
-      canvas.height = Math.floor(viewport.height * outputScale);
+        const transform = outputScale !== 1 ? [outputScale, 0, 0, outputScale, 0, 0] : null;
 
-      const transform = outputScale !== 1 ? [outputScale, 0, 0, outputScale, 0, 0] : null;
+        pageDiv.innerHTML = ''; // Clear placeholder content
+        pageDiv.appendChild(canvas);
 
-      pageDiv.appendChild(canvas);
+        const textLayerDiv = document.createElement("div");
+        textLayerDiv.className = "textLayer";
+        textLayerDiv.style.width = viewport.width + "px";
+        textLayerDiv.style.height = viewport.height + "px";
 
-      const textLayerDiv = document.createElement("div");
-      textLayerDiv.className = "textLayer";
-      textLayerDiv.style.width = viewport.width + "px";
-      textLayerDiv.style.height = viewport.height + "px";
+        pageDiv.appendChild(textLayerDiv);
 
-      pageDiv.appendChild(textLayerDiv);
-      viewer.appendChild(pageDiv);
+        await page.render({ canvasContext: ctx, viewport, transform }).promise;
+        await tryRenderTextLayer(page, viewport, textLayerDiv);
 
-      await page.render({ canvasContext: ctx, viewport, transform }).promise;
-      await tryRenderTextLayer(page, viewport, textLayerDiv);
+        renderHighlightsForPage(pageDiv, num);
+        
+        renderedPages.add(num);
+        
+        // Re-observe page sau khi render (vì DOM đã thay đổi)
+        observePage(pageDiv);
 
-      renderHighlightsForPage(pageDiv, num);
+        window.parent.postMessage({ type: "PDF_PAGE_RENDERED", pageNumber: num }, "*");
 
-      // Notify parent that page is rendered
-      window.parent.postMessage({ type: "PDF_PAGE_RENDERED", pageNumber: num }, "*");
-
-      pageRendering = false;
-      if (pageNumPending !== null) {
-        const next = pageNumPending;
-        pageNumPending = null;
-        renderPage(next);
+      } catch (error) {
+        console.error('Error rendering page', num, ':', error);
       }
     }
 
-    function queuePage(num) {
-      if (pageRendering) pageNumPending = num;
-      else renderPage(num);
+    // ===== VIRTUAL SCROLLING - SETUP PLACEHOLDERS =====
+    
+    async function setupVirtualScroll() {
+      if (!pdfDoc) return;
+      
+      clearViewer();
+      const viewer = document.getElementById("viewer");
+      
+      // Get first page to estimate dimensions
+      const firstPage = await pdfDoc.getPage(1);
+      const scale = computeScale(firstPage);
+      const viewport = firstPage.getViewport({ scale });
+      
+      estimatedPageHeight = viewport.height;
+      pageHeights.set(1, viewport.height);
+      
+      // Setup Intersection Observer
+      setupPageObserver();
+      
+      // Create placeholder divs for all pages
+      for (let i = 1; i <= pdfDoc.numPages; i++) {
+        const pageDiv = document.createElement("div");
+        pageDiv.className = "page-placeholder";
+        pageDiv.setAttribute("data-page-number", i);
+        pageDiv.style.width = viewport.width + "px";
+        pageDiv.style.height = estimatedPageHeight + "px";
+        pageDiv.style.setProperty('--scale-factor', scale);
+        viewer.appendChild(pageDiv);
+        
+        // Observe page để track visibility
+        observePage(pageDiv);
+      }
+      
+      // Render initial visible pages
+      await renderVisiblePages();
     }
 
+    // ===== RENDER VISIBLE PAGES =====
+    
+    async function renderVisiblePages() {
+      if (!pdfDoc) return;
+      
+      const { first, last } = getVisiblePageRange();
+      const buffer = 2; // Render 2 pages ahead/behind
+      
+      const startPage = Math.max(1, first - buffer);
+      const endPage = Math.min(pdfDoc.numPages, last + buffer);
+      
+      // Render visible + buffer pages
+      for (let i = startPage; i <= endPage; i++) {
+        if (!renderedPages.has(i)) {
+          const pageDiv = document.querySelector(`.page-placeholder[data-page-number="${i}"], .page[data-page-number="${i}"]`);
+          if (pageDiv) {
+            await renderPage(i, pageDiv);
+          }
+        }
+      }
+      
+      // Cleanup far offscreen pages to free memory
+      cleanupOffscreenPages(startPage - 5, endPage + 5);
+    }
+
+    function cleanupOffscreenPages(keepStart, keepEnd) {
+      const pagesToCleanup = [];
+      
+      renderedPages.forEach(pageNum => {
+        if (pageNum < keepStart || pageNum > keepEnd) {
+          pagesToCleanup.push(pageNum);
+        }
+      });
+      
+      pagesToCleanup.forEach(pageNum => {
+        const pageDiv = document.querySelector(`.page[data-page-number="${pageNum}"]`);
+        if (pageDiv && pageDiv.getAttribute('data-rendered') === 'true') {
+          // Convert back to placeholder
+          const height = pageHeights.get(pageNum) || estimatedPageHeight;
+          const width = pageDiv.style.width;
+          
+          pageDiv.innerHTML = '';
+          pageDiv.className = 'page-placeholder';
+          pageDiv.style.width = width;
+          pageDiv.style.height = height + "px";
+          pageDiv.removeAttribute('data-rendered');
+          
+          renderedPages.delete(pageNum);
+          
+          // Re-observe placeholder
+          observePage(pageDiv);
+        }
+      });
+    }
+
+    // ===== SIMPLE GO TO PAGE - KHÔNG dùng isNavigating flag =====
+    
+    function goToPage(targetPage, instant = false) {
+      if (!pdfDoc || targetPage < 1 || targetPage > pdfDoc.numPages) return;
+      
+      // Update page number (không skip notify để trigger tracking)
+      setCurrentPage(targetPage, false);
+      
+      const pageDiv = document.querySelector(`[data-page-number="${targetPage}"]`);
+      if (pageDiv) {
+        pageDiv.scrollIntoView({ behavior: instant ? 'auto' : 'smooth', block: 'start' });
+        
+        // Render visible pages ngay
+        setTimeout(() => {
+          renderVisiblePages();
+        }, 100);
+      }
+    }
+
+    // ===== EVENT LISTENERS =====
+    
     document.getElementById("previous").addEventListener("click", function () {
       if (!pdfDoc || pageNum <= 1) return;
-      pageNum--;
-      document.getElementById("pageNumber").value = pageNum;
-      queuePage(pageNum);
+      goToPage(pageNum - 1);
     });
 
     document.getElementById("next").addEventListener("click", function () {
       if (!pdfDoc || pageNum >= pdfDoc.numPages) return;
-      pageNum++;
-      document.getElementById("pageNumber").value = pageNum;
-      queuePage(pageNum);
+      goToPage(pageNum + 1);
     });
 
     document.getElementById("pageNumber").addEventListener("change", function () {
-      if (!pdfDoc) return;
       const num = parseInt(this.value, 10);
-      if (num >= 1 && num <= pdfDoc.numPages) {
-        pageNum = num;
-        queuePage(pageNum);
+      if (!isNaN(num)) {
+        goToPage(num);
       }
     });
 
     document.getElementById("scaleSelect").addEventListener("change", function () {
       const v = this.value;
-      if (v === "auto") zoomMode = "page-width";
-      else if (v === "page-actual" || v === "page-fit" || v === "page-width" || v === "page-height") zoomMode = v;
+      if (v === "auto" || v === "page-width") zoomMode = "page-width";
+      else if (v === "page-actual" || v === "page-fit" || v === "page-height") zoomMode = v;
       else {
         const pct = parseInt(v, 10);
         if (!Number.isNaN(pct)) {
@@ -395,45 +668,129 @@
           fixedScale = pct / 100;
         }
       }
-      if (pdfDoc) queuePage(pageNum);
+      if (pdfDoc) {
+        const savedPage = pageNum;
+        setupVirtualScroll().then(() => {
+          setTimeout(() => {
+            goToPage(savedPage, true);
+          }, 100);
+        });
+      }
     });
 
+    // Chỉ dùng scroll handler cho renderVisiblePages
+    let renderScrollTimer = null;
+    document.getElementById('mainContainer').addEventListener('scroll', function() {
+      if (renderScrollTimer) clearTimeout(renderScrollTimer);
+      renderScrollTimer = setTimeout(() => {
+        if (!isNavigating) {
+          renderVisiblePages();
+        }
+      }, 150);
+    }, { passive: true });
+
+    // ===== MESSAGE HANDLERS =====
+    
     window.addEventListener("message", function (event) {
       if (!event.data) return;
 
       if (event.data.type === "PDF_GO_TO_PAGE" && pdfDoc) {
         const num = parseInt(event.data.pageNumber, 10);
-        if (num >= 1 && num <= pdfDoc.numPages) {
-          pageNum = num;
-          document.getElementById("pageNumber").value = num;
-          queuePage(pageNum);
+        if (!isNaN(num)) {
+          goToPage(num);
         }
       }
 
       if (event.data.type === "PDF_OPEN_BYTES" && event.data.bytes) {
+        pdfIdFromParent = event.data.pdfId || null;
+        
         waitForPdfJs().then(function () {
           const uint8Array = new Uint8Array(event.data.bytes);
           pdfjsLib.getDocument({ data: uint8Array }).promise.then(function (doc) {
             pdfDoc = doc;
-            pageNum = 1;
+            
             const input = document.getElementById("pageNumber");
-            input.value = pageNum;
             input.max = String(pdfDoc.numPages);
-            queuePage(pageNum);
+            
+            const pageCount = document.getElementById("pageCount");
+            if (pageCount) pageCount.textContent = `/ ${pdfDoc.numPages}`;
+
+            setCurrentPage(1, true);
+
+            setupVirtualScroll().then(() => {
+              // Khôi phục trang cuối cùng từ localStorage
+              if (pdfIdFromParent) {
+                try {
+                  const lastPage = parseInt(localStorage.getItem('pdf_last_page_' + pdfIdFromParent) || '1', 10);
+                  if (lastPage >= 1 && lastPage <= pdfDoc.numPages) {
+                    // TẮT Intersection Observer và CLEAR cache CHỈ cho restore
+                    isNavigating = true;
+                    if (pageObserver) {
+                      pageObserver.disconnect();
+                    }
+                    visiblePages.clear();
+                    
+                    setTimeout(() => {
+                      // Scroll trực tiếp KHÔNG qua goToPage
+                      const pageDiv = document.querySelector(`[data-page-number="${lastPage}"]`);
+                      if (pageDiv) {
+                        pageDiv.scrollIntoView({ behavior: 'auto', block: 'start' });
+                      }
+                      setCurrentPage(lastPage, true);
+                      console.log('Restored to page:', lastPage);
+                      
+                      // BẬT LẠI Intersection Observer sau khi restore xong
+                      setTimeout(() => {
+                        setupPageObserver();
+                        // Re-observe tất cả pages
+                        document.querySelectorAll('.page, .page-placeholder').forEach(pageDiv => {
+                          observePage(pageDiv);
+                        });
+                        isNavigating = false;
+                        renderVisiblePages();
+                      }, 800);
+                    }, 500);
+                  } else {
+                    // Không có lastPage, bật observer ngay
+                    isNavigating = false;
+                  }
+                } catch (e) {
+                  console.error('Failed to restore page:', e);
+                  isNavigating = false;
+                }
+              } else {
+                isNavigating = false;
+              }
+            });
           }).catch(err => {
-            console.error("Failed to load PDF:", err);
+            console.error('PDF load error:', err);
           });
         });
       }
 
       if (event.data.type === "PDF_SET_HIGHLIGHTS") {
         currentHighlights = event.data.highlights || [];
-        const pageDiv = document.querySelector('.page[data-page-number="' + pageNum + '"]');
-        if (pageDiv) renderHighlightsForPage(pageDiv, pageNum);
+        
+        // Chỉ re-render highlights cho pages đã render
+        renderedPages.forEach(pageNum => {
+          const pageDiv = document.querySelector(`.page[data-page-number="${pageNum}"][data-rendered="true"]`);
+          if (pageDiv) {
+            renderHighlightsForPage(pageDiv, pageNum);
+          }
+        });
       }
     });
 
+    // ===== TEXT SELECTION WITH THROTTLE =====
+    
     document.addEventListener("mouseup", function () {
+      // Throttle: ignore rapid selections
+      if (selectionTimeout) return;
+      
+      selectionTimeout = setTimeout(() => {
+        selectionTimeout = null;
+      }, 150);
+      
       const selection = window.getSelection();
       if (!selection) return;
 
@@ -445,22 +802,19 @@
 
         const range = selection.getRangeAt(0);
         
-        // Tìm pageDiv từ selection
         const commonAncestor = range.commonAncestorContainer;
         const pageDiv = commonAncestor.nodeType === 3
-          ? commonAncestor.parentElement && commonAncestor.parentElement.closest(".page")
-          : commonAncestor.closest && commonAncestor.closest(".page");
+          ? commonAncestor.parentElement?.closest(".page")
+          : commonAncestor.closest(".page");
 
         if (!pageDiv) return;
 
         const pageNumber = parseInt(pageDiv.getAttribute("data-page-number") || "0", 10);
         if (!pageNumber) return;
 
-        // Lấy tọa độ của pageDiv (container chính)
         const pageRect = pageDiv.getBoundingClientRect();
         if (pageRect.width === 0 || pageRect.height === 0) return;
 
-        // Tạo một range mới và lấy rects từ đó
         const rects = range.getClientRects();
         if (!rects || rects.length === 0) return;
 
@@ -468,14 +822,11 @@
         for (let i = 0; i < rects.length; i++) {
           const r = rects[i];
           
-          // Tính toán phần trăm chính xác dựa trên pageDiv
-          // Trừ đi offset của pageDiv để có tọa độ tương đối
           const xPct = (r.left - pageRect.left) / pageRect.width;
           const yPct = (r.top - pageRect.top) / pageRect.height;
           const wPct = r.width / pageRect.width;
           const hPct = r.height / pageRect.height;
           
-          // Chỉ thêm rect nếu nó nằm trong bounds hợp lý
           if (wPct > 0 && hPct > 0 && xPct >= -0.01 && xPct <= 1.01) {
             pctRects.push({ 
               xPct: Math.max(0, Math.min(1, xPct)),
@@ -487,10 +838,15 @@
         }
 
         if (pctRects.length > 0) {
-          window.parent.postMessage({ type: "PDF_SELECTION", text, pageNumber, rects: pctRects }, "*");
+          window.parent.postMessage({ 
+            type: "PDF_SELECTION", 
+            text, 
+            pageNumber, 
+            rects: pctRects 
+          }, "*");
         }
       } catch (err) {
-        console.error("Error processing selection:", err);
+        console.error('Selection error:', err);
       }
     });
 

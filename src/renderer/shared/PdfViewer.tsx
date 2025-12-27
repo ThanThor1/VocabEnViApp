@@ -55,10 +55,7 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
   const [errorMessage, setErrorMessage] = useState<string>('');
 
   useEffect(() => {
-    console.log('[PdfViewer] mounted / pdfId =', pdfId);
-    return () => {
-      console.log('[PdfViewer] unmounted / pdfId =', pdfId);
-    };
+    return () => {};
   }, [pdfId]);
 
   // Load PDF data and initialize
@@ -67,28 +64,23 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
 
     const initializePdf = async () => {
       try {
-        console.log('[INIT] start, pdfId =', pdfId);
+        
 
         const pdfData = await window.api.pdfGet(pdfId);
-        console.log('[INIT] pdfData =', pdfData);
+        
 
         const loadedHighlights = Array.isArray(pdfData?.highlights) ? (pdfData.highlights as Highlight[]) : [];
-        console.log('[INIT] loadedHighlights.length =', loadedHighlights.length);
+        
 
         if (!cancelled) {
           setHighlights(loadedHighlights);
           setDeckCsvPath(pdfData?.deckCsvPath || '');
         }
 
-        console.log('[INIT] deckCsvPath =', pdfData?.deckCsvPath || '');
-
+        
         const csvPath = pdfData?.deckCsvPath || '';
         if (csvPath) {
-          console.log('[INIT] reading CSV from =', csvPath);
-
           const csvRows = await window.api.readCsv(csvPath);
-          console.log('[INIT] csvRows type =', Array.isArray(csvRows) ? 'array' : typeof csvRows);
-          console.log('[INIT] csvRows.length =', Array.isArray(csvRows) ? csvRows.length : 0);
 
           const newWordMap = new Map<string, { meaning?: string; pronunciation?: string }>();
           const newWordOnlyMap = new Map<string, { meaning?: string; pronunciation?: string }>();
@@ -107,9 +99,7 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
 
           if (!cancelled) setWordMap(newWordMap);
           if (!cancelled) setWordOnlyMap(newWordOnlyMap);
-          console.log('[INIT] wordMap.size =', newWordMap.size);
         } else {
-          console.log('[INIT] deckCsvPath is empty, skip readCsv');
           if (!cancelled) setWordMap(new Map());
         }
 
@@ -121,13 +111,8 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
               ? bytes.byteLength
               : undefined;
 
-        console.log('[INIT] pdfBytes received, length =', bytesLen);
-
         if (!cancelled) setPdfBytes(bytes);
-
-        console.log('[INIT] done');
       } catch (error) {
-        console.error('[INIT] Failed to initialize PDF:', error);
       }
     };
 
@@ -135,7 +120,6 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
 
     return () => {
       cancelled = true;
-      console.log('[INIT] cancelled = true');
     };
   }, [pdfId]);
 
@@ -184,8 +168,6 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
     if (!cw) return;
 
     const enriched = enrichHighlights(highlights);
-    console.log('[POST] sending PDF_SET_HIGHLIGHTS, count =', enriched.length);
-    console.log('[POST] enriched highlights sample =', enriched.slice(0, 6));
 
     cw.postMessage(
       {
@@ -202,34 +184,35 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
       if (iframeRef.current?.contentWindow && event.source !== iframeRef.current.contentWindow) return;
 
       const type = event.data?.type;
-      if (type) console.log('[IFRAME->APP] message type =', type);
 
       if (type === 'PDF_VIEWER_READY') {
-        console.log('[IFRAME] viewer ready');
         setViewerReady(true);
         return;
       }
 
       // Gửi lại highlights sau khi page đã render xong
       if (type === 'PDF_PAGE_RENDERED') {
-        console.log('[IFRAME] page rendered, pageNumber =', event.data?.pageNumber);
         sendHighlightsToIframe();
         return;
       }
 
       if (type === 'PDF_SELECTION') {
-        console.log('[IFRAME] selection received:', {
-          text: event.data?.text,
-          pageNumber: event.data?.pageNumber,
-          rectsCount: Array.isArray(event.data?.rects) ? event.data.rects.length : 0
-        });
-
         setSelectedText({
           text: event.data.text,
           pageNumber: event.data.pageNumber,
-          rects: Array.isArray(event.data.rects) ? event.data.rects : []
+          rects: Array.isArray(event.data?.rects) ? event.data.rects : []
         });
         setShowAddWordModal(true);
+      }
+      // Persist current page sent from iframe (debounced if frequent)
+      if (type === 'PDF_CURRENT_PAGE') {
+        try {
+          const p = parseInt(event.data?.pageNumber, 10);
+          const id = event.data?.pdfId || pdfId;
+          if (!isNaN(p) && id) {
+            try { localStorage.setItem('pdf_last_page_' + id, String(p)); } catch (e) {}
+          }
+        } catch (e) {}
       }
     };
 
@@ -245,7 +228,6 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
         if (!data) return;
         // If this update affects current pdf (by pdfId or deckCsvPath), reload CSV and update maps
         if (data.pdfId === pdfId || (data.deckCsvPath && data.deckCsvPath === deckCsvPath)) {
-          console.log('[DECK UPDATE] detected for', data);
           const csvPath = data.deckCsvPath || deckCsvPath;
           if (!csvPath) return;
           try {
@@ -269,7 +251,6 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
             // re-send highlights so tooltips update
             sendHighlightsToIframe();
           } catch (e) {
-            console.error('[DECK UPDATE] failed to reload csv', e);
           }
         }
       } catch (e) {}
@@ -283,30 +264,17 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
 
   // Gửi PDF bytes sang iframe khi có bytes + iframe ready
   useEffect(() => {
-    console.log('[POST] viewerReady =', viewerReady, 'pdfBytes =', !!pdfBytes);
-
     if (!viewerReady) return;
     if (!pdfBytes) return;
 
     const cw = iframeRef.current?.contentWindow;
-    if (!cw) {
-      console.log('[POST] iframe contentWindow not available');
-      return;
-    }
-
-    const bytesLen =
-      pdfBytes && typeof pdfBytes.length === 'number'
-        ? pdfBytes.length
-        : pdfBytes && pdfBytes.byteLength
-          ? pdfBytes.byteLength
-          : undefined;
-
-    console.log('[POST] sending PDF_OPEN_BYTES, length =', bytesLen);
+    if (!cw) return;
 
     cw.postMessage(
       {
         type: 'PDF_OPEN_BYTES',
-        bytes: pdfBytes
+        bytes: pdfBytes,
+        pdfId: pdfId
       },
       '*'
     );
@@ -320,22 +288,13 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
 
   const handleAddWord = async (word: string, meaning: string, pronunciation: string) => {
     try {
-      console.log('[ADD WORD] start', { pdfId, word, meaning, pronunciation });
-      console.log('[ADD WORD] deckCsvPath =', deckCsvPath);
-      console.log('[ADD WORD] selectedText =', selectedText);
-
-      if (!deckCsvPath) {
-        console.log('[ADD WORD] deckCsvPath is empty, abort');
-        return;
-      }
+      if (!deckCsvPath) return;
 
       await window.api.addWord(deckCsvPath, {
         word,
         meaning,
         pronunciation
       });
-
-      console.log('[ADD WORD] addWord done');
 
       if (selectedText) {
         const wordKey = `${word}_${meaning}`.toLowerCase();
@@ -350,20 +309,12 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
         };
 
         const safeHighlights = Array.isArray(highlights) ? highlights : [];
-        console.log('[ADD WORD] current highlights count =', safeHighlights.length);
-
         const updatedHighlights = [...safeHighlights, newHighlight];
-        console.log('[ADD WORD] updated highlights count =', updatedHighlights.length);
-
         await window.api.pdfWriteHighlights(pdfId, updatedHighlights);
-        console.log('[ADD WORD] pdfWriteHighlights done');
-
         setHighlights(updatedHighlights);
-
         const newWordMap = new Map(wordMap);
         newWordMap.set(wordKey, { meaning, pronunciation });
         setWordMap(newWordMap);
-        // also update wordOnlyMap
         try {
           const w = sanitize(word);
           if (w) {
@@ -372,18 +323,11 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
             setWordOnlyMap(newWordOnly);
           }
         } catch (e) {}
-
-        console.log('[ADD WORD] wordMap.size =', newWordMap.size);
-      } else {
-        console.log('[ADD WORD] selectedText is null, skip highlight write');
       }
 
       setShowAddWordModal(false);
       setSelectedText(null);
-
-      console.log('[ADD WORD] done');
     } catch (error) {
-      console.error('[ADD WORD] Failed to add word:', error);
     }
   };
 
@@ -397,8 +341,6 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
 
     const cw = iframeRef.current?.contentWindow;
     if (!cw) return;
-
-    console.log('[POST] sending PDF_GO_TO_PAGE =', pageNumParsed);
 
     cw.postMessage(
       {
@@ -436,7 +378,6 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
           selectedText={selectedText.text}
           onSave={handleAddWord}
           onCancel={() => {
-            console.log('[ADD WORD] cancelled by user');
             setShowAddWordModal(false);
             setSelectedText(null);
           }}
