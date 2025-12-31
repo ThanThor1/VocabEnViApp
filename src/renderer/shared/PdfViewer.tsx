@@ -46,6 +46,7 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
     text: string;
     pageNumber: number;
     rects: Rect[];
+    contextSentenceEn?: string;
   } | null>(null);
 
   const [targetPage, setTargetPage] = useState('');
@@ -200,7 +201,8 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
         setSelectedText({
           text: event.data.text,
           pageNumber: event.data.pageNumber,
-          rects: Array.isArray(event.data?.rects) ? event.data.rects : []
+          rects: Array.isArray(event.data?.rects) ? event.data.rects : [],
+          contextSentenceEn: typeof event.data?.contextSentenceEn === 'string' ? event.data.contextSentenceEn : ''
         });
         setShowAddWordModal(true);
       }
@@ -286,14 +288,15 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
     sendHighlightsToIframe();
   }, [viewerReady, highlights, wordMap]);
 
-  const handleAddWord = async (word: string, meaning: string, pronunciation: string) => {
+  const handleAddWord = async (word: string, meaning: string, pronunciation: string, pos: string) => {
     try {
       if (!deckCsvPath) return;
 
       await window.api.addWord(deckCsvPath, {
         word,
         meaning,
-        pronunciation
+        pronunciation,
+        pos
       });
 
       if (selectedText) {
@@ -359,12 +362,21 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
 
   return (
     <ErrorBoundary>
-      <div className="flex flex-col h-full w-full bg-white">
+      <div className="flex flex-col h-full w-full bg-gradient-to-b from-gray-50 to-white">
       {errorMessage && (
-        <div className="p-2 bg-red-100 border border-red-300 rounded text-sm text-red-700 mb-2">
-          {errorMessage}
+        <div className="mx-4 mt-4 p-3 bg-red-50 border border-red-200 rounded-lg text-sm text-red-700 shadow-sm animate-pulse">
+          <div className="flex items-center gap-2">
+            <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
+              <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clipRule="evenodd" />
+            </svg>
+            <span className="font-medium">{errorMessage}</span>
+          </div>
         </div>
       )}
+      
+      {/* Modern Toolbar */}
+      
+      
       <iframe
         ref={iframeRef}
         src="/pdfjs/web/viewer.html"
@@ -376,6 +388,7 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
       {showAddWordModal && selectedText && (
         <AddWordModal
           selectedText={selectedText.text}
+          contextSentenceEn={selectedText.contextSentenceEn || ''}
           onSave={handleAddWord}
           onCancel={() => {
             setShowAddWordModal(false);

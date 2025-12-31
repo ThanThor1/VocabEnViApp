@@ -10,6 +10,7 @@ contextBridge.exposeInMainWorld('api', {
   readCsv: (relPath) => ipcRenderer.invoke('readCsv', relPath),
   addWord: (relPath, row) => ipcRenderer.invoke('addWord', relPath, row),
   deleteWord: (relPath, index) => ipcRenderer.invoke('deleteWord', relPath, index),
+  editWord: (relPath, index, newData) => ipcRenderer.invoke('editWord', relPath, index, newData),
   moveWords: (srcRel, dstRel, indices) => ipcRenderer.invoke('moveWords', srcRel, dstRel, indices),
   copyWords: (srcRel, dstRel, indices) => ipcRenderer.invoke('copyWords', srcRel, dstRel, indices),
   // file/folder operations
@@ -32,6 +33,9 @@ contextBridge.exposeInMainWorld('api', {
   pdfRestore: (pdfId) => ipcRenderer.invoke('pdfRestore', pdfId)
   ,
   pdfDeletePermanent: (pdfId) => ipcRenderer.invoke('pdfDeletePermanent', pdfId)
+  ,
+  autoMeaning: (payload) => ipcRenderer.invoke('translator:autoMeaning', payload),
+  autoMeaningCancel: (requestId) => ipcRenderer.invoke('translator:autoMeaningCancel', requestId)
   ,
   // listen for deck updates (emitted when a CSV inside a PDF folder is written)
   onDeckUpdated: (cb) => ipcRenderer.on('deck-updated', (ev, data) => cb && cb(data))

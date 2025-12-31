@@ -4,6 +4,225 @@
  * Và thêm vào viewer.html: <script src="custom-viewer.js"></script>
  */
 
+// Touch/Trackpad zoom support for better UX
+let isPinching = false;
+let lastDistance = 0;
+
+function getDistance(touch1, touch2) {
+  const dx = touch1.clientX - touch2.clientX;
+  const dy = touch1.clientY - touch2.clientY;
+  return Math.sqrt(dx * dx + dy * dy);
+}
+
+function setupZoomControls(container) {
+  console.log('Setting up zoom controls');
+  
+  // Touchpad pinch zoom (using wheel event with ctrlKey) - Chrome/Edge behavior
+  container.addEventListener('wheel', function(evt) {
+    if (!evt.ctrlKey) return;
+    evt.preventDefault();
+    evt.stopPropagation();
+
+    console.log('🔍 [WHEEL ZOOM] Starting...');
+    const scaleDelta = evt.deltaY > 0 ? 0.95 : 1.05;
+    const viewer = window.PDFViewerApplication.pdfViewer;
+    const queue = window.PDFViewerApplication.pdfRenderingQueue;
+    const currentScale = viewer.currentScale;
+    const newScale = currentScale * scaleDelta;
+    const clampedScale = Math.max(0.25, Math.min(5, newScale));
+
+    // Save current page to prevent jumping to page 1
+    const currentPage = window.PDFViewerApplication.page;
+    console.log('🔍 [WHEEL ZOOM] Current page:', currentPage, 'Scale:', currentScale, '→', clampedScale);
+    
+    // Keep viewport center stable (no page jump) without anchoring to cursor
+    const rect = container.getBoundingClientRect();
+    const centerX = container.scrollLeft + rect.width / 2;
+    const centerY = container.scrollTop + rect.height / 2;
+    const scaleFactor = clampedScale / currentScale;
+    
+    console.log('🔍 [WHEEL ZOOM] Scroll before:', {
+      scrollLeft: container.scrollLeft,
+      scrollTop: container.scrollTop,
+      centerX,
+      centerY,
+      scaleFactor
+    });
+
+    // Use pdf.js API to update scale without scroll jump
+    if (viewer && typeof viewer._setScale === 'function') {
+      viewer._setScale(clampedScale, { noScroll: true });
+    } else {
+      viewer.currentScale = clampedScale;
+    }
+
+    requestAnimationFrame(() => {
+      const pageAfter = window.PDFViewerApplication.page;
+      console.log('🔍 [WHEEL ZOOM] Page after scale change:', pageAfter);
+      
+      // Restore page number to prevent jump to page 1
+      if (window.PDFViewerApplication.page !== currentPage) {
+        console.log('⚠️ [WHEEL ZOOM] Page changed! Restoring from', pageAfter, 'to', currentPage);
+        window.PDFViewerApplication.page = currentPage;
+      }
+      
+      const newScrollLeft = centerX * scaleFactor - rect.width / 2;
+      const newScrollTop = centerY * scaleFactor - rect.height / 2;
+      container.scrollLeft = Math.max(0, newScrollLeft);
+      container.scrollTop = Math.max(0, newScrollTop);
+      
+      console.log('🔍 [WHEEL ZOOM] Scroll after:', {
+        scrollLeft: container.scrollLeft,
+        scrollTop: container.scrollTop,
+        finalPage: window.PDFViewerApplication.page
+      });
+      
+      // Force complete re-render with multiple passes
+      try {
+        // Method 1: Force rendering immediately
+        window.PDFViewerApplication.forceRendering();
+        queue?.renderHighestPriority?.();
+        
+        // Method 2: Update all visible pages
+        if (viewer && viewer._pages) {
+          viewer._pages.forEach((pageView) => {
+            if (pageView.div && pageView.div.offsetParent) {
+              pageView.reset();
+              pageView.update(clampedScale);
+            }
+          });
+        }
+        
+        // Method 3: Trigger another render pass after a delay
+        setTimeout(() => {
+          try {
+            window.PDFViewerApplication.forceRendering();
+            queue?.renderHighestPriority?.();
+          } catch (e2) {
+            console.warn('forceRendering delayed error', e2);
+          }
+        }, 50);
+      } catch (e) {
+        console.warn('forceRendering wheel error', e);
+      }
+      console.log('✅ [WHEEL ZOOM] Complete\n');
+    });
+  }, { passive: false });
+
+  // Touch pinch zoom for touch devices
+  container.addEventListener('touchstart', function(evt) {
+    if (evt.touches.length === 2) {
+      isPinching = true;
+      lastDistance = getDistance(evt.touches[0], evt.touches[1]);
+      evt.preventDefault();
+    }
+  }, { passive: false });
+
+  container.addEventListener('touchmove', function(evt) {
+    if (isPinching && evt.touches.length === 2) {
+      evt.preventDefault();
+      
+      const currentDistance = getDistance(evt.touches[0], evt.touches[1]);
+      const delta = currentDistance - lastDistance;
+      
+      if (Math.abs(delta) > 5) {
+        console.log('👆 [PINCH ZOOM] Starting...');
+        const scaleDelta = delta > 0 ? 1.02 : 0.98;
+        const viewer = window.PDFViewerApplication.pdfViewer;
+        const queue = window.PDFViewerApplication.pdfRenderingQueue;
+        const currentScale = viewer.currentScale;
+        const newScale = currentScale * scaleDelta;
+        
+        const clampedScale = Math.max(0.25, Math.min(5, newScale));
+        const scaleFactor = clampedScale / currentScale;
+        
+        // Save current page to prevent jumping to page 1
+        const currentPage = window.PDFViewerApplication.page;
+        console.log('👆 [PINCH ZOOM] Current page:', currentPage, 'Scale:', currentScale, '→', clampedScale);
+        
+        // Keep viewport center stable (no page jump) for touch pinch
+        const rect = container.getBoundingClientRect();
+        const centerX = container.scrollLeft + rect.width / 2;
+        const centerY = container.scrollTop + rect.height / 2;
+        
+        console.log('👆 [PINCH ZOOM] Scroll before:', {
+          scrollLeft: container.scrollLeft,
+          scrollTop: container.scrollTop,
+          centerX,
+          centerY,
+          scaleFactor
+        });
+
+        if (viewer && typeof viewer._setScale === 'function') {
+          viewer._setScale(clampedScale, { noScroll: true });
+        } else {
+          viewer.currentScale = clampedScale;
+        }
+
+        requestAnimationFrame(() => {
+          const pageAfter = window.PDFViewerApplication.page;
+          console.log('👆 [PINCH ZOOM] Page after scale change:', pageAfter);
+          
+          // Restore page number to prevent jump to page 1
+          if (window.PDFViewerApplication.page !== currentPage) {
+            console.log('⚠️ [PINCH ZOOM] Page changed! Restoring from', pageAfter, 'to', currentPage);
+            window.PDFViewerApplication.page = currentPage;
+          }
+          
+          const newScrollLeft = centerX * scaleFactor - rect.width / 2;
+          const newScrollTop = centerY * scaleFactor - rect.height / 2;
+          container.scrollLeft = Math.max(0, newScrollLeft);
+          container.scrollTop = Math.max(0, newScrollTop);
+          
+          console.log('👆 [PINCH ZOOM] Scroll after:', {
+            scrollLeft: container.scrollLeft,
+            scrollTop: container.scrollTop,
+            finalPage: window.PDFViewerApplication.page
+          });
+          
+          // Force complete re-render with multiple passes
+          try {
+            // Method 1: Force rendering immediately
+            window.PDFViewerApplication.forceRendering();
+            queue?.renderHighestPriority?.();
+            
+            // Method 2: Update all visible pages
+            if (viewer && viewer._pages) {
+              viewer._pages.forEach((pageView) => {
+                if (pageView.div && pageView.div.offsetParent) {
+                  pageView.reset();
+                  pageView.update(clampedScale);
+                }
+              });
+            }
+            
+            // Method 3: Trigger another render pass after a delay
+            setTimeout(() => {
+              try {
+                window.PDFViewerApplication.forceRendering();
+                queue?.renderHighestPriority?.();
+              } catch (e2) {
+                console.warn('forceRendering delayed error', e2);
+              }
+            }, 50);
+          } catch (e) {
+            console.warn('forceRendering pinch error', e);
+          }
+          console.log('✅ [PINCH ZOOM] Complete\n');
+        });
+        
+        lastDistance = currentDistance;
+      }
+    }
+  }, { passive: false });
+
+  container.addEventListener('touchend', function(evt) {
+    if (evt.touches.length < 2) {
+      isPinching = false;
+    }
+  });
+}
+
 // Đợi PDF.js load xong
 document.addEventListener('DOMContentLoaded', function() {
   console.log('Custom PDF viewer script loaded');
@@ -14,6 +233,7 @@ document.addEventListener('DOMContentLoaded', function() {
     if (container && window.PDFViewerApplication) {
       clearInterval(waitForViewer);
         initializeCustomFeatures(container);
+        setupZoomControls(container);
         // notify parent that viewer is ready
         try {
           window.parent.postMessage({ type: 'PDF_VIEWER_READY' }, '*');
@@ -77,8 +297,9 @@ function initializeCustomFeatures(container) {
         return;
       }
       
-      // Tính toán tọa độ các rects (theo phần trăm)
-      const pageRect = pageElement.getBoundingClientRect();
+      // Tính toán tọa độ các rects (theo phần trăm, bám theo textLayer để không bị lệch)
+      const textLayer = pageElement.querySelector('.textLayer');
+      const baseRect = (textLayer || pageElement).getBoundingClientRect();
       const rects = [];
       const rangeRects = range.getClientRects();
       
@@ -89,10 +310,10 @@ function initializeCustomFeatures(container) {
         if (rect.width < 1 || rect.height < 1) continue;
         
         rects.push({
-          xPct: (rect.left - pageRect.left) / pageRect.width,
-          yPct: (rect.top - pageRect.top) / pageRect.height,
-          wPct: rect.width / pageRect.width,
-          hPct: rect.height / pageRect.height
+          xPct: (rect.left - baseRect.left) / baseRect.width,
+          yPct: (rect.top - baseRect.top) / baseRect.height,
+          wPct: rect.width / baseRect.width,
+          hPct: rect.height / baseRect.height
         });
       }
       
@@ -223,6 +444,8 @@ function drawHighlights(highlights) {
   highlights.forEach(function(highlight) {
     const pageElement = document.querySelector('.page[data-page-number="' + highlight.pageNumber + '"]');
     if (!pageElement) return;
+    const textLayer = pageElement.querySelector('.textLayer');
+    const targetLayer = textLayer || pageElement;
 
     highlight.rects.forEach(function(rect) {
       const highlightDiv = document.createElement('div');
@@ -264,7 +487,7 @@ function drawHighlights(highlights) {
         t.style.opacity = '0';
       });
 
-      pageElement.appendChild(highlightDiv);
+      targetLayer.appendChild(highlightDiv);
     });
   });
 }

@@ -1,6 +1,7 @@
 import React, { useMemo, useState } from "react";
 import ErrorBoundary from './ErrorBoundary'
 import ChooseFileModal from "./ChooseFileModal";
+import EditWordModal from "./EditWordModal";
 import {
   useReactTable,
   getCoreRowModel,
@@ -14,44 +15,66 @@ type VocabRow = {
   word: string;
   meaning: string;
   pronunciation: string;
+  pos?: string;
 };
+
+type VocabRowWithIndex = VocabRow & { __idx: number };
 
 type Props = {
   rows: VocabRow[];
   onDelete: (rowIndex: number) => void;
+  onEdit: (rowIndex: number, word: string, meaning: string, pronunciation: string, pos: string) => void;
   onSpeak: (word: string) => void;
   onRefresh: () => void;
   currentFile: string;
+  // External state control for persistence
+  selected: Record<number, boolean>;
+  setSelected: React.Dispatch<React.SetStateAction<Record<number, boolean>>>;
+  wordFilter: string;
+  setWordFilter: React.Dispatch<React.SetStateAction<string>>;
+  meaningFilter: string;
+  setMeaningFilter: React.Dispatch<React.SetStateAction<string>>;
 };
 
 export default function VocabTable({
   rows,
   onDelete,
+  onEdit,
   onSpeak,
   onRefresh,
   currentFile,
+  selected,
+  setSelected,
+  wordFilter,
+  setWordFilter,
+  meaningFilter,
+  setMeaningFilter,
 }: Props) {
-  const [selected, setSelected] = useState<Record<number, boolean>>({});
   const [showChooser, setShowChooser] = useState(false);
   const [chooserTree, setChooserTree] = useState<any[]>([]);
   const [errorMessage, setErrorMessage] = useState<string>('')
-  const [wordFilter, setWordFilter] = useState<string>('')
-  const [meaningFilter, setMeaningFilter] = useState<string>('')
+  const [editingRow, setEditingRow] = useState<{index: number, row: VocabRow} | null>(null)
+
+  // Keep the original index to avoid mismatches when filtering
+  const rowsWithIndex = useMemo<VocabRowWithIndex[]>(
+    () => rows.map((r, idx) => ({ ...r, __idx: idx })),
+    [rows]
+  )
 
   const filteredRows = useMemo(() => {
-    if (!rows || rows.length === 0) return []
+    if (!rowsWithIndex || rowsWithIndex.length === 0) return []
     const wf = (wordFilter || '').trim().toLowerCase()
     const mf = (meaningFilter || '').trim().toLowerCase()
-    return rows.filter(r => {
+    return rowsWithIndex.filter(r => {
       const w = (r.word || '').toString().toLowerCase()
       const m = (r.meaning || '').toString().toLowerCase()
       if (wf && !w.includes(wf)) return false
       if (mf && !m.includes(mf)) return false
       return true
     })
-  }, [rows, wordFilter, meaningFilter])
+  }, [rowsWithIndex, wordFilter, meaningFilter])
 
-  const cols = useMemo<ColumnDef<VocabRow>[]>(
+  const cols = useMemo<ColumnDef<VocabRowWithIndex>[]>(
     () => [
       {
         id: "select",
@@ -59,10 +82,10 @@ export default function VocabTable({
         cell: ({ row }) => (
           <input
             type="checkbox"
-            checked={!!selected[row.index]}
+            checked={!!selected[row.original.__idx]}
             onChange={(e) => {
               const checked = e.target.checked;
-              setSelected((prev) => ({ ...prev, [row.index]: checked }));
+              setSelected((prev) => ({ ...prev, [row.original.__idx]: checked }));
             }}
           />
         ),
@@ -70,14 +93,23 @@ export default function VocabTable({
       { accessorKey: "word", header: "Word" },
       { accessorKey: "meaning", header: "Meaning" },
       { accessorKey: "pronunciation", header: "IPA" },
+      { accessorKey: "pos", header: "POS" },
       {
         id: "actions",
         header: "Actions",
         cell: ({ row }) => (
           <div className="flex gap-2">
             <button
-              className="text-red-600"
-              onClick={() => onDelete(row.index)}
+              className="text-blue-600 hover:text-blue-800 font-semibold"
+              onClick={() => setEditingRow({index: row.original.__idx, row: row.original})}
+              type="button"
+              title="Edit"
+            >
+              Edit
+            </button>
+            <button
+              className="text-red-600 hover:text-red-800"
+              onClick={() => onDelete(row.original.__idx)}
               type="button"
             >
               Delete
@@ -94,11 +126,11 @@ export default function VocabTable({
         ),
       },
     ],
-    [selected, onDelete, onSpeak]
+    [selected, onDelete, onEdit, onSpeak]
   );
 
   // safe fallback in case HMR leaves `filteredRows` undefined for a moment
-  const safeRows = typeof filteredRows !== 'undefined' ? filteredRows : (rows || [])
+  const safeRows = typeof filteredRows !== 'undefined' ? filteredRows : (rowsWithIndex || [])
 
   const table = useReactTable({
     data: safeRows,
@@ -181,6 +213,20 @@ export default function VocabTable({
             const cb = (window as any)._vocab_move_copy_cb;
             if (cb) cb(p);
             (window as any)._vocab_move_copy_cb = undefined;
+          }}
+        />
+      )}
+
+      {editingRow && (
+        <EditWordModal
+          word={editingRow.row.word}
+          meaning={editingRow.row.meaning}
+          pronunciation={editingRow.row.pronunciation}
+          pos={(editingRow.row.pos || '')}
+          onClose={() => setEditingRow(null)}
+          onSave={(word, meaning, pronunciation, pos) => {
+            onEdit(editingRow.index, word, meaning, pronunciation, pos);
+            setEditingRow(null);
           }}
         />
       )}

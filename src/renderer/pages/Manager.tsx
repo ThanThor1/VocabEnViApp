@@ -1,10 +1,12 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import ErrorBoundary from "../shared/ErrorBoundary";
 import { useNavigate, useLocation } from "react-router-dom";
 import VocabTable from "../shared/VocabTable";
 import ChooseFileModal from "../shared/ChooseFileModal";
 import InputModal from "../shared/InputModal";
 import FolderNavigator from "../shared/FolderNavigator";
+import { usePersistedState } from "../shared/usePersistedState";
+import { POS_OPTIONS } from "../shared/posOptions";
 
 declare const window: any;
 
@@ -18,16 +20,30 @@ type TreeNode = {
 export default function Manager() {
   const navigate = useNavigate();
   const [tree, setTree] = useState<TreeNode[]>([]);
-  const [currentFile, setCurrentFile] = useState<string | null>(null);
+  
+  // Persisted state - main file/folder context
+  const [currentFile, setCurrentFile] = usePersistedState<string | null>('manager_currentFile', null);
+  const [currentFolder, setCurrentFolder] = usePersistedState<string>('manager_currentFolder', "");
+  
+  // Persisted state - VocabTable filters and selections
+  const [wordFilter, setWordFilter] = usePersistedState<string>('manager_wordFilter', '');
+  const [meaningFilter, setMeaningFilter] = usePersistedState<string>('manager_meaningFilter', '');
+  const [vocabSelected, setVocabSelected] = usePersistedState<Record<number, boolean>>('manager_vocabSelected', {});
+  
+  // Persisted state - folder selection
+  const [selectedItems, setSelectedItems] = usePersistedState<Set<string>>('manager_selectedItems', new Set(), {
+    serialize: (set) => JSON.stringify(Array.from(set)),
+    deserialize: (str) => new Set(JSON.parse(str))
+  });
+  
+  // Non-persisted state
   const [rows, setRows] = useState<any[]>([]);
   const [showChoose, setShowChoose] = useState(false);
   const [showPdfChooser, setShowPdfChooser] = useState(false);
   const [pdfList, setPdfList] = useState<any[]>([]);
-
   const [word, setWord] = useState("");
   const [meaning, setMeaning] = useState("");
-
-  const [currentFolder, setCurrentFolder] = useState<string>("");
+  const [pos, setPos] = useState("");
 
   const [showInputModal, setShowInputModal] = useState(false);
   const [inputModalTitle, setInputModalTitle] = useState("");
@@ -50,7 +66,6 @@ export default function Manager() {
     type: "file" | "folder";
   } | null>(null);
 
-  const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set());
   const [errorMessage, setErrorMessage] = useState<string>('');
 
   const api = window.api as
@@ -59,6 +74,7 @@ export default function Manager() {
         listTree: () => Promise<TreeNode[]>;
         readCsv: (filePath: string) => Promise<any[]>;
         deleteWord: (filePath: string, idx: number) => Promise<void>;
+        editWord: (filePath: string, idx: number, data: {word: string, meaning: string, pronunciation: string, pos?: string}) => Promise<void>;
         addWord: (filePath: string, row: any) => Promise<void>;
         // parentRel can be '' for root
         createFolder: (parentRel: string, name: string) => Promise<boolean>;
@@ -105,6 +121,18 @@ export default function Manager() {
     deleteWord(currentFile, idx).then(() => openFile(currentFile));
   }
 
+  async function handleRowEdit(idx: number, word: string, meaning: string, pronunciation: string, pos: string) {
+    if (!api?.editWord || !currentFile) return;
+    try {
+      await api.editWord(currentFile, idx, { word, meaning, pronunciation: ensureIpaSlashes(pronunciation), pos });
+      await openFile(currentFile);
+    } catch (err) {
+      console.error('Edit failed', err);
+      setErrorMessage(`Edit failed: ${err instanceof Error ? err.message : String(err)}`);
+      setTimeout(() => setErrorMessage(''), 5000);
+    }
+  }
+
   function speak(text: string) {
     try {
       const ut = new SpeechSynthesisUtterance(text);
@@ -113,6 +141,14 @@ export default function Manager() {
       // ignore
     }
   }
+
+  const ensureIpaSlashes = (val: string) => {
+    // Trim, drop stray quotes, then wrap once with slashes for IPA
+    const v = (val || "").trim().replace(/"/g, "");
+    if (!v) return "";
+    const core = v.replace(/^\/+|\/+$/g, "");
+    return `/${core}/`;
+  };
 
   async function lookupIPA(word: string) {
     if (!word) return "";
@@ -123,9 +159,9 @@ export default function Manager() {
       if (!resp.ok) return "";
       const data = await resp.json();
       if (Array.isArray(data) && data[0]?.phonetics?.length > 0) {
-        const ph = data[0].phonetics.find((p: any) => p.text?.includes("/"));
-        if (ph?.text) return ph.text.replace(/\//g, "");
-        return data[0].phonetics[0].text?.replace(/\//g, "") || "";
+        const ph = data[0].phonetics.find((p: any) => p.text);
+        if (ph?.text) return ensureIpaSlashes(ph.text);
+        if (data[0].phonetics[0]?.text) return ensureIpaSlashes(data[0].phonetics[0].text);
       }
       return "";
     } catch (err) {
@@ -349,6 +385,15 @@ export default function Manager() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Restore persisted current file on mount
+  const restoredFileRef = useRef(false);
+  useEffect(() => {
+    if (!restoredFileRef.current && currentFile) {
+      restoredFileRef.current = true;
+      openFile(currentFile).catch(()=>{});
+    }
+  }, [currentFile]);
+
   // helper actions for context menu
   function clearContext() {
     setContextMenu({ visible: false });
@@ -521,7 +566,7 @@ export default function Manager() {
   return (
     <ErrorBoundary>
       <div
-      className="flex h-full bg-gray-50"
+      className="flex h-full bg-gradient-to-br from-gray-50 to-white"
       onContextMenu={(e) => {
         e.preventDefault();
         // show paste menu for current folder (root if empty)
@@ -533,7 +578,7 @@ export default function Manager() {
       }}
     >
       {/* Left: Folder Navigator */}
-      <div className="w-full md:w-1/2 lg:w-2/5 border-r flex flex-col">
+      <div className="w-full md:w-1/2 lg:w-2/5 border-r border-gray-200 bg-white shadow-sm flex flex-col">
         <FolderNavigator
           tree={tree}
           onSelectFile={openFile}
@@ -550,25 +595,54 @@ export default function Manager() {
 
       {/* Right: Vocab Table */}
       <div className="flex-1 hidden md:flex flex-col">
-        <div className="p-3 border-b bg-white">
-          <div className="flex items-center gap-2 flex-wrap">
-            <input
-              placeholder="word"
-              className="border p-2 rounded text-sm flex-1 min-w-32"
-              value={word}
-              onChange={(e) => setWord(e.target.value)}
-            />
-            <input
-              placeholder="meaning"
-              className="border p-2 rounded text-sm flex-1 min-w-32"
-              value={meaning}
-              onChange={(e) => setMeaning(e.target.value)}
-            />
+        {/* Header */}
+        <div className="bg-white border-b border-gray-200 px-6 py-4 shadow-sm">
+          <div className="flex items-center justify-between mb-4">
+            <div>
+              <h1 className="text-2xl font-bold text-gray-900">Vocabulary Manager</h1>
+              <p className="text-sm text-gray-600 mt-1">Manage your vocabulary files and collections</p>
+            </div>
+          </div>
+          
+          {/* Add Word Form */}
+          <div className="flex items-center gap-3">
+            <div className="flex-1 flex items-center gap-2">
+              <div className="relative flex-1">
+                <input
+                  placeholder="Enter word..."
+                  className="input-field pl-10"
+                  value={word}
+                  onChange={(e) => setWord(e.target.value)}
+                />
+              </div>
+              <div className="relative flex-1">
+                <input
+                  placeholder="Enter meaning..."
+                  className="input-field pl-10"
+                  value={meaning}
+                  onChange={(e) => setMeaning(e.target.value)}
+                />
+              </div>
+              <div className="relative w-44">
+                <select
+                  className="input-field"
+                  value={pos}
+                  onChange={(e) => setPos(e.target.value)}
+                >
+                  <option value="">POS...</option>
+                  {POS_OPTIONS.map((o) => (
+                    <option key={o.value} value={o.value}>
+                      {o.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
             <button
-              className="bg-blue-500 text-white px-3 py-1.5 rounded text-sm hover:bg-blue-600 transition whitespace-nowrap"
+              className="btn-primary px-6 py-2.5 flex items-center gap-2 whitespace-nowrap"
               onClick={async () => {
-                if (!word.trim() || !meaning.trim()) {
-                  setErrorMessage("Please enter word + meaning");
+                if (!word.trim() || !meaning.trim() || !pos.trim()) {
+                  setErrorMessage("Please enter word + meaning + POS");
                   setTimeout(() => setErrorMessage(''), 3000);
                   return;
                 }
@@ -587,9 +661,11 @@ export default function Manager() {
                       word: word.trim(),
                       meaning: meaning.trim(),
                       pronunciation: ipa,
+                      pos: pos.trim(),
                     });
                     setWord("");
                     setMeaning("");
+                    setPos("");
                     await loadTree();
                     await openFile(currentFile);
                   } catch (err) {
@@ -603,33 +679,60 @@ export default function Manager() {
               }}
               type="button"
             >
-              + Add
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+              </svg>
+              Add Word
             </button>
           </div>
+          
           {errorMessage && (
-            <div className="mt-2 p-2 bg-red-100 border border-red-300 rounded text-sm text-red-700">
+            <div className="mt-3 p-3 bg-red-50 border border-red-200 rounded-lg text-sm text-red-700 flex items-center gap-2">
+              <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
+                <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clipRule="evenodd" />
+              </svg>
               {errorMessage}
             </div>
           )}
 
-          {currentFile ? (
-            <div className="text-xs text-gray-500 truncate mt-2" title={currentFile}>
-              📄 {currentFile.split(/[/\\\\]/).pop()}
+          {currentFile && (
+            <div className="mt-3 p-3 bg-blue-50 border border-blue-200 rounded-lg flex items-center gap-3">
+              <svg className="w-5 h-5 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+              </svg>
+              <div className="flex-1 min-w-0">
+                <p className="text-xs font-semibold text-blue-600 uppercase tracking-wide">Current File</p>
+                <p className="text-sm font-medium text-gray-900 truncate" title={currentFile}>
+                  {currentFile.split(/[/\\]/).pop()}
+                </p>
+              </div>
             </div>
-          ) : (
-            <div className="text-xs text-gray-500 mt-2">Pick a CSV file to view/edit</div>
-            )}
-          </div>
+          )}
+          {!currentFile && (
+            <div className="mt-3 p-3 bg-gray-50 border border-gray-200 rounded-lg text-center">
+              <p className="text-sm text-gray-600">Select a CSV file from the left panel to view and edit</p>
+            </div>
+          )}
+        </div>
 
-        <div className="flex-1 overflow-y-auto p-3 bg-white">
+        <div className="flex-1 overflow-y-auto p-6 bg-white">
           {currentFile ? (
-            <VocabTable
-              rows={rows}
-              onDelete={handleRowDelete}
-              onSpeak={speak}
-              onRefresh={() => currentFile && openFile(currentFile)}
-              currentFile={currentFile}
-            />
+            <div className="bg-white rounded-2xl shadow-lg border border-gray-200 p-6">
+              <VocabTable
+                rows={rows}
+                onDelete={handleRowDelete}
+                onEdit={handleRowEdit}
+                onSpeak={speak}
+                onRefresh={() => currentFile && openFile(currentFile)}
+                currentFile={currentFile}
+                selected={vocabSelected}
+                setSelected={setVocabSelected}
+                wordFilter={wordFilter}
+                setWordFilter={setWordFilter}
+                meaningFilter={meaningFilter}
+                setMeaningFilter={setMeaningFilter}
+              />
+            </div>
           ) : (
             <FolderContentsView
               tree={tree}
@@ -649,16 +752,23 @@ export default function Manager() {
           onChoose={async (filePath: string) => {
             const addWord = api?.addWord;
             if (!addWord) return;
+            if (!pos.trim()) {
+              setErrorMessage('Please select POS');
+              setTimeout(() => setErrorMessage(''), 3000);
+              return;
+            }
             const ipa = await lookupIPA(word.trim());
             await addWord(filePath, {
               word: word.trim(),
               meaning: meaning.trim(),
               pronunciation: ipa,
+              pos: pos.trim(),
             });
 
             setShowChoose(false);
             setWord("");
             setMeaning("");
+            setPos("");
 
             await loadTree();
             if (filePath === currentFile) await openFile(filePath);
@@ -725,36 +835,85 @@ export default function Manager() {
       {contextMenu.visible && (
         <div
           style={{ left: contextMenu.x || 0, top: contextMenu.y || 0 }}
-          className="fixed z-50 bg-white border rounded shadow-md text-sm"
+          className="fixed z-50 bg-white border border-gray-200 rounded-xl shadow-2xl overflow-hidden"
           onMouseLeave={() => clearContext()}
         >
-          <div className="flex flex-col p-1">
+          <div className="py-1">
             {selectedItems.size > 1 && (
               <>
-                <button className="px-3 py-1 hover:bg-gray-100 text-left text-xs text-gray-500 font-bold">{selectedItems.size} items selected</button>
-                <div className="border-t my-1"></div>
-                <button className="px-3 py-1 hover:bg-gray-100 text-left" onClick={() => { doBulkDelete(); clearContext(); }}>Delete All</button>
-                <button className="px-3 py-1 hover:bg-gray-100 text-left" onClick={() => { doBulkCopy(); }}>Copy All</button>
-                <button className="px-3 py-1 hover:bg-gray-100 text-left" onClick={() => { doBulkCut(); }}>Cut All</button>
-                <button className="px-3 py-1 hover:bg-gray-100 text-left text-blue-600 font-semibold" onClick={() => { doStudySelected(); }}>📚 Study</button>
-                <div className="border-t my-1"></div>
-                <button className="px-3 py-1 hover:bg-gray-100 text-left text-xs" onClick={() => { setSelectedItems(new Set()); clearContext(); }}>Clear Selection</button>
+                <div className="px-4 py-2 text-xs text-gray-500 font-bold bg-gray-50 border-b border-gray-200">
+                  {selectedItems.size} items selected
+                </div>
+                <button className="w-full px-4 py-2.5 hover:bg-red-50 text-left text-red-600 flex items-center gap-2" onClick={() => { doBulkDelete(); clearContext(); }}>
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                  </svg>
+                  Delete All
+                </button>
+                <button className="w-full px-4 py-2.5 hover:bg-gray-50 text-left flex items-center gap-2" onClick={() => { doBulkCopy(); }}>
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                  </svg>
+                  Copy All
+                </button>
+                <button className="w-full px-4 py-2.5 hover:bg-gray-50 text-left flex items-center gap-2" onClick={() => { doBulkCut(); }}>
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.121 14.121L19 19m-7-7l7-7m-7 7l-2.879 2.879M12 12L9.121 9.121m0 5.758a3 3 0 10-4.243 4.243 3 3 0 004.243-4.243zm0-5.758a3 3 0 10-4.243-4.243 3 3 0 004.243 4.243z" />
+                  </svg>
+                  Cut All
+                </button>
+                <button className="w-full px-4 py-2.5 hover:bg-blue-50 text-left text-blue-600 font-semibold flex items-center gap-2 border-t border-gray-200" onClick={() => { doStudySelected(); }}>
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253" />
+                  </svg>
+                  Study Selected
+                </button>
+                <button className="w-full px-4 py-2.5 hover:bg-gray-50 text-left text-xs text-gray-600 border-t border-gray-200" onClick={() => { setSelectedItems(new Set()); clearContext(); }}>
+                  Clear Selection
+                </button>
               </>
             )}
 
             {selectedItems.size <= 1 && !contextMenu.isEmpty && contextMenu.item && (
               <>
-                <button className="px-3 py-1 hover:bg-gray-100 text-left" onClick={() => { handleDeleteNode(contextMenu.item!.path, contextMenu.item!.type); clearContext(); }}>Delete</button>
-                <button className="px-3 py-1 hover:bg-gray-100 text-left" onClick={() => { doCopyItem(contextMenu.item!); }}>Copy</button>
-                <button className="px-3 py-1 hover:bg-gray-100 text-left" onClick={() => { doCutItem(contextMenu.item!); }}>Cut</button>
-                <button className="px-3 py-1 hover:bg-gray-100 text-left" onClick={() => { doRename(contextMenu.item!); }}>Rename</button>
+                <button className="w-full px-4 py-2.5 hover:bg-red-50 text-left text-red-600 flex items-center gap-2" onClick={() => { handleDeleteNode(contextMenu.item!.path, contextMenu.item!.type); clearContext(); }}>
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                  </svg>
+                  Delete
+                </button>
+                <button className="w-full px-4 py-2.5 hover:bg-gray-50 text-left flex items-center gap-2" onClick={() => { doCopyItem(contextMenu.item!); }}>
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                  </svg>
+                  Copy
+                </button>
+                <button className="w-full px-4 py-2.5 hover:bg-gray-50 text-left flex items-center gap-2" onClick={() => { doCutItem(contextMenu.item!); }}>
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.121 14.121L19 19m-7-7l7-7m-7 7l-2.879 2.879M12 12L9.121 9.121m0 5.758a3 3 0 10-4.243 4.243 3 3 0 004.243-4.243zm0-5.758a3 3 0 10-4.243-4.243 3 3 0 004.243 4.243z" />
+                  </svg>
+                  Cut
+                </button>
+                <button className="w-full px-4 py-2.5 hover:bg-gray-50 text-left flex items-center gap-2" onClick={() => { doRename(contextMenu.item!); }}>
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+                  </svg>
+                  Rename
+                </button>
               </>
             )}
 
             {contextMenu.isEmpty && (
               <>
-                <div className="px-3 py-1 text-xs text-gray-500">Paste target: {contextMenu.destFolder || '<root>'}</div>
-                <button className={`px-3 py-1 hover:bg-gray-100 text-left ${!clipboard ? 'opacity-50 cursor-not-allowed' : ''}`} onClick={() => { if (clipboard) doPasteTo(contextMenu.destFolder||''); }}>Paste</button>
+                <div className="px-4 py-2 text-xs text-gray-500 bg-gray-50 border-b border-gray-200">
+                  Paste to: {contextMenu.destFolder || '<root>'}
+                </div>
+                <button className={`w-full px-4 py-2.5 hover:bg-gray-50 text-left flex items-center gap-2 ${!clipboard ? 'opacity-50 cursor-not-allowed' : ''}`} onClick={() => { if (clipboard) doPasteTo(contextMenu.destFolder||''); }}>
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
+                  </svg>
+                  Paste
+                </button>
               </>
             )}
           </div>

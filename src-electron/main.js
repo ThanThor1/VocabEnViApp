@@ -5,6 +5,226 @@ const fsSync = require('fs')
 const Papa = require('papaparse')
 const crypto = require('crypto')
 
+try {
+  require('dotenv').config({ path: path.join(__dirname, '..', '.env') })
+} catch (e) {
+}
+
+const AZURE_TRANSLATOR_ENDPOINT = 'https://api.cognitive.microsofttranslator.com'
+const pendingAutoMeaning = new Map()
+
+function normalizeMeaningForMatch(s) {
+  return String(s || '')
+    .toLowerCase()
+    .replace(/[\u2018\u2019\u201C\u201D]/g, '"')
+    .replace(/[^\p{L}\p{N}\s]+/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function chooseMeaningByContext(candidates, contextSentenceVi) {
+  const ctx = normalizeMeaningForMatch(contextSentenceVi)
+  if (!ctx) return ''
+
+  const matches = []
+  for (const c of candidates) {
+    const vi = String(c.vi || '').trim()
+    const n = normalizeMeaningForMatch(vi)
+    if (!n) continue
+    if (ctx.includes(n)) {
+      const tokenCount = n.split(' ').filter(Boolean).length
+      matches.push({ vi, tokenCount, len: n.length })
+    }
+  }
+
+  if (matches.length === 0) return ''
+
+  matches.sort((a, b) => {
+    if (b.tokenCount !== a.tokenCount) return b.tokenCount - a.tokenCount
+    if (b.len !== a.len) return b.len - a.len
+    return 0
+  })
+
+  return matches[0].vi
+}
+
+function splitVietnameseCandidates(s) {
+  const raw = String(s || '').trim()
+  if (!raw) return []
+  // Split common separators if API returns multiple options.
+  const parts = raw.split(/\s*[;\/|,]\s*/g).map(p => p.trim()).filter(Boolean)
+  const uniq = []
+  const seen = new Set()
+  for (const p of parts.length > 0 ? parts : [raw]) {
+    const key = normalizeMeaningForMatch(p)
+    if (!key || seen.has(key)) continue
+    seen.add(key)
+    uniq.push(p)
+  }
+  return uniq
+}
+
+function candidatesLookUntranslated(word, candidates) {
+  const w = normalizeMeaningForMatch(word)
+  const list = Array.isArray(candidates) ? candidates : []
+  if (list.length === 0) return true
+  // If every candidate normalizes to the same as the source word, treat as untranslated.
+  return list.every((c) => normalizeMeaningForMatch(c.vi) === w)
+}
+
+function getTranslatorConfig(payload) {
+  const key = process.env.AZURE_TRANSLATOR_KEY
+  const region = (payload && payload.region) ? payload.region : process.env.AZURE_TRANSLATOR_REGION
+  if (!key) throw new Error('Missing AZURE_TRANSLATOR_KEY')
+  if (!region) throw new Error('Missing AZURE_TRANSLATOR_REGION')
+  return { key, region }
+}
+
+async function azureTranslatePlain({ key, region, from, to, text, signal }) {
+  const url = `${AZURE_TRANSLATOR_ENDPOINT}/translate?api-version=3.0&from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Ocp-Apim-Subscription-Key': key,
+      'Ocp-Apim-Subscription-Region': region,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify([{ Text: text }]),
+    signal
+  })
+  if (!resp.ok) {
+    const t = await resp.text().catch(() => '')
+    throw new Error(`Azure translate failed: ${resp.status} ${t}`)
+  }
+  const data = await resp.json()
+  const translatedText = data && data[0] && data[0].translations && data[0].translations[0] ? data[0].translations[0].text : ''
+  return String(translatedText || '')
+}
+
+async function azureTranslateWordCandidates({ key, region, from, to, word, signal }) {
+  const translated = await azureTranslatePlain({ key, region, from, to, text: word, signal })
+  const parts = splitVietnameseCandidates(translated)
+  return parts.map((vi) => ({ vi, pos: '', back: [word] }))
+}
+
+async function autoMeaningCore(payload) {
+  const req = payload || {}
+  const requestId = String(req.requestId || generateUUID())
+  const word = String(req.word || '').trim()
+  const contextSentenceEn = String(req.contextSentenceEn || '').trim()
+  const from = String(req.from || 'en')
+  const to = String(req.to || 'vi')
+
+  if (!word) {
+    return {
+      requestId,
+      word: '',
+      meaningSuggested: '',
+      contextSentenceVi: '',
+      candidates: []
+    }
+  }
+
+  if (typeof fetch !== 'function') {
+    throw new Error('Global fetch is not available in Electron main process')
+  }
+
+  const controller = new AbortController()
+  pendingAutoMeaning.set(requestId, controller)
+
+  try {
+    const { key, region } = getTranslatorConfig(req)
+
+    const dict = await azureDictionaryLookup({ key, region, from, to, word, signal: controller.signal })
+    const translations = (Array.isArray(dict) && dict[0] && Array.isArray(dict[0].translations)) ? dict[0].translations : []
+    let candidates = translations
+      .map((t) => {
+        const vi = String(t.displayTarget || t.normalizedTarget || '').trim()
+        const pos = String(t.posTag || '').trim()
+        const back = Array.isArray(t.backTranslations)
+          ? t.backTranslations.map((b) => String(b.displayText || b.normalizedText || '').trim()).filter(Boolean).slice(0, 8)
+          : []
+        return { vi, pos, back }
+      })
+      .filter((c) => c.vi)
+
+    // Azure Dictionary Lookup may not return Vietnamese for some language pairs.
+    // If candidates look untranslated, fall back to translating the word itself.
+    if (candidatesLookUntranslated(word, candidates)) {
+      try {
+        const translatedCandidates = await azureTranslateWordCandidates({
+          key,
+          region,
+          from,
+          to,
+          word,
+          signal: controller.signal
+        })
+        if (Array.isArray(translatedCandidates) && translatedCandidates.length > 0) {
+          candidates = translatedCandidates
+        }
+      } catch (e) {
+      }
+    }
+
+    let contextSentenceVi = ''
+    let meaningSuggested = ''
+
+    if (contextSentenceEn) {
+      contextSentenceVi = await azureTranslatePlain({
+        key,
+        region,
+        from,
+        to,
+        text: contextSentenceEn,
+        signal: controller.signal
+      })
+      meaningSuggested = chooseMeaningByContext(candidates, contextSentenceVi)
+    }
+
+    return {
+      requestId,
+      word,
+      meaningSuggested: meaningSuggested || '',
+      contextSentenceVi: contextSentenceVi || '',
+      candidates
+    }
+  } catch (e) {
+    if (e && e.name === 'AbortError') {
+      return {
+        requestId,
+        word,
+        meaningSuggested: '',
+        contextSentenceVi: '',
+        candidates: []
+      }
+    }
+    console.error('autoMeaning error:', e && e.message ? e.message : e)
+    throw e
+  } finally {
+    pendingAutoMeaning.delete(requestId)
+  }
+}
+
+async function azureDictionaryLookup({ key, region, from, to, word, signal }) {
+  const url = `${AZURE_TRANSLATOR_ENDPOINT}/dictionary/lookup?api-version=3.0&from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Ocp-Apim-Subscription-Key': key,
+      'Ocp-Apim-Subscription-Region': region,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify([{ Text: word }]),
+    signal
+  })
+  if (!resp.ok) {
+    const t = await resp.text().catch(() => '')
+    throw new Error(`Azure dictionary lookup failed: ${resp.status} ${t}`)
+  }
+  return await resp.json()
+}
+
 // Simple UUID v4 implementation
 function generateUUID() {
   return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
@@ -19,8 +239,8 @@ function generateUUID() {
 async function ensureCsvHasHeader(filePath) {
   const text = await fs.readFile(filePath, 'utf8')
   if (!text.trim()) {
-    const header = Papa.unparse([], { header: true, columns: ['word', 'meaning', 'pronunciation'] })
-    await fs.writeFile(filePath, 'word,meaning,pronunciation\n', 'utf8')
+    const header = Papa.unparse([], { header: true, columns: ['word', 'meaning', 'pronunciation', 'pos'] })
+    await fs.writeFile(filePath, 'word,meaning,pronunciation,pos\n', 'utf8')
   }
 }
 
@@ -108,7 +328,7 @@ ipcMain.handle('createFile', async (ev, parentRel, name) => {
     const rel = normalizeRel(parentRel)
     const full = rel ? path.join(root, rel, name) : path.join(root, name)
     await fs.mkdir(path.dirname(full), { recursive: true })
-    await fs.writeFile(full, 'word,meaning,pronunciation\n', 'utf8')
+    await fs.writeFile(full, 'word,meaning,pronunciation,pos\n', 'utf8')
     return true
   } catch (err) {
     console.error('Error creating file:', err)
@@ -147,12 +367,28 @@ ipcMain.handle('readCsv', async (ev, filePath) => {
   const full = path.isAbsolute(filePath) ? filePath : path.join(root, normalizeRel(filePath))
   const text = await fs.readFile(full, 'utf8')
   const parsed = Papa.parse(text, { header: true, skipEmptyLines: true })
-  return parsed.data
+  // Strip accumulated quotes from all fields
+  return (parsed.data || []).map(row => ({
+    word: (row.word || '').replace(/"+/g, ''),
+    meaning: (row.meaning || '').replace(/"+/g, ''),
+    pronunciation: (row.pronunciation || '').replace(/"+/g, ''),
+    pos: (row.pos || '').replace(/"+/g, '')
+  }))
 })
 
 async function writeCsv(fileRelOrAbsPath, rows) {
   const root = getDataRoot()
-  const csv = Papa.unparse(rows, { columns: ['word', 'meaning', 'pronunciation'] })
+  // Clean any accumulated quotes from pronunciation field
+  const cleanRows = rows.map(r => ({
+    word: (r.word || '').replace(/"+/g, ''),
+    meaning: (r.meaning || '').replace(/"+/g, ''),
+    pronunciation: (r.pronunciation || '').replace(/"+/g, ''),
+    pos: (r.pos || '').replace(/"+/g, '')
+  }))
+  const csv = Papa.unparse(cleanRows, { 
+    columns: ['word', 'meaning', 'pronunciation', 'pos'],
+    quotes: false  // Prevent auto-quoting
+  })
   // Support both relative paths and absolute paths
   const full = path.isAbsolute(fileRelOrAbsPath) ? fileRelOrAbsPath : path.join(root, normalizeRel(fileRelOrAbsPath))
   await fs.writeFile(full, csv + '\n', 'utf8')
@@ -184,13 +420,18 @@ ipcMain.handle('addWord', async (ev, fileRelOrAbsPath, row) => {
   // auto create file if missing
   if (!fsSync.existsSync(full)) {
     fsSync.mkdirSync(path.dirname(full), { recursive: true });
-    fsSync.writeFileSync(full, 'word,meaning,pronunciation\n', 'utf8');
+    fsSync.writeFileSync(full, 'word,meaning,pronunciation,pos\n', 'utf8');
   }
 
   const text = await fs.readFile(full, 'utf8');
   const parsed = Papa.parse(text, { header: true, skipEmptyLines: true });
   const rows = parsed.data || [];
-  rows.push(row);
+  rows.push({
+    word: row && row.word ? row.word : '',
+    meaning: row && row.meaning ? row.meaning : '',
+    pronunciation: row && row.pronunciation ? row.pronunciation : '',
+    pos: row && row.pos ? row.pos : ''
+  });
 
   await writeCsv(fileRelOrAbsPath, rows);
   return true;
@@ -204,6 +445,25 @@ ipcMain.handle('deleteWord', async (ev, relPath, index) => {
   const parsed = Papa.parse(text, { header: true, skipEmptyLines: true })
   const rows = parsed.data || []
   rows.splice(index, 1)
+  await writeCsv(relPath, rows)
+  return true
+})
+
+ipcMain.handle('editWord', async (ev, relPath, index, newData) => {
+  const root = getDataRoot()
+  const full = path.isAbsolute(relPath) ? relPath : path.join(root, normalizeRel(relPath))
+  const text = await fs.readFile(full, 'utf8')
+  const parsed = Papa.parse(text, { header: true, skipEmptyLines: true })
+  const rows = parsed.data || []
+  if (index >= 0 && index < rows.length) {
+    rows[index] = {
+      ...rows[index],
+      word: newData.word || rows[index].word,
+      meaning: newData.meaning || rows[index].meaning,
+      pronunciation: newData.pronunciation || rows[index].pronunciation,
+      pos: newData.pos || rows[index].pos || ''
+    }
+  }
   await writeCsv(relPath, rows)
   return true
 })
@@ -227,7 +487,7 @@ ipcMain.handle('moveWords', async (ev, srcRel, dstRel, indices) => {
   // ensure destination file exists (create if missing)
   if (!fsSync.existsSync(dstFull)) {
     fsSync.mkdirSync(path.dirname(dstFull), { recursive: true })
-    fsSync.writeFileSync(dstFull, 'word,meaning,pronunciation\n', 'utf8')
+    fsSync.writeFileSync(dstFull, 'word,meaning,pronunciation,pos\n', 'utf8')
   }
 
   const dstText = await fs.readFile(dstFull, 'utf8')
@@ -253,7 +513,7 @@ ipcMain.handle('copyWords', async (ev, srcRel, dstRel, indices) => {
 
   if (!fsSync.existsSync(dstFull)) {
     fsSync.mkdirSync(path.dirname(dstFull), { recursive: true })
-    fsSync.writeFileSync(dstFull, 'word,meaning,pronunciation\n', 'utf8')
+    fsSync.writeFileSync(dstFull, 'word,meaning,pronunciation,pos\n', 'utf8')
   }
 
   const dstText = await fs.readFile(dstFull, 'utf8')
@@ -353,7 +613,7 @@ ipcMain.handle('pdfImport', async () => {
     await fs.writeFile(path.join(pdfDir, 'meta.json'), JSON.stringify(metaData, null, 2), 'utf8')
 
     // Create vocab CSV
-    await fs.writeFile(deckCsvPath, 'word,meaning,pronunciation\n', 'utf8')
+    await fs.writeFile(deckCsvPath, 'word,meaning,pronunciation,pos\n', 'utf8')
 
     // Create highlights.json (store as an array)
     const highlightsPath = path.join(pdfDir, 'highlights.json')
@@ -480,6 +740,44 @@ ipcMain.handle('pdfGetSourceBytes', async (ev, pdfId) => {
   const pdfData = await fs.readFile(meta.sourcePdfPath)
   // Return as ArrayBuffer so it can be transferred to iframe
   return pdfData.buffer.slice(pdfData.byteOffset, pdfData.byteOffset + pdfData.byteLength)
+})
+
+ipcMain.handle('autoMeaningCancel', async (ev, requestId) => {
+  try {
+    const rid = String(requestId || '')
+    const ctrl = pendingAutoMeaning.get(rid)
+    if (ctrl) {
+      try { ctrl.abort() } catch (e) {}
+      pendingAutoMeaning.delete(rid)
+      return true
+    }
+    return false
+  } catch (e) {
+    return false
+  }
+})
+
+ipcMain.handle('translator:autoMeaningCancel', async (ev, requestId) => {
+  try {
+    const rid = String(requestId || '')
+    const ctrl = pendingAutoMeaning.get(rid)
+    if (ctrl) {
+      try { ctrl.abort() } catch (e) {}
+      pendingAutoMeaning.delete(rid)
+      return true
+    }
+    return false
+  } catch (e) {
+    return false
+  }
+})
+
+ipcMain.handle('autoMeaning', async (ev, payload) => {
+  return autoMeaningCore(payload)
+})
+
+ipcMain.handle('translator:autoMeaning', async (ev, payload) => {
+  return autoMeaningCore(payload)
 })
 
 // Move a PDF to trash (soft-delete) - just set meta.trashed flag
