@@ -9,8 +9,6 @@ import {
   flexRender,
 } from "@tanstack/react-table";
 
-declare const window: any;
-
 type VocabRow = {
   word: string;
   meaning: string;
@@ -76,6 +74,14 @@ export default function VocabTable({
 
   const cols = useMemo<ColumnDef<VocabRowWithIndex>[]>(
     () => [
+      {
+        id: "index",
+        header: "#",
+        cell: ({ row }) => (
+          <span className="font-medium text-gray-600">{row.original.__idx + 1}</span>
+        ),
+        size: 50,
+      },
       {
         id: "select",
         header: "Select",

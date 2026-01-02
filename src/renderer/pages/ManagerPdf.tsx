@@ -4,8 +4,6 @@ import { useNavigate, useLocation } from 'react-router-dom'
 import VocabTable from '../shared/VocabTable'
 import { usePersistedState } from '../shared/usePersistedState'
 
-declare const window: any
-
 export default function ManagerPdf() {
   const navigate = useNavigate()
   const location = useLocation()

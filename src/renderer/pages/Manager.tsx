@@ -8,8 +8,6 @@ import FolderNavigator from "../shared/FolderNavigator";
 import { usePersistedState } from "../shared/usePersistedState";
 import { POS_OPTIONS } from "../shared/posOptions";
 
-declare const window: any;
-
 type TreeNode = {
   name: string;
   path: string;
@@ -68,26 +66,7 @@ export default function Manager() {
 
   const [errorMessage, setErrorMessage] = useState<string>('');
 
-  const api = window.api as
-    | undefined
-    | {
-        listTree: () => Promise<TreeNode[]>;
-        readCsv: (filePath: string) => Promise<any[]>;
-        deleteWord: (filePath: string, idx: number) => Promise<void>;
-        editWord: (filePath: string, idx: number, data: {word: string, meaning: string, pronunciation: string, pos?: string}) => Promise<void>;
-        addWord: (filePath: string, row: any) => Promise<void>;
-        // parentRel can be '' for root
-        createFolder: (parentRel: string, name: string) => Promise<boolean>;
-        createFile: (parentRel: string, name: string) => Promise<boolean>;
-        deleteFolder?: (path: string) => Promise<void>;
-        deleteFile?: (path: string) => Promise<void>;
-        copyPath?: (srcRel: string, dstRel: string) => Promise<void>;
-        movePath?: (srcRel: string, dstRel: string) => Promise<void>;
-        renamePath?: (relPath: string, newName: string) => Promise<void>;
-        pdfDelete?: (pdfId: string) => Promise<void>;
-        pdfTrash?: (pdfId: string) => Promise<void>;
-        pdfRestore?: (pdfId: string) => Promise<void>;
-      };
+  const api = window.api;
 
   async function loadTree() {
     const listTreeFn = api?.listTree;

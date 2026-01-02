@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import AddWordModal from './AddWordModal';
 import ErrorBoundary from './ErrorBoundary';
+import TranslateTextModal from './TranslateTextModal';
 
 interface Rect {
   xPct: number;
@@ -42,12 +43,15 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
   };
 
   const [showAddWordModal, setShowAddWordModal] = useState(false);
+  const [showTranslateModal, setShowTranslateModal] = useState(false);
   const [selectedText, setSelectedText] = useState<{
     text: string;
     pageNumber: number;
     rects: Rect[];
     contextSentenceEn?: string;
   } | null>(null);
+
+  const [selectedPassage, setSelectedPassage] = useState<string>('');
 
   const [targetPage, setTargetPage] = useState('');
 
@@ -198,8 +202,20 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
       }
 
       if (type === 'PDF_SELECTION') {
+        const rawText = String(event.data?.text || '').trim();
+        const wordCount = rawText ? rawText.split(/\s+/g).filter(Boolean).length : 0;
+
+        // New behavior: if selection is longer than 5 words, translate passage only (do not add vocab).
+        if (wordCount > 5) {
+          setSelectedPassage(rawText);
+          setShowTranslateModal(true);
+          setShowAddWordModal(false);
+          setSelectedText(null);
+          return;
+        }
+
         setSelectedText({
-          text: event.data.text,
+          text: rawText,
           pageNumber: event.data.pageNumber,
           rects: Array.isArray(event.data?.rects) ? event.data.rects : [],
           contextSentenceEn: typeof event.data?.contextSentenceEn === 'string' ? event.data.contextSentenceEn : ''
@@ -393,6 +409,18 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
           onCancel={() => {
             setShowAddWordModal(false);
             setSelectedText(null);
+          }}
+        />
+      )}
+
+      {showTranslateModal && selectedPassage && (
+        <TranslateTextModal
+          text={selectedPassage}
+          from="en"
+          to="vi"
+          onClose={() => {
+            setShowTranslateModal(false);
+            setSelectedPassage('');
           }}
         />
       )}

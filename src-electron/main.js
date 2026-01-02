@@ -148,25 +148,6 @@ async function autoMeaningCore(payload) {
       })
       .filter((c) => c.vi)
 
-    // Azure Dictionary Lookup may not return Vietnamese for some language pairs.
-    // If candidates look untranslated, fall back to translating the word itself.
-    if (candidatesLookUntranslated(word, candidates)) {
-      try {
-        const translatedCandidates = await azureTranslateWordCandidates({
-          key,
-          region,
-          from,
-          to,
-          word,
-          signal: controller.signal
-        })
-        if (Array.isArray(translatedCandidates) && translatedCandidates.length > 0) {
-          candidates = translatedCandidates
-        }
-      } catch (e) {
-      }
-    }
-
     let contextSentenceVi = ''
     let meaningSuggested = ''
 
@@ -778,6 +759,17 @@ ipcMain.handle('autoMeaning', async (ev, payload) => {
 
 ipcMain.handle('translator:autoMeaning', async (ev, payload) => {
   return autoMeaningCore(payload)
+})
+
+ipcMain.handle('translator:translatePlain', async (ev, payload) => {
+  const req = payload || {}
+  const text = String(req.text || '').trim()
+  const from = String(req.from || 'en')
+  const to = String(req.to || 'vi')
+  if (!text) return ''
+
+  const { key, region } = getTranslatorConfig(req)
+  return await azureTranslatePlain({ key, region, from, to, text })
 })
 
 // Move a PDF to trash (soft-delete) - just set meta.trashed flag

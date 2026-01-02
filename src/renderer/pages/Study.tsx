@@ -3,8 +3,6 @@ import ErrorBoundary from '../shared/ErrorBoundary'
 import { useLocation } from 'react-router-dom'
 import { usePersistedState } from '../shared/usePersistedState'
 
-declare const window:any
-
 function shuffle<T>(a:T[]){
   for(let i=a.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[a[i],a[j]]=[a[j],a[i]]}
   return a
@@ -17,9 +15,20 @@ type Card = {
   source?: string;
 }
 
+type LearnMode = 'all' | 'random' | 'select' | 'range'
+
+type FileStudyConfig = {
+  mode: LearnMode
+  randomCount: number
+  rangeStart: number
+  rangeEnd: number
+  selectedMap: Record<number, boolean>
+}
+
 export default function Study(){
   const location = useLocation();
   const [tree, setTree] = useState<any[]>([])
+  const [pdfList, setPdfList] = useState<any[]>([])
   const [selectedFiles, setSelectedFiles] = usePersistedState<string[]>('study_selectedFiles', [])
   const [deck, setDeck] = usePersistedState<Card[]>('study_deck', [])
   const [queue, setQueue] = usePersistedState<Card[]>('study_queue', [])
@@ -32,7 +41,22 @@ export default function Study(){
   const [stats, setStats] = usePersistedState('study_stats', { correct: 0, incorrect: 0, hard: 0, easy: 0 })
   const inputRef = useRef<HTMLInputElement|null>(null)
 
-  useEffect(()=>{ window.api.listTree().then((t:any)=>setTree(t)) }, [])
+  const [fileConfigs, setFileConfigs] = useState<Record<string, FileStudyConfig>>({})
+  const [fileCardsByPath, setFileCardsByPath] = useState<Record<string, Card[]>>({})
+  const [fileCardsLoading, setFileCardsLoading] = useState<Record<string, boolean>>({})
+
+  const defaultFileConfig = (): FileStudyConfig => ({
+    mode: 'all',
+    randomCount: 20,
+    rangeStart: 1,
+    rangeEnd: 10,
+    selectedMap: {},
+  })
+
+  useEffect(()=>{ 
+    window.api.listTree().then((t:any)=>setTree(t))
+    window.api.pdfList?.().then((p:any)=>setPdfList(p || [])).catch(()=>{})
+  }, [])
 
   // Auto-start if files are passed via navigation state
   useEffect(() => {
@@ -47,8 +71,81 @@ export default function Study(){
   }, [location]);
 
   async function handleAutoStart(files: string[]) {
-    const cards = await fetchCsvForFiles(files)
-    const shuffled = shuffle(cards)
+    // Auto-start defaults to "all" mode for each file.
+    const cfg: Record<string, FileStudyConfig> = {}
+    for (const f of files) cfg[f] = defaultFileConfig()
+    await startSession(files, cfg)
+  }
+
+  async function fetchCsvForFile(filePath: string): Promise<Card[]> {
+    try {
+      const rows = await window.api.readCsv(filePath)
+      const out: Card[] = []
+      for (const r of rows || []) {
+        if (!r?.word || !r?.meaning) continue
+        out.push({
+          word: String(r.word),
+          meaning: String(r.meaning),
+          pronunciation: r.pronunciation || '',
+          source: filePath,
+        })
+      }
+      return out
+    } catch (err) {
+      console.error('readCsv error', filePath, err)
+      return []
+    }
+  }
+
+  function applyLearnModeForFile(allCards: Card[], cfg: FileStudyConfig): Card[] {
+    const mode = cfg?.mode || 'all'
+    if (mode === 'all') return allCards
+
+    if (mode === 'random') {
+      const count = Math.max(1, Math.min(Number(cfg.randomCount) || 1, allCards.length))
+      const shuffled = shuffle([...allCards])
+      return shuffled.slice(0, count)
+    }
+
+    if (mode === 'range') {
+      const start = Math.max(0, (Number(cfg.rangeStart) || 1) - 1)
+      const end = Math.min(allCards.length, Number(cfg.rangeEnd) || allCards.length)
+      return allCards.slice(start, end)
+    }
+
+    if (mode === 'select') {
+      const sel = cfg.selectedMap || {}
+      return allCards.filter((_, idx) => !!sel[idx])
+    }
+
+    return allCards
+  }
+
+  async function startSession(files: string[], cfgByFile?: Record<string, FileStudyConfig>) {
+    const configs = cfgByFile || fileConfigs
+
+    // Validate select mode: must pick at least 1 word per select-file
+    for (const f of files) {
+      const cfg = configs?.[f]
+      if (cfg?.mode === 'select') {
+        const hasAny = Object.values(cfg.selectedMap || {}).some(Boolean)
+        if (!hasAny) {
+          alert(`Bạn đang chọn chế độ "tự chọn" nhưng chưa chọn từ nào cho file:\n${f}`)
+          return
+        }
+      }
+    }
+
+    const combined: Card[] = []
+    for (const f of files) {
+      const cfg = configs?.[f] || defaultFileConfig()
+      const cached = fileCardsByPath[f]
+      const cards = Array.isArray(cached) ? cached : await fetchCsvForFile(f)
+      const subset = applyLearnModeForFile(cards, cfg)
+      combined.push(...subset)
+    }
+
+    const shuffled = shuffle(combined)
     setDeck(shuffled)
     setQueue(shuffled.slice())
     setIndex(0)
@@ -58,22 +155,6 @@ export default function Study(){
     setLastAnswerCorrect(null)
     setInput('')
     setStats({ correct: 0, incorrect: 0, hard: 0, easy: 0 })
-  }
-
-  async function fetchCsvForFiles(files:string[]) {
-    const all: Card[] = []
-    for(const f of files){
-      try{
-        const rows = await window.api.readCsv(f)
-        for(const r of rows){
-          if (!r.word || !r.meaning) continue
-          all.push({ word: String(r.word), meaning: String(r.meaning), pronunciation: r.pronunciation || '', source: f })
-        }
-      }catch(err){
-        console.error('readCsv error', f, err)
-      }
-    }
-    return all
   }
 
   function maskWordAllUnderscore(w:string, revealCount:number){
@@ -104,17 +185,30 @@ export default function Study(){
   }
 
   async function start(){
-    const cards = await fetchCsvForFiles(selectedFiles)
-    const shuffled = shuffle(cards)
-    setDeck(shuffled)
-    setQueue(shuffled.slice())
-    setIndex(0)
-    setPhase('studying')
-    setRevealLevel(0)
-    setToReview([])
-    setLastAnswerCorrect(null)
-    setInput('')
-    setStats({ correct: 0, incorrect: 0, hard: 0, easy: 0 })
+    await startSession(selectedFiles)
+  }
+
+  function updateFileConfig(filePath: string, patch: Partial<FileStudyConfig>) {
+    setFileConfigs((prev) => {
+      const base = prev?.[filePath] || defaultFileConfig()
+      return { ...(prev || {}), [filePath]: { ...base, ...patch } }
+    })
+  }
+
+  function toggleSelectedWord(filePath: string, idx: number, checked: boolean) {
+    setFileConfigs((prev) => {
+      const base = prev?.[filePath] || defaultFileConfig()
+      return {
+        ...(prev || {}),
+        [filePath]: {
+          ...base,
+          selectedMap: {
+            ...(base.selectedMap || {}),
+            [idx]: checked,
+          },
+        },
+      }
+    })
   }
 
   // handle submit answer
@@ -225,6 +319,54 @@ export default function Study(){
     return files
   }
 
+  // Get all PDF deck files
+  function getPdfDeckFiles(): any[] {
+    return (pdfList || []).map((pdf) => ({ 
+      name: `${pdf.baseName} (PDF)`, 
+      path: pdf.deckCsvPath 
+    }))
+  }
+
+  // Ensure we have configs/cards for all selected files
+  useEffect(() => {
+    if (!selectedFiles || selectedFiles.length === 0) return
+
+    // Ensure config exists
+    setFileConfigs((prev) => {
+      const next = { ...(prev || {}) }
+      for (const f of selectedFiles) {
+        if (!next[f]) next[f] = defaultFileConfig()
+      }
+      // prune removed
+      for (const k of Object.keys(next)) {
+        if (!selectedFiles.includes(k)) delete next[k]
+      }
+      return next
+    })
+
+    // Load missing cards
+    ;(async () => {
+      for (const f of selectedFiles) {
+        if (fileCardsByPath[f] || fileCardsLoading[f]) continue
+        try {
+          setFileCardsLoading((p) => ({ ...(p || {}), [f]: true }))
+          const cards = await fetchCsvForFile(f)
+          setFileCardsByPath((p) => ({ ...(p || {}), [f]: cards }))
+          // If range end is still default, adjust to file length
+          setFileConfigs((p) => {
+            const cur = p?.[f]
+            if (!cur) return p
+            if (cur.rangeEnd !== 10) return p
+            return { ...p, [f]: { ...cur, rangeEnd: Math.min(10, cards.length || 10) } }
+          })
+        } finally {
+          setFileCardsLoading((p) => ({ ...(p || {}), [f]: false }))
+        }
+      }
+    })().catch(() => {})
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedFiles])
+
   // progress counts
   const totalToLearn = queue.length
   const currentPos = Math.min(index+1, totalToLearn)
@@ -249,7 +391,7 @@ export default function Study(){
           </div>
 
           {/* File Selection Card */}
-          <div className="bg-white rounded-2xl shadow-xl border border-gray-100 p-8">
+          <div className="bg-white rounded-2xl shadow-xl border border-gray-100 p-8 mb-6">
             <h2 className="text-xl font-bold text-gray-800 mb-6 flex items-center gap-2">
               <svg className="w-6 h-6 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
@@ -257,7 +399,7 @@ export default function Study(){
               Select Files to Study
             </h2>
             
-            {allFiles.length === 0 ? (
+            {allFiles.length === 0 && getPdfDeckFiles().length === 0 ? (
               <div className="text-center py-12 text-gray-500">
                 <svg className="w-16 h-16 mx-auto mb-4 text-gray-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
@@ -267,54 +409,191 @@ export default function Study(){
               </div>
             ) : (
               <div className="space-y-2 max-h-96 overflow-y-auto pr-2">
-                {allFiles.map((f: any, i: number) => (
-                  <label
-                    key={i}
-                    className="flex items-center gap-3 p-4 rounded-xl border-2 border-gray-200 hover:border-blue-400 hover:bg-blue-50 cursor-pointer transition-all group"
-                  >
-                    <input
-                      type="checkbox"
-                      checked={selectedFiles.includes(f.path)}
-                      onChange={(e) => {
-                        const s = [...selectedFiles]
-                        if (e.target.checked) s.push(f.path)
-                        else {
-                          const idx = s.indexOf(f.path)
-                          if (idx >= 0) s.splice(idx, 1)
-                        }
-                        setSelectedFiles(s)
-                      }}
-                      className="w-5 h-5 text-blue-500 rounded focus:ring-2 focus:ring-blue-500"
-                    />
-                    <div className="flex-1 min-w-0">
-                      <div className="font-medium text-gray-900 truncate">{f.name}</div>
-                      <div className="text-xs text-gray-500 truncate">{f.path}</div>
+                {allFiles.concat(getPdfDeckFiles()).map((f: any, i: number) => {
+                  const checked = selectedFiles.includes(f.path)
+                  const cfg = fileConfigs[f.path] || defaultFileConfig()
+                  const cards = fileCardsByPath[f.path] || []
+                  const loading = !!fileCardsLoading[f.path]
+
+                  return (
+                    <div
+                      key={i}
+                      className={`p-4 rounded-xl border-2 transition-all ${
+                        checked ? 'border-blue-400 bg-blue-50' : 'border-gray-200 hover:border-blue-400 hover:bg-blue-50'
+                      }`}
+                    >
+                      <div className="flex items-center gap-3">
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={(e) => {
+                            const s = [...selectedFiles]
+                            if (e.target.checked) {
+                              s.push(f.path)
+                              updateFileConfig(f.path, {})
+                            } else {
+                              const idx = s.indexOf(f.path)
+                              if (idx >= 0) s.splice(idx, 1)
+                            }
+                            setSelectedFiles(s)
+                          }}
+                          className="w-5 h-5 text-blue-500 rounded focus:ring-2 focus:ring-blue-500"
+                        />
+                        <div className="flex-1 min-w-0">
+                          <div className="font-medium text-gray-900 truncate">{f.name}</div>
+                          <div className="text-xs text-gray-500 truncate">{f.path}</div>
+                        </div>
+                        <div className="text-xs text-gray-500">
+                          {checked ? (loading ? 'Loading…' : `${cards.length} words`) : ''}
+                        </div>
+                      </div>
+
+                      {checked && (
+                        <div className="mt-4 pl-8">
+                          <div className="text-sm font-semibold text-gray-700 mb-2">Choose Learning Mode (per file)</div>
+                          <div className="grid grid-cols-2 gap-2">
+                            <button
+                              type="button"
+                              onClick={() => updateFileConfig(f.path, { mode: 'all' })}
+                              className={`p-3 rounded-lg border-2 transition-all ${
+                                cfg.mode === 'all'
+                                  ? 'border-blue-500 bg-white font-semibold text-blue-700'
+                                  : 'border-gray-200 hover:border-gray-300 bg-white'
+                              }`}
+                            >
+                              1. All Words
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => updateFileConfig(f.path, { mode: 'random' })}
+                              className={`p-3 rounded-lg border-2 transition-all ${
+                                cfg.mode === 'random'
+                                  ? 'border-blue-500 bg-white font-semibold text-blue-700'
+                                  : 'border-gray-200 hover:border-gray-300 bg-white'
+                              }`}
+                            >
+                              2. Random N Words
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => updateFileConfig(f.path, { mode: 'select' })}
+                              className={`p-3 rounded-lg border-2 transition-all ${
+                                cfg.mode === 'select'
+                                  ? 'border-blue-500 bg-white font-semibold text-blue-700'
+                                  : 'border-gray-200 hover:border-gray-300 bg-white'
+                              }`}
+                            >
+                              3. Select Words
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => updateFileConfig(f.path, { mode: 'range' })}
+                              className={`p-3 rounded-lg border-2 transition-all ${
+                                cfg.mode === 'range'
+                                  ? 'border-blue-500 bg-white font-semibold text-blue-700'
+                                  : 'border-gray-200 hover:border-gray-300 bg-white'
+                              }`}
+                            >
+                              4. Range (x1-x2)
+                            </button>
+                          </div>
+
+                          {cfg.mode === 'random' && (
+                            <div className="mt-3 p-3 bg-white rounded-lg border border-gray-200">
+                              <label className="block text-sm font-medium text-gray-700 mb-2">Random Count:</label>
+                              <input
+                                type="number"
+                                min={1}
+                                value={cfg.randomCount}
+                                onChange={(e) => updateFileConfig(f.path, { randomCount: Math.max(1, parseInt(e.target.value) || 1) })}
+                                className="border rounded px-3 py-2 w-full"
+                              />
+                            </div>
+                          )}
+
+                          {cfg.mode === 'range' && (
+                            <div className="mt-3 p-3 bg-white rounded-lg border border-gray-200 space-y-2">
+                              <label className="block text-sm font-medium text-gray-700">Range From:</label>
+                              <input
+                                type="number"
+                                min={1}
+                                value={cfg.rangeStart}
+                                onChange={(e) => updateFileConfig(f.path, { rangeStart: Math.max(1, parseInt(e.target.value) || 1) })}
+                                className="border rounded px-3 py-2 w-full"
+                              />
+                              <label className="block text-sm font-medium text-gray-700 mt-2">Range To:</label>
+                              <input
+                                type="number"
+                                min={1}
+                                value={cfg.rangeEnd}
+                                onChange={(e) => updateFileConfig(f.path, { rangeEnd: Math.max(1, parseInt(e.target.value) || 1) })}
+                                className="border rounded px-3 py-2 w-full"
+                              />
+                              <div className="text-xs text-gray-500">Max: {cards.length}</div>
+                            </div>
+                          )}
+
+                          {cfg.mode === 'select' && (
+                            <div className="mt-3 p-3 bg-white rounded-lg border border-gray-200">
+                              <div className="text-sm font-medium text-gray-700 mb-2">Select Words:</div>
+                              {loading ? (
+                                <div className="text-sm text-gray-500">Loading words…</div>
+                              ) : cards.length === 0 ? (
+                                <div className="text-sm text-gray-500">No words found in this file.</div>
+                              ) : (
+                                <div className="max-h-56 overflow-y-auto">
+                                  <table className="w-full text-left text-sm">
+                                    <thead className="bg-gray-100 border-b">
+                                      <tr>
+                                        <th className="px-3 py-2">#</th>
+                                        <th className="px-3 py-2">Word</th>
+                                        <th className="px-3 py-2">Meaning</th>
+                                      </tr>
+                                    </thead>
+                                    <tbody>
+                                      {cards.map((card, idx) => (
+                                        <tr key={idx} className="border-b hover:bg-gray-50">
+                                          <td className="px-3 py-2">
+                                            <input
+                                              type="checkbox"
+                                              checked={!!cfg.selectedMap?.[idx]}
+                                              onChange={(e) => toggleSelectedWord(f.path, idx, e.target.checked)}
+                                              className="w-4 h-4"
+                                            />
+                                          </td>
+                                          <td className="px-3 py-2 font-medium">{card.word}</td>
+                                          <td className="px-3 py-2 text-gray-700">{card.meaning}</td>
+                                        </tr>
+                                      ))}
+                                    </tbody>
+                                  </table>
+                                </div>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      )}
                     </div>
-                    <svg className="w-5 h-5 text-gray-300 group-hover:text-blue-500 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
-                    </svg>
-                  </label>
-                ))}
+                  )
+                })}
               </div>
             )}
 
             {selectedFiles.length > 0 && (
-              <div className="mt-6 pt-6 border-t border-gray-200">
-                <div className="flex items-center justify-between">
-                  <div className="text-sm text-gray-600">
-                    <span className="font-semibold text-blue-600">{selectedFiles.length}</span> file(s) selected
-                  </div>
-                  <button
-                    onClick={start}
-                    className="btn-primary px-8 py-3 text-lg flex items-center gap-2"
-                  >
-                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                    </svg>
-                    Start Learning
-                  </button>
+              <div className="mt-6 pt-6 border-t border-gray-200 space-y-4">
+                <div className="text-sm text-gray-600">
+                  <span className="font-semibold text-blue-600">{selectedFiles.length}</span> file(s) selected
                 </div>
+                <button
+                  onClick={start}
+                  className="btn-primary px-8 py-3 text-lg flex items-center gap-2"
+                >
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                  </svg>
+                  Start Learning
+                </button>
               </div>
             )}
           </div>

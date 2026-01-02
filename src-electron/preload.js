@@ -37,6 +37,8 @@ contextBridge.exposeInMainWorld('api', {
   autoMeaning: (payload) => ipcRenderer.invoke('translator:autoMeaning', payload),
   autoMeaningCancel: (requestId) => ipcRenderer.invoke('translator:autoMeaningCancel', requestId)
   ,
+  translatePlain: (payload) => ipcRenderer.invoke('translator:translatePlain', payload)
+  ,
   // listen for deck updates (emitted when a CSV inside a PDF folder is written)
   onDeckUpdated: (cb) => ipcRenderer.on('deck-updated', (ev, data) => cb && cb(data))
   ,

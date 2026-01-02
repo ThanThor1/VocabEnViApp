@@ -2,8 +2,6 @@ import React, { useState, useEffect } from 'react'
 import ErrorBoundary from './ErrorBoundary'
 import { useNavigate } from 'react-router-dom'
 
-declare const window: any
-
 interface Props {
   pdfId: string
   baseName: string

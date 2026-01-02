@@ -5,8 +5,6 @@ import PdfViewer from '../shared/PdfViewer'
 import PdfVocabPanel from '../shared/PdfVocabPanel'
 import { usePersistedState } from '../shared/usePersistedState'
 
-declare const window: any
-
 type PdfItem = {
   pdfId: string
   baseName: string

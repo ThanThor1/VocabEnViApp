@@ -163,14 +163,12 @@
 
       <div id="toolbarRight">
         <select id="scaleSelect" title="Zoom">
-          <option value="auto" selected>Auto</option>
-          <option value="page-actual">100%</option>
-          <option value="page-width">Fit Width</option>
+          <option value="page-width" selected>Fit Width</option>
           <option value="50">50%</option>
           <option value="75">75%</option>
           <option value="100">100%</option>
           <option value="125">125%</option>
-          <option value="150" selected>150%</option>
+          <option value="150">150%</option>
           <option value="200">200%</option>
         </select>
       </div>
@@ -190,7 +188,7 @@
     let pdfjsLib = null;
     let pdfDoc = null;
     let pageNum = 1;
-    let zoomMode = "fixed";
+    let zoomMode = "page-width";
     let fixedScale = 1.5;
     let currentHighlights = [];
     let pdfIdFromParent = null;
@@ -252,21 +250,31 @@
 
     function updateScaleSelect(scale) {
       const select = document.getElementById('scaleSelect');
-      const percentage = Math.round(scale * 100);
+      if (!select) return;
 
-      const options = Array.from(select.options);
-      const exactMatch = options.find(opt => {
-        const val = parseInt(opt.value, 10);
-        return !isNaN(val) && val === percentage;
-      });
-
-      if (exactMatch) {
-        select.value = exactMatch.value;
-      } else if (percentage === 100) {
-        select.value = 'page-actual';
-      } else {
-        select.value = options.find(opt => !isNaN(parseInt(opt.value, 10)))?.value || '100';
+      if (zoomMode === 'page-width') {
+        select.value = 'page-width';
+        return;
       }
+
+      const percentage = Math.round(scale * 100);
+      const numericOptions = Array.from(select.options)
+        .map(opt => parseInt(opt.value, 10))
+        .filter(n => !Number.isNaN(n));
+
+      if (numericOptions.length === 0) return;
+
+      let best = numericOptions[0];
+      let bestDiff = Math.abs(best - percentage);
+      for (const n of numericOptions) {
+        const diff = Math.abs(n - percentage);
+        if (diff < bestDiff) {
+          best = n;
+          bestDiff = diff;
+        }
+      }
+
+      select.value = String(best);
     }
 
     function setCurrentPage(newPage, skipNotify) {
@@ -398,12 +406,8 @@
       const base = page.getViewport({ scale: 1 });
       const container = document.getElementById("mainContainer");
       const cw = Math.max(100, (container ? container.clientWidth : window.innerWidth) - 24);
-      const ch = Math.max(100, window.innerHeight - 130);
 
-      if (zoomMode === "page-actual") return 1;
-      if (zoomMode === "page-width" || zoomMode === "auto") return cw / base.width;
-      if (zoomMode === "page-height") return ch / base.height;
-      if (zoomMode === "page-fit") return Math.min(cw / base.width, ch / base.height);
+      if (zoomMode === "page-width") return cw / base.width;
       return fixedScale;
     }
 
@@ -490,6 +494,94 @@
         const winStart = Math.max(0, idx - 90);
         const winEnd = Math.min(p.length, after + 90);
         sentence = p.slice(winStart, winEnd).trim();
+      }
+      return sentence;
+    }
+
+    function findFirstTextDescendant(node) {
+      try {
+        if (!node) return null;
+        if (node.nodeType === Node.TEXT_NODE) return node;
+        const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT, null);
+        return walker.nextNode();
+      } catch (e) {
+        return null;
+      }
+    }
+
+    function buildTextFromTextLayerAndGetIndex(textLayerEl, selection) {
+      try {
+        if (!textLayerEl || !selection) return null;
+
+        // Use focus (where the mouseup ended). This maps better when selecting across multiple words.
+        const focusNode = findFirstTextDescendant(selection.focusNode) || findFirstTextDescendant(selection.anchorNode);
+        const focusOffsetRaw = typeof selection.focusOffset === 'number' ? selection.focusOffset : 0;
+
+        let out = '';
+        let outIndexAtFocus = -1;
+
+        const walker = document.createTreeWalker(textLayerEl, NodeFilter.SHOW_TEXT, null);
+        let prevEndedWithSpace = true;
+        let n;
+        while ((n = walker.nextNode())) {
+          const nodeText = n.nodeValue || '';
+          if (!nodeText) continue;
+
+          const startsWithSpace = /^\s/.test(nodeText);
+          const needsSpace = out.length > 0 && !prevEndedWithSpace && !startsWithSpace;
+          const prefix = needsSpace ? ' ' : '';
+
+          if (focusNode && n === focusNode && outIndexAtFocus < 0) {
+            const clampedOffset = Math.max(0, Math.min(focusOffsetRaw, nodeText.length));
+            outIndexAtFocus = out.length + prefix.length + clampedOffset;
+          }
+
+          out += prefix + nodeText;
+          prevEndedWithSpace = /\s$/.test(nodeText);
+        }
+
+        out = out.replace(/\s+/g, ' ').trim();
+        if (!out) return null;
+
+        // If trimming shifted the index slightly, clamp it.
+        if (outIndexAtFocus >= out.length) outIndexAtFocus = out.length - 1;
+        if (outIndexAtFocus < 0) outIndexAtFocus = Math.floor(out.length / 2);
+
+        return { text: out, index: outIndexAtFocus };
+      } catch (e) {
+        return null;
+      }
+    }
+
+    function extractContextSentenceAtIndex(fullText, index) {
+      const s = String(fullText || '');
+      if (!s) return '';
+      const lower = s.toLowerCase();
+      const idx = Math.max(0, Math.min(Number.isFinite(index) ? index : 0, lower.length - 1));
+
+      // sentence boundaries: . ? ! or newline
+      const leftBound = Math.max(
+        lower.lastIndexOf('.', idx),
+        lower.lastIndexOf('?', idx),
+        lower.lastIndexOf('!', idx),
+        lower.lastIndexOf('\n', idx)
+      );
+      let start = leftBound >= 0 ? leftBound + 1 : Math.max(0, idx - 90);
+
+      const candidates = [
+        lower.indexOf('.', idx + 1),
+        lower.indexOf('?', idx + 1),
+        lower.indexOf('!', idx + 1),
+        lower.indexOf('\n', idx + 1)
+      ].filter(n => n >= 0);
+      let end = candidates.length > 0 ? Math.min(...candidates) + 1 : Math.min(lower.length, idx + 90);
+
+      let sentence = s.slice(start, end).trim();
+      // Clamp very long outputs to a compact window
+      if (sentence.length > 220) {
+        const winStart = Math.max(0, idx - 90);
+        const winEnd = Math.min(lower.length, idx + 90);
+        sentence = s.slice(winStart, winEnd).trim();
       }
       return sentence;
     }
@@ -957,9 +1049,9 @@
 
     document.getElementById("scaleSelect").addEventListener("change", function () {
       const v = this.value;
-      if (v === "auto" || v === "page-width") zoomMode = "page-width";
-      else if (v === "page-actual" || v === "page-fit" || v === "page-height") zoomMode = v;
-      else {
+      if (v === "page-width") {
+        zoomMode = "page-width";
+      } else {
         const pct = parseInt(v, 10);
         if (!Number.isNaN(pct)) {
           zoomMode = "fixed";
@@ -1107,8 +1199,21 @@
         }
 
         if (pctRects.length > 0) {
-          const plainText = pagePlainTextByNumber.get(pageNumber) || '';
-          const contextSentenceEn = plainText ? extractContextSentence(plainText, text) : '';
+          let contextSentenceEn = '';
+
+          // Prefer sentence extraction based on the exact clicked/ended position in the text layer.
+          const textLayer = pageDiv.querySelector('.textLayer');
+          const built = buildTextFromTextLayerAndGetIndex(textLayer, selection);
+          if (built && built.text) {
+            contextSentenceEn = extractContextSentenceAtIndex(built.text, built.index);
+          }
+
+          // Fallback: old behavior (first occurrence search in cached plain text)
+          if (!contextSentenceEn) {
+            const plainText = pagePlainTextByNumber.get(pageNumber) || '';
+            contextSentenceEn = plainText ? extractContextSentence(plainText, text) : '';
+          }
+
           window.parent.postMessage({
             type: "PDF_SELECTION",
             text,
