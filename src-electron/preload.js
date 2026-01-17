@@ -37,8 +37,23 @@ contextBridge.exposeInMainWorld('api', {
   autoMeaning: (payload) => ipcRenderer.invoke('translator:autoMeaning', payload),
   autoMeaningCancel: (requestId) => ipcRenderer.invoke('translator:autoMeaningCancel', requestId)
   ,
+  suggestExampleSentence: (payload) => ipcRenderer.invoke('translator:suggestExampleSentence', payload)
+  ,
+  suggestIpa: (payload) => ipcRenderer.invoke('translator:suggestIpa', payload)
+  ,
   translatePlain: (payload) => ipcRenderer.invoke('translator:translatePlain', payload)
   ,
+  // Per-user settings (stored in userData/.env)
+  getGoogleAiStudioStatus: () => ipcRenderer.invoke('settings:getGoogleAiStudioStatus'),
+  setGoogleAiStudioApiKey: (apiKey) => ipcRenderer.invoke('settings:setGoogleAiStudioApiKey', apiKey),
+  clearGoogleAiStudioApiKey: () => ipcRenderer.invoke('settings:clearGoogleAiStudioApiKey'),
+
+  // Multi-key management (stored in userData/google-ai-studio-keys.json)
+  listGoogleAiStudioApiKeys: () => ipcRenderer.invoke('settings:listGoogleAiStudioApiKeys'),
+  addGoogleAiStudioApiKey: (payload) => ipcRenderer.invoke('settings:addGoogleAiStudioApiKey', payload),
+  deleteGoogleAiStudioApiKey: (keyId) => ipcRenderer.invoke('settings:deleteGoogleAiStudioApiKey', keyId),
+  setActiveGoogleAiStudioApiKey: (keyId) => ipcRenderer.invoke('settings:setActiveGoogleAiStudioApiKey', keyId),
+
   // listen for deck updates (emitted when a CSV inside a PDF folder is written)
   onDeckUpdated: (cb) => ipcRenderer.on('deck-updated', (ev, data) => cb && cb(data))
   ,
