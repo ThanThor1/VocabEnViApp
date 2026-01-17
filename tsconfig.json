@@ -11,5 +11,6 @@
     "resolveJsonModule": true,
     "baseUrl": "./"
   },
-  "include": ["src", "src-electron", "electron.d.ts"]
+  "include": ["src", "electron", "electron.d.ts"],
+  "exclude": ["src/renderer/**", "dist/**", "dist-electron/**", "release/**"]
 }
