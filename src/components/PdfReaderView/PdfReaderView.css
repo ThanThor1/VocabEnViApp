@@ -1,0 +1,282 @@
+/* ============================================
+   PdfReaderView - Modern Redesign
+   ============================================ */
+
+/* Main PDF container */
+.pdf-container {
+  @apply flex h-full 
+         bg-slate-100 dark:bg-slate-950;
+}
+
+/* PDF sidebar (left) */
+.pdf-sidebar {
+  @apply w-72 xl:w-80
+         bg-white dark:bg-slate-900
+         border-r border-slate-200 dark:border-slate-800
+         flex flex-col
+         shadow-lg dark:shadow-black/20;
+}
+
+.pdf-sidebar-header {
+  @apply px-4 py-3
+         bg-slate-50 dark:bg-slate-800/50
+         border-b border-slate-200 dark:border-slate-700;
+}
+
+.pdf-sidebar-title {
+  @apply text-sm font-bold text-slate-700 dark:text-slate-300;
+}
+
+.pdf-sidebar-content {
+  @apply flex-1 overflow-y-auto p-3;
+}
+
+/* PDF viewer wrapper */
+.pdf-viewer-wrapper {
+  @apply flex-1 relative 
+         bg-slate-200 dark:bg-slate-800;
+}
+
+.pdf-viewer-iframe {
+  @apply w-full h-full border-0;
+}
+
+/* PDF toolbar */
+.pdf-toolbar {
+  @apply flex items-center gap-3 
+         px-4 py-3
+         bg-white dark:bg-slate-900
+         border-b border-slate-200 dark:border-slate-800
+         shadow-sm;
+}
+
+.pdf-toolbar-group {
+  @apply flex items-center gap-2;
+}
+
+.pdf-toolbar-divider {
+  @apply w-px h-6 bg-slate-200 dark:bg-slate-700 mx-2;
+}
+
+/* Page navigation */
+.page-nav-btn {
+  @apply w-9 h-9 flex items-center justify-center 
+         rounded-lg
+         bg-white dark:bg-slate-800 
+         border border-slate-200 dark:border-slate-700 
+         text-slate-600 dark:text-slate-400
+         shadow-sm
+         hover:bg-slate-50 dark:hover:bg-slate-700 
+         hover:text-slate-900 dark:hover:text-white
+         hover:shadow-md
+         active:scale-95
+         transition-all duration-150
+         disabled:opacity-40 disabled:cursor-not-allowed;
+}
+
+.page-input {
+  @apply w-16 px-2 py-1.5 
+         text-center text-sm font-medium
+         bg-white dark:bg-slate-800
+         border border-slate-200 dark:border-slate-700 
+         rounded-lg
+         text-slate-900 dark:text-white
+         focus:ring-2 focus:ring-violet-500/30 focus:border-violet-500;
+}
+
+/* Zoom controls */
+.zoom-btn {
+  @apply px-3 py-1.5 
+         text-sm font-medium
+         bg-white dark:bg-slate-800
+         border border-slate-200 dark:border-slate-700
+         rounded-lg
+         text-slate-700 dark:text-slate-300
+         hover:bg-slate-50 dark:hover:bg-slate-700
+         transition-all duration-150;
+}
+
+.zoom-btn-active {
+  @apply bg-violet-50 dark:bg-violet-900/30
+         border-violet-300 dark:border-violet-700
+         text-violet-700 dark:text-violet-300;
+}
+
+/* Highlight overlays */
+.highlight-overlay {
+  @apply absolute cursor-pointer transition-all duration-150;
+}
+
+.highlight-known {
+  background: rgba(34, 197, 94, 0.2);
+  border-bottom: 2px solid rgba(34, 197, 94, 0.7);
+}
+
+.highlight-known:hover {
+  background: rgba(34, 197, 94, 0.3);
+}
+
+.highlight-unknown {
+  background: rgba(251, 191, 36, 0.2);
+  border-bottom: 2px solid rgba(251, 191, 36, 0.7);
+}
+
+.highlight-unknown:hover {
+  background: rgba(251, 191, 36, 0.3);
+}
+
+/* Selection tooltip */
+.selection-tooltip {
+  @apply absolute z-50 
+         bg-slate-900 dark:bg-slate-700 
+         text-white 
+         px-4 py-2.5 rounded-xl 
+         shadow-2xl
+         flex items-center gap-3;
+  animation: tooltipFadeIn 0.15s ease-out;
+}
+
+@keyframes tooltipFadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.selection-tooltip-btn {
+  @apply px-3 py-1.5 
+         text-sm font-medium rounded-lg
+         bg-white/10 hover:bg-white/20
+         transition-colors duration-100;
+}
+
+.selection-tooltip-btn-primary {
+  @apply bg-violet-500 hover:bg-violet-600;
+}
+
+/* Word panel (right) */
+.word-panel {
+  @apply w-80 xl:w-96
+         bg-white dark:bg-slate-900
+         border-l border-slate-200 dark:border-slate-800
+         flex flex-col
+         shadow-lg dark:shadow-black/20;
+}
+
+.word-panel-header {
+  @apply px-4 py-3
+         bg-slate-50 dark:bg-slate-800/50
+         border-b border-slate-200 dark:border-slate-700
+         flex items-center justify-between;
+}
+
+.word-panel-title {
+  @apply text-sm font-bold text-slate-700 dark:text-slate-300;
+}
+
+.word-panel-content {
+  @apply flex-1 overflow-y-auto p-4;
+}
+
+/* Vocab stats mini display */
+.vocab-stats-mini {
+  @apply flex items-center gap-4 
+         px-4 py-2 
+         bg-slate-50 dark:bg-slate-800/50 
+         border-b border-slate-200 dark:border-slate-700;
+}
+
+.vocab-stat-item {
+  @apply flex items-center gap-1.5 text-xs font-medium;
+}
+
+.vocab-stat-known {
+  @apply text-emerald-600 dark:text-emerald-400;
+}
+
+.vocab-stat-unknown {
+  @apply text-amber-600 dark:text-amber-400;
+}
+
+/* Error overlay */
+.pdf-error-overlay {
+  @apply absolute inset-0 
+         flex items-center justify-center 
+         bg-white/90 dark:bg-slate-900/90 
+         backdrop-blur-sm;
+}
+
+.pdf-error-content {
+  @apply text-center p-8 max-w-md;
+}
+
+.pdf-error-icon {
+  @apply w-16 h-16 mx-auto mb-4 
+         text-rose-400 dark:text-rose-500;
+}
+
+.pdf-error-title {
+  @apply text-lg font-bold text-slate-900 dark:text-white mb-2;
+}
+
+.pdf-error-message {
+  @apply text-sm text-slate-600 dark:text-slate-400;
+}
+
+/* Loading overlay */
+.pdf-loading-overlay {
+  @apply absolute inset-0 
+         flex flex-col items-center justify-center 
+         bg-white/80 dark:bg-slate-900/80 
+         backdrop-blur-sm;
+}
+
+.pdf-loading-spinner {
+  @apply w-12 h-12 
+         border-4 border-violet-100 dark:border-violet-900 
+         border-t-violet-500 
+         rounded-full;
+  animation: spin 0.8s linear infinite;
+}
+
+.pdf-loading-text {
+  @apply mt-4 text-sm font-medium text-slate-600 dark:text-slate-400;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* PDF list item in sidebar */
+.pdf-list-item {
+  @apply flex items-center gap-3 p-3
+         bg-slate-50 dark:bg-slate-800
+         border border-slate-200 dark:border-slate-700
+         rounded-xl
+         cursor-pointer
+         transition-all duration-150
+         hover:bg-slate-100 dark:hover:bg-slate-700
+         hover:shadow-md;
+}
+
+.pdf-list-item-active {
+  @apply bg-violet-50 dark:bg-violet-900/30
+         border-violet-300 dark:border-violet-700;
+}
+
+.pdf-list-item-icon {
+  @apply w-10 h-10 
+         bg-rose-100 dark:bg-rose-900/50 
+         text-rose-600 dark:text-rose-400
+         rounded-lg flex items-center justify-center;
+}
+
+.pdf-list-item-info {
+  @apply flex-1 min-w-0;
+}
+
+.pdf-list-item-name {
+  @apply text-sm font-medium text-slate-900 dark:text-white truncate;
+}
+
+.pdf-list-item-meta {
+  @apply text-xs text-slate-500 dark:text-slate-400;
+}

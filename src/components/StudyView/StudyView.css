@@ -1,0 +1,386 @@
+/* ============================================
+   StudyView - Modern Redesign
+   ============================================ */
+
+/* Main layout */
+.study-page {
+  @apply h-full overflow-y-auto
+         bg-slate-50 dark:bg-slate-950;
+}
+
+/* Custom scrollbar for study page */
+.study-page::-webkit-scrollbar,
+.study-file-list::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.study-page::-webkit-scrollbar-track,
+.study-file-list::-webkit-scrollbar-track {
+  @apply bg-slate-100 dark:bg-slate-800 rounded-full;
+}
+
+.study-page::-webkit-scrollbar-thumb,
+.study-file-list::-webkit-scrollbar-thumb {
+  @apply bg-violet-300 dark:bg-violet-700 rounded-full;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+.study-page::-webkit-scrollbar-thumb:hover,
+.study-file-list::-webkit-scrollbar-thumb:hover {
+  @apply bg-violet-400 dark:bg-violet-600;
+}
+
+/* File list scrollbar container */
+.study-file-list {
+  @apply overflow-y-auto pr-2;
+  scrollbar-gutter: stable;
+}
+
+.study-container {
+  @apply max-w-4xl mx-auto p-6;
+}
+
+/* Header section */
+.study-header {
+  @apply sticky top-0 z-10
+         bg-white/80 dark:bg-slate-900/80 backdrop-blur-xl
+         border-b border-slate-200 dark:border-slate-800
+         -mx-6 px-6 py-4 mb-6;
+}
+
+.study-title {
+  @apply text-2xl font-bold text-slate-900 dark:text-white;
+}
+
+.study-subtitle {
+  @apply text-sm text-slate-500 dark:text-slate-400 mt-1;
+}
+
+/* Flashcard container */
+.flashcard-container {
+  @apply relative;
+  perspective: 1000px;
+}
+
+.flashcard {
+  @apply bg-white dark:bg-slate-900
+         border border-slate-200 dark:border-slate-800
+         rounded-2xl shadow-xl
+         p-8 min-h-[280px]
+         flex flex-col items-center justify-center text-center
+         transition-all duration-300;
+}
+
+.flashcard-front {
+  @apply bg-gradient-to-br from-white to-violet-50/30 dark:from-slate-900 dark:to-violet-900/10;
+}
+
+.flashcard-word {
+  @apply text-3xl md:text-4xl font-bold text-slate-900 dark:text-white mb-2;
+}
+
+.flashcard-pronunciation {
+  @apply text-lg text-violet-600 dark:text-violet-400 font-medium mb-4;
+}
+
+.flashcard-meaning {
+  @apply text-xl text-slate-700 dark:text-slate-300;
+}
+
+.flashcard-example {
+  @apply text-sm text-slate-500 dark:text-slate-400 mt-4 italic
+         max-w-md;
+}
+
+/* Word mask for guessing */
+.word-mask {
+  @apply font-mono tracking-[0.16em] text-center
+         text-3xl md:text-4xl font-bold;
+}
+
+.word-mask-char {
+  @apply inline-block w-6 md:w-8 mx-0.5
+         text-slate-900 dark:text-white;
+}
+
+.word-mask-hidden {
+  @apply inline-block w-6 md:w-8 mx-0.5
+         border-b-4 border-violet-400 dark:border-violet-500;
+}
+
+/* Study input */
+.study-input {
+  @apply w-full max-w-md mx-auto
+         px-6 py-4
+         bg-white dark:bg-slate-800
+         border-2 border-slate-200 dark:border-slate-700
+         rounded-xl
+         text-lg text-center font-medium text-slate-900 dark:text-white
+         placeholder-slate-400 dark:placeholder-slate-500
+         transition-all duration-200
+         focus:border-violet-500 dark:focus:border-violet-400
+         focus:ring-4 focus:ring-violet-500/20;
+}
+
+.study-input:focus {
+  animation: inputFocus 0.3s ease-out;
+}
+
+@keyframes inputFocus {
+  0% { box-shadow: 0 0 0 0 rgba(139, 92, 246, 0.4); }
+  100% { box-shadow: 0 0 0 8px rgba(139, 92, 246, 0.1); }
+}
+
+/* Answer feedback animations */
+@keyframes correctPulse {
+  0% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.5); }
+  70% { box-shadow: 0 0 0 16px rgba(34, 197, 94, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); }
+}
+
+@keyframes incorrectShake {
+  0%, 100% { transform: translateX(0); }
+  20%, 60% { transform: translateX(-8px); }
+  40%, 80% { transform: translateX(8px); }
+}
+
+.answer-correct {
+  @apply border-emerald-500 bg-emerald-50 dark:bg-emerald-900/20;
+  animation: correctPulse 0.6s ease-out;
+}
+
+.answer-incorrect {
+  @apply border-rose-500 bg-rose-50 dark:bg-rose-900/20;
+  animation: incorrectShake 0.4s ease-out;
+}
+
+/* Progress section */
+.study-progress {
+  @apply flex items-center gap-4 mb-6;
+}
+
+.progress-bar-container {
+  @apply flex-1 h-3 bg-slate-200 dark:bg-slate-800 rounded-full overflow-hidden;
+}
+
+.progress-bar-fill {
+  @apply h-full bg-gradient-to-r from-violet-500 to-purple-500
+         transition-all duration-500 ease-out;
+}
+
+.progress-text {
+  @apply text-sm font-medium text-slate-600 dark:text-slate-400 whitespace-nowrap;
+}
+
+/* Round badge */
+.round-badge {
+  @apply inline-flex items-center gap-1.5 
+         px-3 py-1.5 
+         bg-violet-100 dark:bg-violet-900/50
+         border border-violet-200 dark:border-violet-700
+         rounded-full 
+         text-xs font-bold text-violet-700 dark:text-violet-300;
+}
+
+/* Stats cards */
+.stats-grid {
+  @apply grid grid-cols-2 md:grid-cols-4 gap-4 mb-6;
+}
+
+.stat-card {
+  @apply bg-white dark:bg-slate-900
+         border border-slate-200 dark:border-slate-800
+         rounded-xl p-4 text-center
+         transition-all duration-200
+         hover:-translate-y-0.5 hover:shadow-lg;
+}
+
+.stat-card-correct {
+  @apply border-emerald-200 dark:border-emerald-800 bg-emerald-50 dark:bg-emerald-900/20;
+}
+
+.stat-card-incorrect {
+  @apply border-rose-200 dark:border-rose-800 bg-rose-50 dark:bg-rose-900/20;
+}
+
+.stat-card-value {
+  @apply text-2xl font-bold;
+}
+
+.stat-card-label {
+  @apply text-xs font-medium text-slate-500 dark:text-slate-400 mt-1;
+}
+
+/* Action buttons */
+.study-actions {
+  @apply flex flex-wrap items-center justify-center gap-3 mt-6;
+}
+
+.study-btn {
+  @apply inline-flex items-center gap-2 px-5 py-3
+         rounded-xl font-semibold text-sm
+         transition-all duration-200
+         active:scale-95;
+}
+
+.study-btn-primary {
+  @apply study-btn
+         bg-gradient-to-r from-violet-500 to-purple-600 text-white
+         hover:from-violet-600 hover:to-purple-700
+         shadow-lg shadow-violet-500/25 hover:shadow-xl;
+}
+
+.study-btn-secondary {
+  @apply study-btn
+         bg-white dark:bg-slate-800 text-slate-700 dark:text-slate-300
+         border border-slate-200 dark:border-slate-700
+         hover:bg-slate-50 dark:hover:bg-slate-700
+         shadow-sm hover:shadow-md;
+}
+
+.study-btn-success {
+  @apply study-btn
+         bg-emerald-500 text-white
+         hover:bg-emerald-600
+         shadow-lg shadow-emerald-500/25;
+}
+
+.study-btn-danger {
+  @apply study-btn
+         bg-rose-500 text-white
+         hover:bg-rose-600
+         shadow-lg shadow-rose-500/25;
+}
+
+/* Keyboard hints */
+.keyboard-hint {
+  @apply inline-flex items-center justify-center 
+         w-6 h-6 
+         bg-slate-700 dark:bg-slate-600 
+         text-white 
+         rounded-md text-xs font-bold
+         shadow-sm;
+}
+
+/* File selection (idle state) */
+.file-select-grid {
+  @apply space-y-3;
+}
+
+.file-select-item {
+  @apply flex items-center gap-4 p-4
+         bg-white dark:bg-slate-900
+         border-2 rounded-xl
+         transition-all duration-200 cursor-pointer;
+}
+
+.file-select-item-checked {
+  @apply border-violet-400 dark:border-violet-500
+         bg-violet-50 dark:bg-violet-900/20
+         shadow-lg shadow-violet-500/10;
+}
+
+.file-select-item-unchecked {
+  @apply border-slate-200 dark:border-slate-700
+         hover:border-violet-300 dark:hover:border-violet-600
+         hover:shadow-md;
+}
+
+.file-select-checkbox {
+  @apply w-5 h-5 rounded-md
+         border-2 border-slate-300 dark:border-slate-600
+         text-violet-600 
+         focus:ring-2 focus:ring-violet-500/30;
+}
+
+.file-select-info {
+  @apply flex-1 min-w-0;
+}
+
+.file-select-name {
+  @apply text-sm font-medium text-slate-900 dark:text-white truncate;
+}
+
+.file-select-count {
+  @apply text-xs text-slate-500 dark:text-slate-400 mt-0.5;
+}
+
+/* Mode buttons */
+.mode-buttons {
+  @apply flex flex-wrap gap-2 mt-3;
+}
+
+.mode-btn {
+  @apply px-3 py-1.5 rounded-lg border-2 
+         text-xs font-medium
+         transition-all duration-150 cursor-pointer;
+}
+
+.mode-btn-active {
+  @apply border-violet-500 dark:border-violet-400
+         bg-violet-50 dark:bg-violet-900/30
+         text-violet-700 dark:text-violet-300 font-bold;
+}
+
+.mode-btn-inactive {
+  @apply border-slate-200 dark:border-slate-700
+         hover:border-slate-300 dark:hover:border-slate-600
+         bg-white dark:bg-slate-800
+         text-slate-600 dark:text-slate-400;
+}
+
+/* Summary view */
+.summary-container {
+  @apply bg-white dark:bg-slate-900
+         border border-slate-200 dark:border-slate-800
+         rounded-2xl p-8 text-center
+         shadow-xl;
+}
+
+.summary-title {
+  @apply text-3xl font-bold text-slate-900 dark:text-white mb-2;
+}
+
+.summary-subtitle {
+  @apply text-slate-500 dark:text-slate-400 mb-6;
+}
+
+.summary-stats {
+  @apply grid grid-cols-2 gap-4 mb-8;
+}
+
+.summary-stat {
+  @apply p-4 rounded-xl;
+}
+
+.summary-stat-value {
+  @apply text-3xl font-bold;
+}
+
+.summary-stat-label {
+  @apply text-sm font-medium text-slate-500 dark:text-slate-400 mt-1;
+}
+
+/* Celebration effect */
+.celebration {
+  @apply relative overflow-hidden;
+}
+
+/* Empty state */
+.study-empty {
+  @apply flex flex-col items-center justify-center py-16 text-center;
+}
+
+.study-empty-icon {
+  @apply w-20 h-20 text-slate-300 dark:text-slate-700 mb-4;
+}
+
+.study-empty-title {
+  @apply text-lg font-semibold text-slate-700 dark:text-slate-300 mb-2;
+}
+
+.study-empty-description {
+  @apply text-sm text-slate-500 dark:text-slate-400 max-w-sm;
+}

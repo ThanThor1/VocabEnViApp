@@ -1,0 +1,78 @@
+/* ManagerPdfView scoped styles */
+
+/* PDF manager container */
+.pdf-manager {
+  @apply flex h-full bg-slate-50 dark:bg-slate-900;
+}
+
+/* PDF list sidebar */
+.pdf-list-sidebar {
+  @apply w-80 bg-white/95 dark:bg-slate-800/95 backdrop-blur-sm border-r border-slate-200/60 dark:border-slate-700/60;
+  @apply flex flex-col shadow-xl;
+}
+
+/* PDF item card */
+.pdf-item {
+  @apply p-4 rounded-xl cursor-pointer transition-all duration-200;
+}
+
+.pdf-item-selected {
+  @apply bg-gradient-to-r from-violet-500 to-purple-600 text-white shadow-lg transform scale-[1.02];
+}
+
+.pdf-item-unselected {
+  @apply bg-slate-50 dark:bg-slate-700/50 hover:bg-slate-100 dark:hover:bg-slate-700 border border-slate-200 dark:border-slate-600;
+}
+
+/* Import dropzone */
+.import-dropzone {
+  @apply border-2 border-dashed border-slate-300 dark:border-slate-600 rounded-2xl p-8;
+  @apply flex flex-col items-center justify-center;
+  @apply transition-all duration-200;
+  @apply hover:border-violet-400 dark:hover:border-violet-500 hover:bg-violet-50/30 dark:hover:bg-violet-900/20;
+}
+
+.import-dropzone-active {
+  @apply border-violet-500 bg-violet-50/50 dark:bg-violet-900/30;
+}
+
+/* Trash mode indicator */
+.trash-mode {
+  @apply bg-gradient-to-r from-rose-500 to-pink-600 text-white;
+}
+
+/* PDF preview panel */
+.pdf-preview {
+  @apply flex-1 flex flex-col bg-slate-100 dark:bg-slate-900;
+}
+
+/* PDF info header */
+.pdf-info-header {
+  @apply px-6 py-4 bg-white dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700;
+  @apply flex items-center justify-between;
+}
+
+/* Stats grid */
+.pdf-stats-grid {
+  @apply grid grid-cols-3 gap-4 p-4 bg-slate-50/80 dark:bg-slate-800/50 border-b border-slate-200/60 dark:border-slate-700/60;
+}
+
+.pdf-stat-card {
+  @apply text-center p-3 bg-white dark:bg-slate-800 rounded-xl border border-slate-200 dark:border-slate-700 shadow-sm;
+}
+
+/* Action buttons container */
+.pdf-actions {
+  @apply flex items-center gap-2 px-4 py-3 border-b border-slate-200/60 dark:border-slate-700/60 bg-white dark:bg-slate-800;
+}
+
+/* Confirm delete animation */
+.confirm-delete {
+  animation: confirmShake 0.3s ease-out;
+}
+
+@keyframes confirmShake {
+  0%, 100% { transform: translateX(0); }
+  25% { transform: translateX(-4px); }
+  75% { transform: translateX(4px); }
+}
