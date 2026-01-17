@@ -7,8 +7,8 @@
   <meta http-equiv="X-UA-Compatible" content="IE=edge">
   <title>PDF Viewer</title>
 
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf_viewer.min.js"></script>
+  <script src="../build/pdf.min.js"></script>
+  <script src="./pdf_viewer.js"></script>
 
   <style>
     body { margin:0; padding:0; overflow:hidden; font-family:sans-serif; }
@@ -223,7 +223,7 @@
       if (window.pdfjsLib) {
         pdfjsLib = window.pdfjsLib;
         pdfjsLib.GlobalWorkerOptions.workerSrc =
-          "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+          "../build/pdf.worker.min.js";
         return Promise.resolve();
       }
       return new Promise(resolve => setTimeout(() => waitForPdfJs().then(resolve), 100));
