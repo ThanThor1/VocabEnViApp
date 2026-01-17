@@ -28,7 +28,20 @@ git clone <repo-url>
 cd FunnyApp
 ```
 
-### 1.3. Cấu hình biến môi trường (Azure Translator) — nếu muốn dùng Auto Meaning
+### 1.3. Cấu hình biến môi trường
+
+#### 1.3.1. Google AI Studio (Gemma) — dùng cho dịch đoạn / dịch ngữ cảnh (bắt buộc nếu muốn dùng tính năng dịch tự động)
+
+Tạo file `.env` tại **root project** (cùng cấp với `package.json`):
+
+```env
+GOOGLE_AI_STUDIO_API_KEY=your_key_here
+# Optional:
+GOOGLE_AI_STUDIO_MODEL=gemma-3-27b-it
+GOOGLE_AI_STUDIO_ENDPOINT=https://generativelanguage.googleapis.com/v1beta
+```
+
+#### 1.3.2. Azure Translator (Dictionary Lookup) — nếu muốn dùng Auto Meaning (gợi ý nghĩa từ)
 
 Tính năng **Auto Meaning theo ngữ cảnh** gọi Azure Translator **từ Electron main process**, nên **không lộ key ở renderer**.
 
@@ -241,6 +254,11 @@ App có cơ chế lưu state vào localStorage cho một số màn hình:
 #### Auto Meaning không hoạt động
 
 - Kiểm tra `.env` có `AZURE_TRANSLATOR_KEY` và `AZURE_TRANSLATOR_REGION`
+- Restart app sau khi đổi `.env`
+
+#### Dịch đoạn (Translate Passage) không hoạt động
+
+- Kiểm tra `.env` có `GOOGLE_AI_STUDIO_API_KEY`
 - Restart app sau khi đổi `.env`
 
 #### PDF viewer không hiển thị
