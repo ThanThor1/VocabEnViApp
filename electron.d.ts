@@ -5,6 +5,7 @@ export type VocabRow = {
   meaning: string
   pronunciation?: string
   pos?: string
+  example?: string
 }
 
 export type PdfMeta = {
@@ -59,6 +60,7 @@ export interface WindowApi {
   deleteFolder: (relPath: string) => Promise<boolean>
   readCsv: (relPathOrAbsPath: string) => Promise<VocabRow[]>
   addWord: (relPathOrAbsPath: string, row: VocabRow) => Promise<boolean>
+  enhanceWordInBackground: (relPathOrAbsPath: string, word: string, meaning: string, pronunciation: string, pos: string, example: string) => Promise<boolean>
   deleteWord: (relPathOrAbsPath: string, index: number) => Promise<boolean>
   editWord: (relPathOrAbsPath: string, index: number, newData: Partial<VocabRow>) => Promise<boolean>
   moveWords: (srcRelOrAbs: string, dstRelOrAbs: string, indices: number[]) => Promise<boolean>
@@ -83,7 +85,22 @@ export interface WindowApi {
   autoMeaning: (payload: { requestId: string; word: string; contextSentenceEn: string; from?: string; to?: string }) => Promise<AutoMeaningResponse>
   autoMeaningCancel: (requestId: string) => Promise<boolean>
 
+  suggestExampleSentence: (payload: { word: string; meaningVi?: string; pos?: string; contextSentenceEn?: string }) => Promise<string>
+
+  suggestIpa: (payload: { word: string; dialect?: 'US' | 'UK' }) => Promise<string>
+
   translatePlain: (payload: { text: string; from?: string; to?: string; region?: string }) => Promise<string>
+
+  getGoogleAiStudioStatus: () => Promise<{ hasKey: boolean }>
+  getGoogleAiStudioConcurrency: () => Promise<{ concurrency: number }>
+  setGoogleAiStudioConcurrency: (concurrency: number) => Promise<{ concurrency: number }>
+  setGoogleAiStudioApiKey: (apiKey: string) => Promise<boolean>
+  clearGoogleAiStudioApiKey: () => Promise<boolean>
+
+  listGoogleAiStudioApiKeys: () => Promise<{ activeId: string | null; items: Array<{ id: string; name: string; masked: string }> }>
+  addGoogleAiStudioApiKey: (payload: { name?: string; apiKey: string }) => Promise<boolean>
+  deleteGoogleAiStudioApiKey: (keyId: string) => Promise<boolean>
+  setActiveGoogleAiStudioApiKey: (keyId: string) => Promise<boolean>
 
   onDeckUpdated: (cb: (data: { pdfId?: string; deckCsvPath?: string }) => void) => void
   offDeckUpdated: (cb: (data: { pdfId?: string; deckCsvPath?: string }) => void) => void
