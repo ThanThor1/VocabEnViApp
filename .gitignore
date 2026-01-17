@@ -21,3 +21,6 @@ pnpm-debug.log*
 .DS_Store
 Thumbs.db
 .vscode/
+
+release/
+dist-electron/
