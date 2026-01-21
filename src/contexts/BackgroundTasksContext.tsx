@@ -76,98 +76,141 @@ export function BackgroundTasksProvider({ children }: { children: React.ReactNod
     const cleanWord = task.word.trim()
     const cleanContext = (task.contextSentenceEn || '').trim()
 
-    try {
-      updateTask(task.id, { status: 'running', progress: 'Đang lấy phát âm...' })
-
-      // 1. Fetch IPA
-      let pronunciation = ''
+    const fetchDictionaryIpa = async () => {
       try {
-        const suggestIpa = (window as any)?.api?.suggestIpa
-        if (suggestIpa) {
-          const out = await suggestIpa({ word: cleanWord, dialect: 'US' })
-          if (String(out || '').trim()) {
-            pronunciation = ensureIpaSlashes(String(out || ''))
-          }
+        const resp = await fetch(`https://api.dictionaryapi.dev/api/v2/entries/en/${encodeURIComponent(cleanWord)}`)
+        if (!resp.ok) return ''
+        const data = await resp.json()
+        if (Array.isArray(data) && data[0]?.phonetics?.length > 0) {
+          const ph = data[0].phonetics.find((p: any) => p.text)
+          if (ph?.text) return ensureIpaSlashes(ph.text)
         }
-        if (!pronunciation) {
-          const resp = await fetch(`https://api.dictionaryapi.dev/api/v2/entries/en/${encodeURIComponent(cleanWord)}`)
-          if (resp.ok) {
-            const data = await resp.json()
-            if (Array.isArray(data) && data[0]?.phonetics?.length > 0) {
-              const ph = data[0].phonetics.find((p: any) => p.text)
-              if (ph?.text) pronunciation = ensureIpaSlashes(ph.text)
-            }
-          }
-        }
-      } catch (e) {
-        console.warn('[BackgroundTask] IPA fetch error:', e)
-      }
+      } catch (e) {}
+      return ''
+    }
 
-      if (abortController.signal.aborted) return
+    try {
+      updateTask(task.id, { status: 'running', progress: 'Đang dịch...' })
 
-      updateTask(task.id, { pronunciation, progress: 'Đang dịch nghĩa...' })
-
-      // 2. Fetch meaning
+      let pronunciation = ''
       let meaning = ''
       let candidates: AutoMeaningCandidate[] = []
       let contextVi = ''
       let pos = ''
+      let example = ''
 
-      try {
-        if ((window as any)?.api?.autoMeaning) {
-          const resp = await (window as any).api.autoMeaning({
+      const enrichWord = (window as any)?.api?.enrichWord
+      if (enrichWord) {
+        try {
+          const resp = await enrichWord({
             requestId,
             word: cleanWord,
             contextSentenceEn: cleanContext,
             from: 'en',
-            to: 'vi'
+            to: 'vi',
+            dialect: 'US'
           })
 
           if (resp) {
-            meaning = (resp.meaningSuggested || '').trim()
+            meaning = String(resp.meaningSuggested || '').trim()
             candidates = Array.isArray(resp.candidates) ? resp.candidates : []
-            contextVi = (resp.contextSentenceVi || '').trim()
+            contextVi = String(resp.contextSentenceVi || '').trim()
+            example = String((resp as any).example || '').trim()
 
-            const firstWithPos = candidates.find((c: any) => c && c.pos)
-            const normalized = normalizePos(firstWithPos?.pos)
-            if (normalized) pos = normalized
-          }
-        }
-      } catch (e) {
-        console.warn('[BackgroundTask] Meaning fetch error:', e)
-      }
+            const posSuggested = normalizePos((resp as any).posSuggested)
+            if (posSuggested) {
+              pos = posSuggested
+            } else {
+              const firstWithPos = candidates.find((c: any) => c && c.pos)
+              const normalized = normalizePos(firstWithPos?.pos)
+              if (normalized) pos = normalized
+            }
 
-      if (abortController.signal.aborted) return
-
-      updateTask(task.id, { meaning, candidates, contextVi, pos, progress: 'Đang tạo câu ví dụ...' })
-
-      // 3. Fetch example sentence
-      let example = ''
-      if (meaning && (window as any)?.api?.suggestExampleSentence) {
-        try {
-          const exampleOut = await (window as any).api.suggestExampleSentence({
-            word: cleanWord,
-            meaningVi: meaning,
-            pos: pos || '',
-            contextSentenceEn: cleanContext
-          })
-          if (String(exampleOut || '').trim()) {
-            example = String(exampleOut || '').trim()
+            const ipa = String((resp as any).ipa || '').trim()
+            if (ipa) pronunciation = ensureIpaSlashes(ipa)
           }
         } catch (e) {
-          console.warn('[BackgroundTask] Example fetch error:', e)
+          console.warn('[BackgroundTask] enrichWord error:', e)
+        }
+
+        if (!pronunciation && !/\s/.test(cleanWord)) {
+          pronunciation = await fetchDictionaryIpa()
+        }
+
+        // If example missing, do a cheap fallback.
+        if (!example && meaning && (window as any)?.api?.suggestExampleSentence) {
+          try {
+            const exampleOut = await (window as any).api.suggestExampleSentence({
+              word: cleanWord,
+              meaningVi: meaning,
+              pos: pos || '',
+              contextSentenceEn: cleanContext
+            })
+            if (String(exampleOut || '').trim()) example = String(exampleOut || '').trim()
+          } catch (e) {}
+        }
+      } else {
+        // Older builds: keep previous behavior
+        updateTask(task.id, { progress: 'Đang lấy phát âm...' })
+        try {
+          const suggestIpa = (window as any)?.api?.suggestIpa
+          if (suggestIpa) {
+            const out = await suggestIpa({ word: cleanWord, dialect: 'US' })
+            if (String(out || '').trim()) pronunciation = ensureIpaSlashes(String(out || ''))
+          }
+          if (!pronunciation && !/\s/.test(cleanWord)) {
+            pronunciation = await fetchDictionaryIpa()
+          }
+        } catch (e) {}
+
+        if (abortController.signal.aborted) return
+        updateTask(task.id, { pronunciation, progress: 'Đang dịch nghĩa...' })
+
+        try {
+          if ((window as any)?.api?.autoMeaning) {
+            const resp = await (window as any).api.autoMeaning({
+              requestId,
+              word: cleanWord,
+              contextSentenceEn: cleanContext,
+              from: 'en',
+              to: 'vi'
+            })
+
+            if (resp) {
+              meaning = (resp.meaningSuggested || '').trim()
+              candidates = Array.isArray(resp.candidates) ? resp.candidates : []
+              contextVi = (resp.contextSentenceVi || '').trim()
+
+              const firstWithPos = candidates.find((c: any) => c && c.pos)
+              const normalized = normalizePos(firstWithPos?.pos)
+              if (normalized) pos = normalized
+            }
+          }
+        } catch (e) {}
+
+        if (abortController.signal.aborted) return
+        updateTask(task.id, { meaning, candidates, contextVi, pos, progress: 'Đang tạo câu ví dụ...' })
+
+        if (meaning && (window as any)?.api?.suggestExampleSentence) {
+          try {
+            const exampleOut = await (window as any).api.suggestExampleSentence({
+              word: cleanWord,
+              meaningVi: meaning,
+              pos: pos || '',
+              contextSentenceEn: cleanContext
+            })
+            if (String(exampleOut || '').trim()) example = String(exampleOut || '').trim()
+          } catch (e) {}
         }
       }
 
       if (abortController.signal.aborted) return
 
-      // Done!
-      updateTask(task.id, {
-        status: 'completed',
-        progress: 'Hoàn tất!',
-        example,
-        completedAt: Date.now()
-      })
+      // Persist results to task state
+      updateTask(task.id, { pronunciation, meaning, candidates, contextVi, pos, example })
+
+      // Done
+      updateTask(task.id, { status: 'completed', progress: 'Hoàn tất!', completedAt: Date.now() })
 
     } catch (error: any) {
       if (!abortController.signal.aborted) {

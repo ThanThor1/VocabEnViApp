@@ -1,5 +1,8 @@
 const { contextBridge, ipcRenderer } = require('electron')
 
+// Keep track of wrappers so removeListener can remove the correct function
+const deckUpdatedWrappers = new Map();
+
 contextBridge.exposeInMainWorld('api', {
   listTree: () => ipcRenderer.invoke('listTree'),
   // createFolder/createFile now accept (parentRelPath, name)
@@ -37,6 +40,8 @@ contextBridge.exposeInMainWorld('api', {
   autoMeaning: (payload) => ipcRenderer.invoke('translator:autoMeaning', payload),
   autoMeaningCancel: (requestId) => ipcRenderer.invoke('translator:autoMeaningCancel', requestId)
   ,
+  enrichWord: (payload) => ipcRenderer.invoke('translator:enrichWord', payload)
+  ,
   suggestExampleSentence: (payload) => ipcRenderer.invoke('translator:suggestExampleSentence', payload)
   ,
   suggestIpa: (payload) => ipcRenderer.invoke('translator:suggestIpa', payload)
@@ -45,6 +50,8 @@ contextBridge.exposeInMainWorld('api', {
   ,
   // Per-user settings (stored in userData/.env)
   getGoogleAiStudioStatus: () => ipcRenderer.invoke('settings:getGoogleAiStudioStatus'),
+  getGoogleAiStudioConcurrency: () => ipcRenderer.invoke('settings:getGoogleAiStudioConcurrency'),
+  setGoogleAiStudioConcurrency: (concurrency) => ipcRenderer.invoke('settings:setGoogleAiStudioConcurrency', concurrency),
   setGoogleAiStudioApiKey: (apiKey) => ipcRenderer.invoke('settings:setGoogleAiStudioApiKey', apiKey),
   clearGoogleAiStudioApiKey: () => ipcRenderer.invoke('settings:clearGoogleAiStudioApiKey'),
 
@@ -53,9 +60,19 @@ contextBridge.exposeInMainWorld('api', {
   addGoogleAiStudioApiKey: (payload) => ipcRenderer.invoke('settings:addGoogleAiStudioApiKey', payload),
   deleteGoogleAiStudioApiKey: (keyId) => ipcRenderer.invoke('settings:deleteGoogleAiStudioApiKey', keyId),
   setActiveGoogleAiStudioApiKey: (keyId) => ipcRenderer.invoke('settings:setActiveGoogleAiStudioApiKey', keyId),
+  toggleGoogleAiStudioApiKey: (keyId, enabled) => ipcRenderer.invoke('settings:toggleGoogleAiStudioApiKey', keyId, enabled),
 
   // listen for deck updates (emitted when a CSV inside a PDF folder is written)
-  onDeckUpdated: (cb) => ipcRenderer.on('deck-updated', (ev, data) => cb && cb(data))
-  ,
-  offDeckUpdated: (cb) => ipcRenderer.removeListener('deck-updated', cb)
+  onDeckUpdated: (cb) => {
+    const wrapper = (ev, data) => cb && cb(data);
+    deckUpdatedWrappers.set(cb, wrapper);
+    ipcRenderer.on('deck-updated', wrapper);
+  },
+  offDeckUpdated: (cb) => {
+    const wrapper = deckUpdatedWrappers.get(cb);
+    if (wrapper) {
+      ipcRenderer.removeListener('deck-updated', wrapper);
+      deckUpdatedWrappers.delete(cb);
+    }
+  }
 })

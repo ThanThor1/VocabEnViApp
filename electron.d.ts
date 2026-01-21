@@ -52,6 +52,12 @@ export type AutoMeaningResponse = {
   candidates: AutoMeaningCandidate[]
 }
 
+export type EnrichWordResponse = AutoMeaningResponse & {
+  posSuggested: string
+  ipa: string
+  example: string
+}
+
 export interface WindowApi {
   listTree: () => Promise<TreeNode[]>
   createFolder: (parentRelPath: string, name: string) => Promise<boolean>
@@ -85,6 +91,8 @@ export interface WindowApi {
   autoMeaning: (payload: { requestId: string; word: string; contextSentenceEn: string; from?: string; to?: string }) => Promise<AutoMeaningResponse>
   autoMeaningCancel: (requestId: string) => Promise<boolean>
 
+  enrichWord: (payload: { requestId: string; word: string; contextSentenceEn: string; from?: string; to?: string; dialect?: 'US' | 'UK' }) => Promise<EnrichWordResponse>
+
   suggestExampleSentence: (payload: { word: string; meaningVi?: string; pos?: string; contextSentenceEn?: string }) => Promise<string>
 
   suggestIpa: (payload: { word: string; dialect?: 'US' | 'UK' }) => Promise<string>
@@ -97,10 +105,11 @@ export interface WindowApi {
   setGoogleAiStudioApiKey: (apiKey: string) => Promise<boolean>
   clearGoogleAiStudioApiKey: () => Promise<boolean>
 
-  listGoogleAiStudioApiKeys: () => Promise<{ activeId: string | null; items: Array<{ id: string; name: string; masked: string }> }>
+  listGoogleAiStudioApiKeys: () => Promise<{ activeIds: string[]; activeId: string | null; items: Array<{ id: string; name: string; masked: string }> }>
   addGoogleAiStudioApiKey: (payload: { name?: string; apiKey: string }) => Promise<boolean>
   deleteGoogleAiStudioApiKey: (keyId: string) => Promise<boolean>
   setActiveGoogleAiStudioApiKey: (keyId: string) => Promise<boolean>
+  toggleGoogleAiStudioApiKey: (keyId: string, enabled: boolean) => Promise<boolean>
 
   onDeckUpdated: (cb: (data: { pdfId?: string; deckCsvPath?: string }) => void) => void
   offDeckUpdated: (cb: (data: { pdfId?: string; deckCsvPath?: string }) => void) => void

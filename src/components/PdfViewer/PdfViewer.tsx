@@ -2,8 +2,10 @@ import React, { useEffect, useRef, useState, useCallback } from 'react';
 import ErrorBoundary from '../ErrorBoundary/ErrorBoundary'
 import TranslateTextModal from '../TranslateTextModal/TranslateTextModal'
 import { PendingWordsSidebar, PendingWord } from '../PendingWordsSidebar'
+import PendingPassagesSidebar from '../PendingPassagesSidebar/PendingPassagesSidebar'
 import { normalizePos } from '../posOptions/posOptions'
 import { useBackgroundTasks } from '../../contexts/BackgroundTasksContext'
+import { usePassages } from '../../contexts/PassagesContext'
 
 interface Rect {
   xPct: number;
@@ -32,6 +34,12 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
 
   // Background tasks for translations that persist across navigation
   const { addTranslationTask, getTasksForPdf, removeTask, tasks: allBackgroundTasks } = useBackgroundTasks();
+  
+  // Passages context for long text translation (optional - may be null if not in PdfReaderView)
+  const passagesContext = usePassages();
+
+  const [showRightPanel, setShowRightPanel] = useState(true)
+  const [rightPanelTab, setRightPanelTab] = useState<'words' | 'passages'>('words')
 
   const [highlights, setHighlights] = useState<Highlight[]>([]);
   const [deckCsvPath, setDeckCsvPath] = useState<string>('');
@@ -50,9 +58,13 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
 
   // Pending words for sidebar
   const [pendingWords, setPendingWords] = useState<PendingWord[]>([]);
+  const pendingWordsRef = useRef<PendingWord[]>([]);
   
   // Track API request IDs to cancel when needed
   const pendingApiRequestsRef = useRef<Map<string, string>>(new Map());
+  // Retry timers and attempt counters per pending word
+  const pendingRetryTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  const retryAttemptsRef = useRef<Map<string, number>>(new Map());
 
   const [showTranslateModal, setShowTranslateModal] = useState(false);
   const [selectedPassage, setSelectedPassage] = useState<string>('');
@@ -87,6 +99,10 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
   useEffect(() => {
     wordOnlyMapRef.current = wordOnlyMap;
   }, [wordOnlyMap]);
+
+  useEffect(() => {
+    pendingWordsRef.current = Array.isArray(pendingWords) ? pendingWords : [];
+  }, [pendingWords]);
 
   // Restore pending words from background tasks when returning to PDF view
   useEffect(() => {
@@ -138,8 +154,9 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
         const existingWord = prev.find(w => w.id === task.id);
         if (!existingWord) return prev;
         
-        // Only update if there's new data
-        if (task.status === 'completed' && !existingWord.isApiComplete) {
+        // Sync data from task to pending word (supports incremental updates)
+        if (task.status === 'completed') {
+          if (existingWord.isApiComplete) return prev; // Already up to date
           return prev.map(w => w.id === task.id ? {
             ...w,
             meaning: task.meaning || w.meaning,
@@ -150,16 +167,37 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
             candidates: task.candidates || w.candidates,
             isApiLoading: false,
             isApiComplete: true,
+            apiError: undefined,
           } : w);
-        } else if (task.status === 'error' && existingWord.isApiLoading) {
+        } else if (task.status === 'error') {
+          if (!existingWord.isApiLoading && existingWord.apiError) return prev;
           return prev.map(w => w.id === task.id ? {
             ...w,
             isApiLoading: false,
             isApiComplete: false,
             apiError: task.error || 'Lỗi không xác định',
           } : w);
-        } else if ((task.status === 'running' || task.status === 'pending') && !existingWord.isApiLoading && !existingWord.isApiComplete) {
-          // Task is still running
+        } else if (task.status === 'running') {
+          // Sync partial results during running (meaning, pronunciation, etc. may be populated incrementally)
+          const hasNewData = 
+            (task.meaning && !existingWord.meaning) ||
+            (task.pronunciation && !existingWord.pronunciation) ||
+            (task.pos && !existingWord.pos) ||
+            (task.candidates && task.candidates.length > 0 && (!existingWord.candidates || existingWord.candidates.length === 0));
+          
+          if (!hasNewData && existingWord.isApiLoading) return prev;
+          
+          return prev.map(w => w.id === task.id ? {
+            ...w,
+            meaning: task.meaning || w.meaning,
+            pronunciation: task.pronunciation || w.pronunciation,
+            pos: task.pos || w.pos,
+            example: task.example || w.example,
+            contextVi: task.contextVi || w.contextVi,
+            candidates: task.candidates || w.candidates,
+            isApiLoading: true,
+          } : w);
+        } else if (task.status === 'pending' && !existingWord.isApiLoading && !existingWord.isApiComplete) {
           return prev.map(w => w.id === task.id ? {
             ...w,
             isApiLoading: true,
@@ -312,10 +350,18 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
         const rawText = String(event.data?.text || '').trim();
         const wordCount = rawText ? rawText.split(/\s+/g).filter(Boolean).length : 0;
 
-        // If selection is longer than 5 words, translate passage only (do not add vocab).
+        // If selection is longer than 5 words, add to passages sidebar for translation
         if (wordCount > 5) {
-          setSelectedPassage(rawText);
-          setShowTranslateModal(true);
+          // If passagesContext is available, add to sidebar
+          if (passagesContext) {
+            passagesContext.addPassage(rawText);
+            setRightPanelTab('passages')
+            setShowRightPanel(true)
+          } else {
+            // Fallback to modal if not in PdfReaderView
+            setSelectedPassage(rawText);
+            setShowTranslateModal(true);
+          }
           return;
         }
 
@@ -344,6 +390,7 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
         setPendingWords((prev) => [...prev, newPendingWord]);
         
         // Use background task for translation (persists across navigation)
+        // This is the ONLY place that calls the AI API - no duplicate calls
         addTranslationTask({
           id: wordId,
           word: rawText,
@@ -354,8 +401,8 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
           rects: rects,
         });
         
-        // Also start fetching API data locally for immediate feedback
-        fetchWordData(wordId, rawText, contextSentence);
+        // NOTE: Removed fetchWordData() call here - background task handles it
+        // UI will update via the useEffect that syncs from allBackgroundTasks
       }
       // Persist current page sent from iframe (debounced if frequent)
       if (type === 'PDF_CURRENT_PAGE') {
@@ -371,7 +418,7 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
 
     window.addEventListener('message', handleMessage);
     return () => window.removeEventListener('message', handleMessage);
-  }, [highlights, wordMap, pendingWords, showTranslateModal]);
+  }, [highlights, wordMap, pendingWords, showTranslateModal, passagesContext]);
 
   // Listen for deck updates from main process and reload CSV when changed
   useEffect(() => {
@@ -449,123 +496,210 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
 
   // Fetch IPA and meaning data for a pending word
   const fetchWordData = useCallback(async (wordId: string, word: string, contextSentenceEn: string) => {
-    const cleanWord = word.trim();
-    const cleanContext = (contextSentenceEn || '').trim();
-    
-    if (!cleanWord) return;
-    
-    const requestId = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
-    pendingApiRequestsRef.current.set(wordId, requestId);
-    
+    const cleanWord = word.trim()
+    const cleanContext = (contextSentenceEn || '').trim()
+    if (!cleanWord) return
+
+    const requestId = `${Date.now()}_${Math.random().toString(16).slice(2)}`
+    pendingApiRequestsRef.current.set(wordId, requestId)
+
+    setPendingWords((prev) =>
+      prev.map((w) => (w.id === wordId ? { ...w, isApiLoading: true, isApiComplete: false, apiError: undefined } : w))
+    )
+
     const ensureIpaSlashes = (val: string) => {
-      const v = (val || '').trim().replace(/"/g, '');
-      if (!v) return '';
-      const core = v.replace(/^\/+|\/+$/g, '');
-      return `/${core}/`;
-    };
+      const v = (val || '').trim().replace(/"/g, '')
+      if (!v) return ''
+      const core = v.replace(/^\/+|\/+$/g, '')
+      return `/${core}/`
+    }
+
+    const fetchDictionaryIpa = async () => {
+      try {
+        const resp = await fetch(`https://api.dictionaryapi.dev/api/v2/entries/en/${encodeURIComponent(cleanWord)}`)
+        if (!resp.ok) return ''
+        const data = await resp.json()
+        if (Array.isArray(data) && data[0]?.phonetics?.length > 0) {
+          const ph = data[0].phonetics.find((p: any) => p.text)
+          if (ph?.text) return ensureIpaSlashes(ph.text)
+        }
+      } catch (e) {}
+      return ''
+    }
 
     try {
-      const results = await Promise.allSettled([
-        // 1. IPA
-        (async () => {
-          const suggestIpa = (window as any)?.api?.suggestIpa;
-          if (suggestIpa) {
-            const out = await suggestIpa({ word: cleanWord, dialect: 'US' });
-            if (String(out || '').trim()) return { type: 'ipa', value: ensureIpaSlashes(String(out || '')) };
-          }
-          const resp = await fetch(`https://api.dictionaryapi.dev/api/v2/entries/en/${encodeURIComponent(cleanWord)}`);
-          if (resp.ok) {
-            const data = await resp.json();
-            if (Array.isArray(data) && data[0]?.phonetics?.length > 0) {
-              const ph = data[0].phonetics.find((p: any) => p.text);
-              if (ph?.text) return { type: 'ipa', value: ensureIpaSlashes(ph.text) };
+      let updates: Partial<PendingWord> = { isApiLoading: false }
+
+      const enrichWord = (window as any)?.api?.enrichWord
+      if (enrichWord) {
+        const resp = await enrichWord({
+          requestId,
+          word: cleanWord,
+          contextSentenceEn: cleanContext,
+          from: 'en',
+          to: 'vi',
+          dialect: 'US'
+        })
+
+        if (pendingApiRequestsRef.current.get(wordId) !== requestId) return
+        if (!resp || resp.requestId !== requestId) return
+
+        const suggested = String(resp.meaningSuggested || '').trim()
+        updates.isApiComplete = !!suggested
+        if (suggested) updates.meaning = suggested
+        updates.candidates = Array.isArray(resp.candidates) ? resp.candidates : []
+        updates.contextVi = String(resp.contextSentenceVi || '').trim()
+
+        const posSuggested = normalizePos((resp as any).posSuggested)
+        if (posSuggested) {
+          updates.pos = posSuggested
+        } else {
+          const firstWithPos = (Array.isArray(resp.candidates) ? resp.candidates : []).find((c: any) => c && c.pos)
+          const normalized = normalizePos(firstWithPos?.pos)
+          if (normalized) updates.pos = normalized
+        }
+
+        const example = String((resp as any).example || '').trim()
+        if (example) updates.example = example
+
+        let ipa = String((resp as any).ipa || '').trim()
+        if (!ipa && !/\s/.test(cleanWord)) {
+          ipa = await fetchDictionaryIpa()
+        }
+        if (ipa) updates.pronunciation = ensureIpaSlashes(ipa)
+      } else {
+        const results = await Promise.allSettled([
+          (async () => {
+            const suggestIpa = (window as any)?.api?.suggestIpa
+            if (suggestIpa) {
+              const out = await suggestIpa({ word: cleanWord, dialect: 'US' })
+              if (String(out || '').trim()) return { type: 'ipa', value: ensureIpaSlashes(String(out || '')) }
             }
+            const ipa = await fetchDictionaryIpa()
+            return { type: 'ipa', value: ipa || '' }
+          })(),
+          (async () => {
+            if (!(window as any)?.api?.autoMeaning) return { type: 'meaning', value: null }
+            const resp = await (window as any).api.autoMeaning({
+              requestId,
+              word: cleanWord,
+              contextSentenceEn: cleanContext,
+              from: 'en',
+              to: 'vi'
+            })
+            if (!resp || resp.requestId !== requestId) return { type: 'meaning', value: null }
+            return { type: 'meaning', value: resp }
+          })()
+        ])
+
+        if (pendingApiRequestsRef.current.get(wordId) !== requestId) return
+
+        let suggested = ''
+        for (const r of results) {
+          if (r.status === 'fulfilled' && r.value && (r.value as any).type === 'meaning' && (r.value as any).value) {
+            suggested = String(((r.value as any).value as any).meaningSuggested || '').trim()
+            break
           }
-          return { type: 'ipa', value: '' };
-        })(),
+        }
+        updates.isApiComplete = !!suggested
 
-        // 2. Auto meaning
-        (async () => {
-          if (!(window as any)?.api?.autoMeaning) return { type: 'meaning', value: null };
-
-          const resp = await (window as any).api.autoMeaning({
-            requestId,
-            word: cleanWord,
-            contextSentenceEn: cleanContext,
-            from: 'en',
-            to: 'vi'
-          });
-
-          if (!resp || resp.requestId !== requestId) return { type: 'meaning', value: null };
-          return { type: 'meaning', value: resp };
-        })()
-      ]);
-
-      // Check if this request is still valid
-      if (pendingApiRequestsRef.current.get(wordId) !== requestId) return;
-
-      let updates: Partial<PendingWord> = {
-        isApiLoading: false,
-        isApiComplete: true
-      };
-
-      for (const result of results) {
-        if (result.status === 'fulfilled' && result.value) {
-          const data = result.value as any;
+        for (const result of results) {
+          if (result.status !== 'fulfilled' || !result.value) continue
+          const data = result.value as any
 
           if (data.type === 'ipa' && data.value) {
-            updates.pronunciation = data.value;
+            updates.pronunciation = data.value
           }
 
           if (data.type === 'meaning' && data.value) {
-            const resp = data.value;
-            const suggested = (resp.meaningSuggested || '').trim();
-            if (suggested) {
-              updates.meaning = suggested;
-            }
-            updates.candidates = Array.isArray(resp.candidates) ? resp.candidates : [];
-            updates.contextVi = (resp.contextSentenceVi || '').trim();
+            const resp = data.value
+            const s = String(resp.meaningSuggested || '').trim()
+            if (s) updates.meaning = s
+            updates.candidates = Array.isArray(resp.candidates) ? resp.candidates : []
+            updates.contextVi = String(resp.contextSentenceVi || '').trim()
 
-            // Extract POS from first candidate
-            const firstWithPos = (Array.isArray(resp.candidates) ? resp.candidates : []).find((c: any) => c && c.pos);
-            const normalized = normalizePos(firstWithPos?.pos);
-            if (normalized) updates.pos = normalized;
-            
-            // Fetch example sentence if meaning is available
-            if (suggested && (window as any)?.api?.suggestExampleSentence) {
+            const firstWithPos = (Array.isArray(resp.candidates) ? resp.candidates : []).find((c: any) => c && c.pos)
+            const normalized = normalizePos(firstWithPos?.pos)
+            if (normalized) updates.pos = normalized
+
+            if (s && (window as any)?.api?.suggestExampleSentence) {
               try {
                 const exampleOut = await (window as any).api.suggestExampleSentence({
                   word: cleanWord,
-                  meaningVi: suggested,
+                  meaningVi: s,
                   pos: normalized || '',
                   contextSentenceEn: cleanContext
-                });
-                if (String(exampleOut || '').trim()) {
-                  updates.example = String(exampleOut || '').trim();
-                }
-              } catch (e) {
-                // Silent fail
-              }
+                })
+                if (String(exampleOut || '').trim()) updates.example = String(exampleOut || '').trim()
+              } catch (e) {}
             }
           }
         }
       }
 
-      setPendingWords((prev) =>
-        prev.map((w) => (w.id === wordId ? { ...w, ...updates } : w))
-      );
+      if (updates.isApiComplete) {
+        try {
+          const t = pendingRetryTimersRef.current.get(wordId)
+          if (t) {
+            clearTimeout(t as any)
+            pendingRetryTimersRef.current.delete(wordId)
+          }
+        } catch (e) {}
+        retryAttemptsRef.current.delete(wordId)
+      }
+
+      setPendingWords((prev) => prev.map((w) => (w.id === wordId ? { ...w, ...updates } : w)))
+
+      if (!updates.isApiComplete) {
+        const attempts = (retryAttemptsRef.current.get(wordId) || 0) + 1
+        retryAttemptsRef.current.set(wordId, attempts)
+        const retryMs = Math.min(60_000, 2000 * Math.pow(2, attempts - 1))
+        const userMsg = `Retry scheduled in ${Math.ceil(retryMs / 1000)}s`
+
+        setPendingWords((prev) => prev.map((w) => (w.id === wordId ? { ...w, apiError: userMsg } : w)))
+
+        try {
+          const prevTimer = pendingRetryTimersRef.current.get(wordId)
+          if (prevTimer) {
+            clearTimeout(prevTimer as any)
+            pendingRetryTimersRef.current.delete(wordId)
+          }
+        } catch (e) {}
+
+        const timer = setTimeout(() => {
+          const stillPending = (pendingWordsRef.current || []).find((w) => w.id === wordId)
+          if (stillPending) fetchWordData(wordId, word, contextSentenceEn).catch(() => {})
+          pendingRetryTimersRef.current.delete(wordId)
+        }, retryMs)
+        pendingRetryTimersRef.current.set(wordId, timer as any)
+      }
     } catch (e) {
       if (pendingApiRequestsRef.current.get(wordId) === requestId) {
+        const errText = e && ((e as any).message || String(e)) ? ((e as any).message || String(e)) : 'Lỗi khi tải dữ liệu'
         setPendingWords((prev) =>
-          prev.map((w) =>
-            w.id === wordId
-              ? { ...w, isApiLoading: false, isApiComplete: false, apiError: 'Lỗi khi tải dữ liệu' }
-              : w
-          )
-        );
+          prev.map((w) => (w.id === wordId ? { ...w, isApiLoading: false, isApiComplete: false, apiError: errText } : w))
+        )
+
+        try {
+          const m = String(errText).match(/retry(?:\s*in)?\s*([0-9]+(?:\.[0-9]+)?)s/i)
+          if (m) {
+            const ms = Math.ceil(Number(m[1]) * 1000)
+            const prevTimer = pendingRetryTimersRef.current.get(wordId)
+            if (prevTimer) {
+              clearTimeout(prevTimer as any)
+              pendingRetryTimersRef.current.delete(wordId)
+            }
+            const timer = setTimeout(() => {
+              const stillPending = (pendingWordsRef.current || []).find((w) => w.id === wordId)
+              if (stillPending) fetchWordData(wordId, word, contextSentenceEn).catch(() => {})
+              pendingRetryTimersRef.current.delete(wordId)
+            }, ms)
+            pendingRetryTimersRef.current.set(wordId, timer as any)
+          }
+        } catch (ex) {}
       }
     }
-  }, []);
+  }, [])
 
   // Handle saving a word from sidebar
   const handleSaveWord = (
@@ -693,6 +827,14 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
   // Handle removing a pending word from sidebar
   const handleRemovePendingWord = (wordId: string) => {
     setPendingWords((prev) => prev.filter((w) => w.id !== wordId));
+    try {
+      const t = pendingRetryTimersRef.current.get(wordId)
+      if (t) {
+        clearTimeout(t as any)
+        pendingRetryTimersRef.current.delete(wordId)
+      }
+    } catch (e) {}
+    retryAttemptsRef.current.delete(wordId)
     // Cancel any pending API request
     const requestId = pendingApiRequestsRef.current.get(wordId);
     if (requestId && (window as any)?.api?.autoMeaningCancel) {
@@ -857,17 +999,104 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
           )}
         </div>
 
-        {/* Right sidebar for pending words */}
-        <div className="w-80 border-l border-slate-200/60 dark:border-slate-700/60 flex-shrink-0">
-          <PendingWordsSidebar
-            pendingWords={pendingWords}
-            onSave={handleSaveWord}
-            onRemove={handleRemovePendingWord}
-            onUpdateWord={handleUpdatePendingWord}
-            onSaveAll={handleSaveAllCompleted}
-            saveAllDisabled={!deckCsvPath || pendingAddCount > 0}
-          />
-        </div>
+        {/* Right sidebar: Tabs (Words / Passages) */}
+        {showRightPanel ? (
+          <div className="w-96 border-l border-slate-200/60 dark:border-slate-700/60 flex-shrink-0 bg-white dark:bg-slate-800 flex flex-col relative">
+            {/* Collapse */}
+            <div className="absolute top-3 left-3 z-10">
+              <button
+                title="Ẩn bảng bên phải"
+                onClick={() => setShowRightPanel(false)}
+                className="btn-icon !w-9 !h-9"
+              >
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                </svg>
+              </button>
+            </div>
+
+            {/* Tabs */}
+            <div className="flex border-b border-slate-200 dark:border-slate-700 mt-2 mx-14">
+              <button
+                onClick={() => setRightPanelTab('words')}
+                className={`flex-1 px-4 py-3 text-sm font-semibold transition-all flex items-center justify-center gap-2 ${
+                  rightPanelTab === 'words'
+                    ? 'text-violet-600 dark:text-violet-400 border-b-2 border-violet-500'
+                    : 'text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-300'
+                }`}
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253" />
+                </svg>
+                Từ
+                {pendingWords.length > 0 && (
+                  <span className="ml-1 px-1.5 py-0.5 bg-violet-500 text-white text-xs font-bold rounded-full">
+                    {pendingWords.length}
+                  </span>
+                )}
+              </button>
+              <button
+                onClick={() => setRightPanelTab('passages')}
+                className={`flex-1 px-4 py-3 text-sm font-semibold transition-all flex items-center justify-center gap-2 ${
+                  rightPanelTab === 'passages'
+                    ? 'text-emerald-600 dark:text-emerald-400 border-b-2 border-emerald-500'
+                    : 'text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-300'
+                }`}
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 5h12M9 3v2m1.048 9.5A18.022 18.022 0 016.412 9m6.088 9h7M11 21l5-10 5 10M12.751 5C11.783 10.77 8.07 15.61 3 18.129" />
+                </svg>
+                Đoạn
+                {!!passagesContext?.passages?.length && (
+                  <span className="ml-1 px-1.5 py-0.5 bg-emerald-500 text-white text-xs font-bold rounded-full">
+                    {passagesContext.passages.length}
+                  </span>
+                )}
+              </button>
+            </div>
+
+            {/* Content */}
+            <div className="flex-1 overflow-y-auto">
+              {rightPanelTab === 'words' && (
+                <PendingWordsSidebar
+                  pendingWords={pendingWords}
+                  onSave={handleSaveWord}
+                  onRemove={handleRemovePendingWord}
+                  onUpdateWord={handleUpdatePendingWord}
+                  onSaveAll={handleSaveAllCompleted}
+                  saveAllDisabled={!deckCsvPath || pendingAddCount > 0}
+                />
+              )}
+
+              {rightPanelTab === 'passages' && (
+                passagesContext ? (
+                  <PendingPassagesSidebar
+                    passages={passagesContext.passages}
+                    onRemove={passagesContext.removePassage}
+                    onClearAll={passagesContext.clearAll}
+                    onRetry={(id) => { void passagesContext.translatePassage(id) }}
+                  />
+                ) : (
+                  <div className="p-6 text-sm text-slate-600 dark:text-slate-300">
+                    Tính năng dịch đoạn chỉ khả dụng trong chế độ đọc PDF.
+                  </div>
+                )
+              )}
+            </div>
+          </div>
+        ) : (
+          <div className="w-14 flex items-center justify-center border-l border-slate-200/60 dark:border-slate-700/60 bg-white/95 dark:bg-slate-800/95 backdrop-blur-sm">
+            <button
+              title="Hiện bảng bên phải"
+              onClick={() => setShowRightPanel(true)}
+              className="btn-icon !w-10 !h-10"
+            >
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
+              </svg>
+            </button>
+          </div>
+        )}
 
         {showTranslateModal && selectedPassage && (
           <TranslateTextModal

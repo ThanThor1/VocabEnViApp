@@ -141,7 +141,14 @@ function normalizeKeysStore(obj) {
   const now = new Date().toISOString()
   const store = obj && typeof obj === 'object' ? obj : {}
   const version = 1
-  const activeId = typeof store.activeId === 'string' ? store.activeId : null
+  // Support both legacy activeId (string) and new activeIds (array)
+  let activeIds = []
+  if (Array.isArray(store.activeIds)) {
+    activeIds = store.activeIds.filter(id => typeof id === 'string' && id.trim()).map(id => id.trim())
+  } else if (typeof store.activeId === 'string' && store.activeId.trim()) {
+    // Migrate from single activeId to activeIds array
+    activeIds = [store.activeId.trim()]
+  }
   const itemsRaw = Array.isArray(store.items) ? store.items : []
   const items = itemsRaw
     .map((it) => {
@@ -159,8 +166,9 @@ function normalizeKeysStore(obj) {
     })
     .filter(Boolean)
 
-  const resolvedActiveId = activeId && items.some((x) => x.id === activeId) ? activeId : null
-  return { version, activeId: resolvedActiveId, items }
+  // Filter activeIds to only include valid item ids
+  const validActiveIds = activeIds.filter(id => items.some(x => x.id === id))
+  return { version, activeIds: validActiveIds, items }
 }
 
 async function readGoogleAiStudioKeysStore() {
@@ -192,29 +200,50 @@ async function ensureGoogleAiStudioKeysStore() {
     const id = makeId()
     return await writeGoogleAiStudioKeysStore({
       version: 1,
-      activeId: id,
+      activeIds: [id],
       items: [{ id, name: 'Default', key: envKey, createdAt: now, updatedAt: now }]
     })
   }
 
   // Do not create file eagerly if there is no key.
-  return { version: 1, activeId: null, items: [] }
+  return { version: 1, activeIds: [], items: [] }
 }
 
-async function setActiveGoogleAiStudioKeyId(activeId) {
+// Toggle a key on/off in activeIds
+async function toggleActiveGoogleAiStudioKeyId(keyId, enabled) {
   const store = await ensureGoogleAiStudioKeysStore()
-  const id = activeId == null ? null : String(activeId || '').trim()
-  let next = { ...store, activeId: null }
-  if (id) {
-    const found = store.items.find((x) => x.id === id)
-    if (!found) throw new Error('API key not found')
-    next.activeId = found.id
-    await writeGoogleAiStudioKeysStore(next)
-    await setUserEnvVar('GOOGLE_AI_STUDIO_API_KEY', found.key)
-    return true
+  const id = String(keyId || '').trim()
+  if (!id) throw new Error('Key id is required')
+  
+  const found = store.items.find((x) => x.id === id)
+  if (!found) throw new Error('API key not found')
+  
+  let newActiveIds = [...(store.activeIds || [])]
+  if (enabled) {
+    if (!newActiveIds.includes(id)) {
+      newActiveIds.push(id)
+    }
+  } else {
+    newActiveIds = newActiveIds.filter(x => x !== id)
   }
+  
+  const next = { ...store, activeIds: newActiveIds }
+  await writeGoogleAiStudioKeysStore(next)
+  
+  // Update env var with first active key for backward compat
+  if (newActiveIds.length > 0) {
+    const firstActive = store.items.find(x => x.id === newActiveIds[0])
+    await setUserEnvVar('GOOGLE_AI_STUDIO_API_KEY', firstActive ? firstActive.key : null)
+  } else {
+    await setUserEnvVar('GOOGLE_AI_STUDIO_API_KEY', null)
+  }
+  return true
+}
 
-  // Clear active (disable auto-translation), keep saved keys.
+// Clear all active keys
+async function clearAllActiveGoogleAiStudioKeys() {
+  const store = await ensureGoogleAiStudioKeysStore()
+  const next = { ...store, activeIds: [] }
   if (fsSync.existsSync(getUserGoogleAiStudioKeysPath())) {
     await writeGoogleAiStudioKeysStore(next)
   }
@@ -226,24 +255,27 @@ const AZURE_TRANSLATOR_ENDPOINT = 'https://api.cognitive.microsofttranslator.com
 const pendingAutoMeaning = new Map()
 
 // --- Google AI Studio concurrency + caching ---
+// Concurrency is now PER-KEY: if concurrency=2 and you have 4 keys, total parallel requests = 2*4 = 8
 function coerceGoogleAiConcurrency(val) {
   const n = Number(val)
-  if (!Number.isFinite(n)) return 4
+  if (!Number.isFinite(n)) return 2
   const i = Math.floor(n)
   if (i < 1) return 1
-  if (i > 16) return 16
+  if (i > 8) return 8  // per-key limit, reasonable for most APIs
   return i
 }
 
-let googleAiMaxConcurrency = coerceGoogleAiConcurrency(process.env.GOOGLE_AI_STUDIO_CONCURRENCY || 4)
+let googleAiPerKeyConcurrency = coerceGoogleAiConcurrency(process.env.GOOGLE_AI_STUDIO_CONCURRENCY || 2)
 const GOOGLE_AI_CACHE_TTL_MS = Math.max(0, Number(process.env.GOOGLE_AI_STUDIO_CACHE_TTL_MS || 5 * 60 * 1000) || 0)
-let googleAiActive = 0
+// Per-key active counters: Map<keyString, number>
+const googleAiActivePerKey = new Map()
+// Global queue - jobs include the key they want to use
 const googleAiQueue = []
 const googleAiCache = new Map() // key -> { t: number, v: string }
 
 function refreshGoogleAiConcurrencyFromEnv() {
-  googleAiMaxConcurrency = coerceGoogleAiConcurrency(process.env.GOOGLE_AI_STUDIO_CONCURRENCY || 4)
-  return googleAiMaxConcurrency
+  googleAiPerKeyConcurrency = coerceGoogleAiConcurrency(process.env.GOOGLE_AI_STUDIO_CONCURRENCY || 2)
+  return googleAiPerKeyConcurrency
 }
 
 function googleAiCacheGet(key) {
@@ -268,36 +300,59 @@ function googleAiCacheSet(key, value) {
   googleAiCache.set(key, { t: Date.now(), v: String(value || '') })
 }
 
-function runGoogleAiTask(taskFn) {
+// Run a task with per-key concurrency limiting
+// taskFn receives the apiKey to use
+function runGoogleAiTaskWithKey(apiKey, taskFn) {
   return new Promise((resolve, reject) => {
-    googleAiQueue.push({ taskFn, resolve, reject })
+    googleAiQueue.push({ apiKey, taskFn, resolve, reject })
     pumpGoogleAiQueue()
   })
 }
 
 function pumpGoogleAiQueue() {
-  while (googleAiActive < googleAiMaxConcurrency && googleAiQueue.length > 0) {
-    const job = googleAiQueue.shift()
-    if (!job) return
-    googleAiActive++
-    Promise.resolve()
-      .then(() => job.taskFn())
-      .then(job.resolve, job.reject)
-      .finally(() => {
-        googleAiActive--
-        pumpGoogleAiQueue()
-      })
+  // Try to find jobs that can run (their key hasn't hit concurrency limit)
+  let i = 0
+  while (i < googleAiQueue.length) {
+    const job = googleAiQueue[i]
+    const keyStr = job.apiKey || '__default__'
+    const active = googleAiActivePerKey.get(keyStr) || 0
+    
+    if (active < googleAiPerKeyConcurrency) {
+      // Can run this job
+      googleAiQueue.splice(i, 1)
+      googleAiActivePerKey.set(keyStr, active + 1)
+      
+      Promise.resolve()
+        .then(() => job.taskFn())
+        .then(job.resolve, job.reject)
+        .finally(() => {
+          const curr = googleAiActivePerKey.get(keyStr) || 1
+          googleAiActivePerKey.set(keyStr, Math.max(0, curr - 1))
+          pumpGoogleAiQueue()
+        })
+    } else {
+      // This key is at capacity, try next job
+      i++
+    }
   }
 }
 
 function sleepMs(ms, signal) {
   return new Promise((resolve, reject) => {
     if (signal && signal.aborted) return reject(Object.assign(new Error('Aborted'), { name: 'AbortError' }))
-    const t = setTimeout(() => resolve(true), ms)
+    const t = setTimeout(() => {
+      try {
+        if (signal && typeof onAbort === 'function') {
+          try { signal.removeEventListener('abort', onAbort) } catch {}
+        }
+      } catch (e) {}
+      resolve(true)
+    }, ms)
+    let onAbort
     if (signal) {
-      const onAbort = () => {
+      onAbort = () => {
         try { clearTimeout(t) } catch {}
-        signal.removeEventListener('abort', onAbort)
+        try { signal.removeEventListener('abort', onAbort) } catch {}
         reject(Object.assign(new Error('Aborted'), { name: 'AbortError' }))
       }
       signal.addEventListener('abort', onAbort)
@@ -305,7 +360,45 @@ function sleepMs(ms, signal) {
   })
 }
 
-function getGoogleAiStudioConfig(payload) {
+// Multi-key rotation state
+let activeKeysCache = null
+let activeKeyIndex = 0
+
+async function getActiveApiKeys() {
+  // Cache for performance, refresh periodically
+  if (!activeKeysCache) {
+    const store = await readGoogleAiStudioKeysStore()
+    if (store && store.activeIds && store.activeIds.length > 0) {
+      activeKeysCache = store.items.filter(item => store.activeIds.includes(item.id))
+    } else {
+      activeKeysCache = []
+    }
+    // Clear cache after 10 seconds to pick up changes
+    setTimeout(() => { activeKeysCache = null }, 10000)
+  }
+  return activeKeysCache
+}
+
+function getNextApiKey(keys) {
+  if (!keys || keys.length === 0) return null
+  const key = keys[activeKeyIndex % keys.length]
+  activeKeyIndex = (activeKeyIndex + 1) % keys.length
+  return key
+}
+
+async function getGoogleAiStudioConfig(payload) {
+  // First try multi-key rotation
+  const keys = await getActiveApiKeys()
+  if (keys && keys.length > 0) {
+    const keyItem = getNextApiKey(keys)
+    if (keyItem) {
+      const model = process.env.GOOGLE_AI_STUDIO_MODEL || 'gemma-3-27b-it'
+      const endpoint = process.env.GOOGLE_AI_STUDIO_ENDPOINT || 'https://generativelanguage.googleapis.com/v1beta'
+      return { key: keyItem.key, model, endpoint }
+    }
+  }
+  
+  // Fallback to env var
   const key = process.env.GOOGLE_AI_STUDIO_API_KEY || process.env.GOOGLE_API_KEY
   const model = process.env.GOOGLE_AI_STUDIO_MODEL || 'gemma-3-27b-it'
   const endpoint = process.env.GOOGLE_AI_STUDIO_ENDPOINT || 'https://generativelanguage.googleapis.com/v1beta'
@@ -323,8 +416,9 @@ async function googleAiStudioGenerateContent({ key, endpoint, model, prompt, sig
   const cached = googleAiCacheGet(cacheKey)
   if (cached != null) return cached
 
-  // Queue + limited parallelism, plus retry/backoff for transient rate limits.
-  return await runGoogleAiTask(async () => {
+  // Queue + per-key limited parallelism, plus retry/backoff for transient rate limits.
+  // The key is used to limit concurrency per-key, so multiple keys can run in parallel.
+  return await runGoogleAiTaskWithKey(key, async () => {
     const cached2 = googleAiCacheGet(cacheKey)
     if (cached2 != null) return cached2
 
@@ -362,13 +456,44 @@ async function googleAiStudioGenerateContent({ key, endpoint, model, prompt, sig
       const status = resp.status
       const t = await resp.text().catch(() => '')
       const isRetryable = status === 429 || status === 503 || status === 500
+      // Try to extract server-provided retry info (RetryInfo) if present
+      let retryDelayMs = null
+      try {
+        const parsed = JSON.parse(t)
+        const details = parsed && parsed.error && Array.isArray(parsed.error.details) ? parsed.error.details : []
+        for (const d of details) {
+          if (d && d['@type'] === 'type.googleapis.com/google.rpc.RetryInfo' && d.retryDelay) {
+            const rd = d.retryDelay
+            if (typeof rd === 'string') {
+              // e.g. "22.183372971s"
+              const m = rd.match(/([0-9]+)(?:\.([0-9]+))?s/)
+              if (m) {
+                const secs = Number(m[1] || 0)
+                const frac = m[2] ? Number('0.' + m[2]) : 0
+                retryDelayMs = Math.ceil((secs + frac) * 1000)
+                break
+              }
+            } else if (typeof rd === 'object' && (rd.seconds || rd.nanos)) {
+              const secs = Number(rd.seconds || 0)
+              const nanos = Number(rd.nanos || 0)
+              retryDelayMs = secs * 1000 + Math.floor(nanos / 1e6)
+              break
+            }
+          }
+        }
+      } catch (e) {}
+
       if (!isRetryable || attempt === maxRetries) {
         throw new Error(`Google AI Studio generateContent failed: ${status} ${t}`)
       }
 
-      const baseDelay = 400 * Math.pow(2, attempt)
-      const jitter = Math.floor(Math.random() * 250)
-      await sleepMs(baseDelay + jitter, signal)
+      if (retryDelayMs && retryDelayMs > 0) {
+        await sleepMs(retryDelayMs, signal)
+      } else {
+        const baseDelay = 400 * Math.pow(2, attempt)
+        const jitter = Math.floor(Math.random() * 250)
+        await sleepMs(baseDelay + jitter, signal)
+      }
     }
 
     // should be unreachable
@@ -428,6 +553,114 @@ async function gemmaSuggestIpa({ key, endpoint, model, word, dialect, signal }) 
 
   const raw = await googleAiStudioGenerateContent({ key, endpoint, model, prompt, signal })
   return sanitizeIpaOutput(raw)
+}
+
+async function gemmaEnrichWord({ key, endpoint, model, word, contextSentenceEn, from, to, dialect, signal }) {
+  const w = String(word || '').trim()
+  const ctx = String(contextSentenceEn || '').trim()
+  if (!w) {
+    return {
+      meaningSuggested: '',
+      candidates: [],
+      posSuggested: '',
+      ipa: '',
+      example: '',
+      contextSentenceVi: ''
+    }
+  }
+
+  const allowedPos = [
+    'Noun',
+    'Verb',
+    'Adjective',
+    'Adverb',
+    'Pronoun',
+    'Preposition',
+    'Conjunction',
+    'Determiner',
+    'Interjection',
+    'Phrase',
+    'Other'
+  ]
+
+  const d = (dialect === 'UK' ? 'British English (UK)' : 'American English (US)')
+  const src = String(from || 'en')
+  const dst = String(to || 'vi')
+
+  const prompt =
+    `You are a bilingual English→Vietnamese dictionary assistant.\n` +
+    `Given a selected term and an optional English context sentence, produce a compact word card: Vietnamese meanings + POS + IPA + one example sentence, and translate the context sentence to Vietnamese if provided.\n` +
+    `\n` +
+    `Selected term: "${w}"\n` +
+    (ctx ? `Context sentence (English): "${ctx}"\n` : '') +
+    `\n` +
+    `Output MUST be valid JSON only (no markdown, no commentary).\n` +
+    `Schema:\n` +
+    `{\n` +
+    `  "meaningSuggested": string,\n` +
+    `  "posSuggested": one of ${JSON.stringify(allowedPos)},\n` +
+    `  "ipa": string,\n` +
+    `  "example": string,\n` +
+    `  "contextSentenceVi": string,\n` +
+    `  "candidates": [\n` +
+    `    { "vi": string, "pos": one of ${JSON.stringify(allowedPos)}, "back": string[] }\n` +
+    `  ]\n` +
+    `}\n` +
+    `Rules:\n` +
+    `- Provide 3 to 7 candidates if possible.\n` +
+    `- Each candidate.vi is a short Vietnamese gloss (not a full sentence).\n` +
+    `- back: short English hints/synonyms (0-5 items).\n` +
+    `- meaningSuggested must exactly equal one of candidates[i].vi (best for the context).\n` +
+    `- posSuggested should match the POS of meaningSuggested.\n` +
+    `- ipa: IPA for "${w}" in ${d}, wrapped in slashes like /həˈloʊ/. If the term is a multi-word expression, set ipa to empty string.\n` +
+    `- example: ONE short English sentence (<= 25 words) using the term in the SAME meaning as meaningSuggested.\n` +
+    `- contextSentenceVi: translate the context sentence from ${src} to ${dst} if context is provided, else empty string.\n`
+
+  const raw = await googleAiStudioGenerateContent({ key, endpoint, model, prompt, signal })
+  const obj = safeJsonParseObject(raw) || {}
+
+  const candidates = dedupeCandidates(obj.candidates)
+  let meaningSuggested = obj.meaningSuggested ? String(obj.meaningSuggested || '').trim() : ''
+  if (meaningSuggested) {
+    const found = candidates.find((c) => normalizeMeaningForMatch(c.vi) === normalizeMeaningForMatch(meaningSuggested))
+    meaningSuggested = found ? found.vi : ''
+  }
+  if (!meaningSuggested && candidates.length > 0) meaningSuggested = candidates[0].vi
+
+  let posSuggested = normalizeGemmaPos(obj.posSuggested)
+  if (!posSuggested) {
+    const byMeaning = meaningSuggested
+      ? candidates.find((c) => normalizeMeaningForMatch(c.vi) === normalizeMeaningForMatch(meaningSuggested))
+      : null
+    posSuggested = normalizeGemmaPos(byMeaning && byMeaning.pos ? byMeaning.pos : '')
+  }
+
+  // IPA is empty for phrases.
+  let ipa = ''
+  if (!/\s/.test(w)) {
+    ipa = sanitizeIpaOutput(obj.ipa)
+  }
+
+  let example = obj.example ? String(obj.example || '').trim() : ''
+  if (example.includes('\n')) {
+    example = example
+      .split(/\r?\n/)
+      .map((x) => x.trim())
+      .filter(Boolean)[0] || ''
+  }
+  // Strip surrounding quotes.
+  example = example.replace(/^"+|"+$/g, '').trim()
+
+  const contextSentenceVi = obj.contextSentenceVi ? String(obj.contextSentenceVi || '').trim() : ''
+
+  return {
+    meaningSuggested: meaningSuggested || '',
+    candidates,
+    posSuggested: posSuggested || '',
+    ipa: ipa || '',
+    example: example || '',
+    contextSentenceVi: contextSentenceVi || ''
+  }
 }
 
 function extractFirstJsonObject(s) {
@@ -719,14 +952,16 @@ async function autoMeaningCore(payload) {
     // If Google AI Studio key is missing, skip Gemma and rely on Azure dictionary fallback (or return empty).
     let g = null
     try {
-      g = getGoogleAiStudioConfig(req)
+      g = await getGoogleAiStudioConfig(req)
     } catch (e) {
       g = null
     }
 
     if (g) {
-      try {
-        const gemma = await gemmaSuggestMeaningCandidates({
+      // Run meaning-candidates + optional context translation concurrently to reduce single-word latency.
+      const jobs = []
+      jobs.push(
+        gemmaSuggestMeaningCandidates({
           key: g.key,
           endpoint: g.endpoint,
           model: g.model,
@@ -736,27 +971,31 @@ async function autoMeaningCore(payload) {
           to,
           signal: controller.signal
         })
+      )
+      jobs.push(
+        contextSentenceEn
+          ? googleTranslatePlain({
+              key: g.key,
+              endpoint: g.endpoint,
+              model: g.model,
+              from,
+              to,
+              text: contextSentenceEn,
+              signal: controller.signal
+            })
+          : Promise.resolve('')
+      )
+
+      const [meaningRes, ctxRes] = await Promise.allSettled(jobs)
+
+      if (meaningRes.status === 'fulfilled') {
+        const gemma = meaningRes.value
         candidates = Array.isArray(gemma.candidates) ? gemma.candidates : []
         meaningSuggested = String(gemma.meaningSuggested || '').trim()
-      } catch (e) {
-        // ignore Gemma errors; allow Azure fallback below
       }
 
-      // 2) Translate context sentence for display (still Gemma).
-      if (contextSentenceEn) {
-        try {
-          contextSentenceVi = await googleTranslatePlain({
-            key: g.key,
-            endpoint: g.endpoint,
-            model: g.model,
-            from,
-            to,
-            text: contextSentenceEn,
-            signal: controller.signal
-          })
-        } catch (e) {
-          // ignore context translation errors
-        }
+      if (ctxRes.status === 'fulfilled') {
+        contextSentenceVi = String(ctxRes.value || '').trim()
       }
     }
 
@@ -807,6 +1046,104 @@ async function autoMeaningCore(payload) {
       }
     }
     console.error('autoMeaning error:', e && e.message ? e.message : e)
+    throw e
+  } finally {
+    pendingAutoMeaning.delete(requestId)
+  }
+}
+
+async function enrichWordCore(payload) {
+  const req = payload || {}
+  const requestId = String(req.requestId || generateUUID())
+  const word = String(req.word || '').trim()
+  const contextSentenceEn = String(req.contextSentenceEn || '').trim()
+  const from = String(req.from || 'en')
+  const to = String(req.to || 'vi')
+  const dialect = (req.dialect === 'UK' ? 'UK' : 'US')
+
+  if (!word) {
+    return {
+      requestId,
+      word: '',
+      meaningSuggested: '',
+      contextSentenceVi: '',
+      candidates: [],
+      posSuggested: '',
+      ipa: '',
+      example: ''
+    }
+  }
+
+  const controller = new AbortController()
+  // Reuse the existing cancel mechanism (autoMeaningCancel) by storing the controller under the same map.
+  pendingAutoMeaning.set(requestId, controller)
+
+  try {
+    let g = null
+    try {
+      g = await getGoogleAiStudioConfig(req)
+    } catch (e) {
+      g = null
+    }
+
+    if (g) {
+      const enriched = await gemmaEnrichWord({
+        key: g.key,
+        endpoint: g.endpoint,
+        model: g.model,
+        word,
+        contextSentenceEn,
+        from,
+        to,
+        dialect,
+        signal: controller.signal
+      })
+
+      return {
+        requestId,
+        word,
+        meaningSuggested: enriched.meaningSuggested || '',
+        contextSentenceVi: enriched.contextSentenceVi || '',
+        candidates: Array.isArray(enriched.candidates) ? enriched.candidates : [],
+        posSuggested: enriched.posSuggested || '',
+        ipa: enriched.ipa || '',
+        example: enriched.example || ''
+      }
+    }
+
+    // Fallback: reuse existing autoMeaningCore (Azure dictionary / etc.) and leave ipa/example empty.
+    const base = await autoMeaningCore({
+      requestId,
+      word,
+      contextSentenceEn,
+      from,
+      to
+    })
+
+    return {
+      requestId,
+      word,
+      meaningSuggested: String(base && base.meaningSuggested ? base.meaningSuggested : '').trim(),
+      contextSentenceVi: String(base && base.contextSentenceVi ? base.contextSentenceVi : '').trim(),
+      candidates: Array.isArray(base && base.candidates) ? base.candidates : [],
+      posSuggested: '',
+      ipa: '',
+      example: ''
+    }
+  } catch (e) {
+    if (e && e.name === 'AbortError') {
+      return {
+        requestId,
+        word,
+        meaningSuggested: '',
+        contextSentenceVi: '',
+        candidates: [],
+        posSuggested: '',
+        ipa: '',
+        example: ''
+      }
+    }
+    console.error('enrichWord error:', e && e.message ? e.message : e)
     throw e
   } finally {
     pendingAutoMeaning.delete(requestId)
@@ -1175,6 +1512,130 @@ ipcMain.handle('addWord', async (ev, fileRelOrAbsPath, row) => {
   return true;
 });
 
+// Background enhancement: improve word data if fields are missing
+ipcMain.handle('enhanceWordInBackground', async (ev, fileRelOrAbsPath, word, meaning, pronunciation, pos, example) => {
+  try {
+    const root = getDataRoot();
+    const full = path.isAbsolute(fileRelOrAbsPath)
+      ? fileRelOrAbsPath
+      : path.join(root, normalizeRel(fileRelOrAbsPath));
+
+    if (!fsSync.existsSync(full)) return false;
+
+    const text = await fs.readFile(full, 'utf8');
+    const parsed = Papa.parse(text, { header: true, skipEmptyLines: true });
+    const rows = parsed.data || [];
+
+    const targetIndex = rows.findIndex(
+      (r) => String(r.word || '').trim() === word.trim() && String(r.meaning || '').trim() === meaning.trim()
+    );
+    
+    if (targetIndex === -1) return false;
+
+    let needsUpdate = false;
+    const updatedRow = { ...rows[targetIndex] };
+
+    // Reuse one config read per background enhancement.
+    let g = null
+    try {
+      g = await getGoogleAiStudioConfig()
+    } catch (e) {
+      g = null
+    }
+
+    const shouldIpa = !pronunciation || !pronunciation.trim() || pronunciation === '//'
+    const shouldExample = !example || !example.trim()
+
+    // If we have an LLM key and multiple fields are missing, run them concurrently.
+    if (g && (shouldIpa || shouldExample)) {
+      const jobs = []
+      jobs.push(
+        shouldIpa
+          ? gemmaSuggestIpa({
+              key: g.key,
+              endpoint: g.endpoint,
+              model: g.model,
+              word: word.trim(),
+              dialect: 'US',
+              signal: null
+            })
+          : Promise.resolve(null)
+      )
+      jobs.push(
+        shouldExample
+          ? gemmaSuggestExampleSentence({
+              key: g.key,
+              endpoint: g.endpoint,
+              model: g.model,
+              word: word.trim(),
+              meaningVi: meaning.trim(),
+              pos: pos.trim(),
+              contextSentenceEn: '',
+              signal: null
+            })
+          : Promise.resolve(null)
+      )
+
+      const [ipaRes, exRes] = await Promise.allSettled(jobs)
+
+      if (ipaRes.status === 'fulfilled' && ipaRes.value && String(ipaRes.value).trim()) {
+        const core = String(ipaRes.value).trim().replace(/^\/+|\/+$/g, '')
+        updatedRow.pronunciation = core ? `/${core}/` : ''
+        needsUpdate = true
+      }
+
+      if (exRes.status === 'fulfilled' && exRes.value && String(exRes.value).trim()) {
+        updatedRow.example = String(exRes.value).trim()
+        needsUpdate = true
+      }
+    }
+
+    // Enhance pronunciation if missing
+    if (!g && (!pronunciation || !pronunciation.trim() || pronunciation === '//')) {
+      try {
+        // LLM unavailable; fallback to dictionaryapi.dev
+      } catch (e) {
+        try {
+          const resp = await fetch(`https://api.dictionaryapi.dev/api/v2/entries/en/${encodeURIComponent(word.trim())}`);
+          if (resp.ok) {
+            const data = await resp.json();
+            if (Array.isArray(data) && data[0]?.phonetics?.length > 0) {
+              const ph = data[0].phonetics.find((p) => p.text);
+              if (ph?.text) {
+                const core = String(ph.text).trim().replace(/^\/+|\/+$/g, '');
+                updatedRow.pronunciation = core ? `/${core}/` : '';
+                needsUpdate = true;
+              }
+            }
+          }
+        } catch (e2) {
+          // Silent fail
+        }
+      }
+    }
+
+    // Enhance example if missing
+    if (!g && (!example || !example.trim())) {
+      try {
+        // LLM unavailable; skip example enhancement.
+      } catch (e) {
+        // Silent fail
+      }
+    }
+
+    // Save if we enhanced anything
+    if (needsUpdate) {
+      rows[targetIndex] = updatedRow;
+      await writeCsv(fileRelOrAbsPath, rows);
+    }
+
+    return needsUpdate;
+  } catch (err) {
+    console.error('Background enhancement error:', err);
+    return false;
+  }
+});
+
 
 ipcMain.handle('deleteWord', async (ev, relPath, index) => {
   const root = getDataRoot()
@@ -1266,7 +1727,7 @@ ipcMain.handle('copyWords', async (ev, srcRel, dstRel, indices) => {
 ipcMain.handle('translator:suggestExampleSentence', async (ev, payload) => {
   const ctrl = new AbortController()
   try {
-    const { key, model, endpoint } = getGoogleAiStudioConfig(payload)
+    const { key, model, endpoint } = await getGoogleAiStudioConfig(payload)
     const word = payload && payload.word ? payload.word : ''
     const meaningVi = payload && payload.meaningVi ? payload.meaningVi : ''
     const pos = payload && payload.pos ? payload.pos : ''
@@ -1280,7 +1741,7 @@ ipcMain.handle('translator:suggestExampleSentence', async (ev, payload) => {
 ipcMain.handle('translator:suggestIpa', async (ev, payload) => {
   const ctrl = new AbortController()
   try {
-    const { key, model, endpoint } = getGoogleAiStudioConfig(payload)
+    const { key, model, endpoint } = await getGoogleAiStudioConfig(payload)
     const word = payload && payload.word ? payload.word : ''
     const dialect = payload && payload.dialect ? payload.dialect : 'US'
     return await gemmaSuggestIpa({ key, endpoint, model, word, dialect, signal: ctrl.signal })
@@ -1541,8 +2002,16 @@ ipcMain.handle('autoMeaning', async (ev, payload) => {
   return autoMeaningCore(payload)
 })
 
+ipcMain.handle('enrichWord', async (ev, payload) => {
+  return enrichWordCore(payload)
+})
+
 ipcMain.handle('translator:autoMeaning', async (ev, payload) => {
   return autoMeaningCore(payload)
+})
+
+ipcMain.handle('translator:enrichWord', async (ev, payload) => {
+  return enrichWordCore(payload)
 })
 
 ipcMain.handle('translator:translatePlain', async (ev, payload) => {
@@ -1552,12 +2021,13 @@ ipcMain.handle('translator:translatePlain', async (ev, payload) => {
   const to = String(req.to || 'vi')
   if (!text) return ''
 
-  const g = getGoogleAiStudioConfig(req)
+  const g = await getGoogleAiStudioConfig(req)
   return await googleTranslatePlain({ key: g.key, endpoint: g.endpoint, model: g.model, from, to, text })
 })
 
 ipcMain.handle('settings:getGoogleAiStudioStatus', async () => {
-  const hasKey = !!(process.env.GOOGLE_AI_STUDIO_API_KEY || process.env.GOOGLE_API_KEY)
+  const store = await readGoogleAiStudioKeysStore()
+  const hasKey = (store && store.activeIds && store.activeIds.length > 0) || !!(process.env.GOOGLE_AI_STUDIO_API_KEY || process.env.GOOGLE_API_KEY)
   return { hasKey }
 })
 
@@ -1577,33 +2047,33 @@ ipcMain.handle('settings:setGoogleAiStudioConcurrency', async (ev, concurrency) 
 ipcMain.handle('settings:setGoogleAiStudioApiKey', async (ev, apiKey) => {
   const key = String(apiKey || '').trim()
   if (!key) throw new Error('API key is required')
-  // Backward-compat: also store it in the multi-key store as the active key.
+  // Backward-compat: also store it in the multi-key store as active
   const store = await ensureGoogleAiStudioKeysStore()
   const now = new Date().toISOString()
   const id = makeId()
   const next = {
     ...store,
-    activeId: id,
+    activeIds: [...(store.activeIds || []), id],
     items: [...store.items, { id, name: 'Key', key, createdAt: now, updatedAt: now }]
   }
-  if (fsSync.existsSync(getUserGoogleAiStudioKeysPath()) || store.items.length > 0) {
-    await writeGoogleAiStudioKeysStore(next)
-  } else {
-    await writeGoogleAiStudioKeysStore(next)
-  }
+  await writeGoogleAiStudioKeysStore(next)
+  activeKeysCache = null // Clear cache
   await setUserEnvVar('GOOGLE_AI_STUDIO_API_KEY', key)
   return true
 })
 
 ipcMain.handle('settings:clearGoogleAiStudioApiKey', async () => {
-  await setActiveGoogleAiStudioKeyId(null)
+  await clearAllActiveGoogleAiStudioKeys()
+  activeKeysCache = null // Clear cache
   return true
 })
 
 ipcMain.handle('settings:listGoogleAiStudioApiKeys', async () => {
   const store = await ensureGoogleAiStudioKeysStore()
   return {
-    activeId: store.activeId,
+    activeIds: store.activeIds || [],
+    // For backward compat, also return activeId as first active
+    activeId: store.activeIds && store.activeIds.length > 0 ? store.activeIds[0] : null,
     items: store.items.map((it) => ({
       id: it.id,
       name: it.name,
@@ -1623,11 +2093,14 @@ ipcMain.handle('settings:addGoogleAiStudioApiKey', async (ev, payload) => {
   const id = makeId()
   const next = {
     ...store,
-    activeId: id,
+    activeIds: [...(store.activeIds || []), id], // Auto-enable new key
     items: [...store.items, { id, name, key, createdAt: now, updatedAt: now }]
   }
   await writeGoogleAiStudioKeysStore(next)
-  await setUserEnvVar('GOOGLE_AI_STUDIO_API_KEY', key)
+  activeKeysCache = null // Clear cache
+  // Set first key as env var for backward compat
+  const firstActiveKey = next.items.find(x => next.activeIds.includes(x.id))
+  await setUserEnvVar('GOOGLE_AI_STUDIO_API_KEY', firstActiveKey ? firstActiveKey.key : null)
   return true
 })
 
@@ -1637,29 +2110,36 @@ ipcMain.handle('settings:deleteGoogleAiStudioApiKey', async (ev, keyId) => {
 
   const store = await ensureGoogleAiStudioKeysStore()
   const items = store.items.filter((x) => x.id !== id)
-  const wasActive = store.activeId === id
-  const nextActiveId = wasActive ? (items[0] ? items[0].id : null) : store.activeId
-  const next = { ...store, items, activeId: nextActiveId }
+  // Remove from activeIds if present
+  const newActiveIds = (store.activeIds || []).filter(x => x !== id)
+  const next = { ...store, items, activeIds: newActiveIds }
 
-  if (fsSync.existsSync(getUserGoogleAiStudioKeysPath())) {
-    await writeGoogleAiStudioKeysStore(next)
-  } else {
-    await writeGoogleAiStudioKeysStore(next)
-  }
+  await writeGoogleAiStudioKeysStore(next)
+  activeKeysCache = null // Clear cache
 
-  if (nextActiveId) {
-    const found = items.find((x) => x.id === nextActiveId)
-    await setUserEnvVar('GOOGLE_AI_STUDIO_API_KEY', found ? found.key : null)
+  // Update env var with first active key
+  if (newActiveIds.length > 0) {
+    const firstActive = items.find((x) => x.id === newActiveIds[0])
+    await setUserEnvVar('GOOGLE_AI_STUDIO_API_KEY', firstActive ? firstActive.key : null)
   } else {
     await setUserEnvVar('GOOGLE_AI_STUDIO_API_KEY', null)
   }
   return true
 })
 
+// Toggle a key on/off (for multi-select)
+ipcMain.handle('settings:toggleGoogleAiStudioApiKey', async (ev, keyId, enabled) => {
+  await toggleActiveGoogleAiStudioKeyId(keyId, enabled)
+  activeKeysCache = null // Clear cache
+  return true
+})
+
 ipcMain.handle('settings:setActiveGoogleAiStudioApiKey', async (ev, keyId) => {
+  // For backward compat - toggle the key on
   const id = String(keyId || '').trim()
   if (!id) throw new Error('Key id is required')
-  await setActiveGoogleAiStudioKeyId(id)
+  await toggleActiveGoogleAiStudioKeyId(id, true)
+  activeKeysCache = null // Clear cache
   return true
 })
 

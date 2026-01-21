@@ -10,7 +10,7 @@ export default function ApiKey() {
   const [statusMsg, setStatusMsg] = useState<string>('')
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null)
 
-  const [activeId, setActiveId] = useState<string | null>(null)
+  const [activeIds, setActiveIds] = useState<string[]>([])
   const [items, setItems] = useState<Array<{ id: string; name: string; masked: string }>>([])
   const [hasConfiguredKey, setHasConfiguredKey] = useState<boolean>(false)
 
@@ -22,7 +22,7 @@ export default function ApiKey() {
 
   const busyTokenRef = useRef<string | null>(null)
 
-  const hasActiveKey = useMemo(() => !!activeId, [activeId])
+  const hasActiveKey = useMemo(() => activeIds.length > 0, [activeIds])
 
   const withTimeout = async <T,>(p: Promise<T>, ms: number, label: string): Promise<T> => {
     let to: any
@@ -70,7 +70,7 @@ export default function ApiKey() {
   const refresh = async () => {
     if (!api?.listGoogleAiStudioApiKeys) return
     const data = await api.listGoogleAiStudioApiKeys()
-    setActiveId(data?.activeId ?? null)
+    setActiveIds(Array.isArray(data?.activeIds) ? data.activeIds : (data?.activeId ? [data.activeId] : []))
     setItems(Array.isArray(data?.items) ? data.items : [])
   }
 
@@ -165,22 +165,22 @@ export default function ApiKey() {
     }
   }
 
-  const handleSelect = async (id: string) => {
+  const handleToggle = async (id: string, enabled: boolean) => {
     try {
       setStatusMsg('')
       setError('')
-      if (!api?.setActiveGoogleAiStudioApiKey) {
+      if (!api?.toggleGoogleAiStudioApiKey) {
         setError('API unavailable')
         return
       }
       await runBusy(async () => {
-        await api.setActiveGoogleAiStudioApiKey(id)
+        await api.toggleGoogleAiStudioApiKey(id, enabled)
         await refresh()
-      }, 12000, 'Select active API key')
-      setStatusMsg('Selected as active key.')
+      }, 12000, 'Toggle API key')
+      setStatusMsg(enabled ? 'Key enabled.' : 'Key disabled.')
       setTimeout(() => setStatusMsg(''), 2500)
     } catch (e: any) {
-      setError(e?.message ? String(e.message) : 'Failed to set active key')
+      setError(e?.message ? String(e.message) : 'Failed to toggle key')
     }
   }
 
@@ -202,7 +202,7 @@ export default function ApiKey() {
     try {
       setStatusMsg('')
       setError('')
-      if (!activeId) return
+      if (activeIds.length === 0) return
       if (!api?.clearGoogleAiStudioApiKey) {
         setError('API unavailable')
         return
@@ -225,8 +225,8 @@ export default function ApiKey() {
   }
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-50 via-violet-50/30 to-purple-50/30 dark:from-slate-900 dark:via-slate-900 dark:to-slate-800 p-8">
-      <div className="max-w-3xl mx-auto">
+    <div className="h-full overflow-y-auto bg-gradient-to-br from-slate-50 via-violet-50/30 to-purple-50/30 dark:from-slate-900 dark:via-slate-900 dark:to-slate-800 p-8">
+      <div className="max-w-3xl mx-auto pb-8">
       {confirmDeleteId && (
         <ConfirmModal
           title="Delete API key?"
@@ -294,7 +294,7 @@ export default function ApiKey() {
               {hasActiveKey ? (
                 <span className="inline-flex items-center gap-2 text-green-700 dark:text-green-400 font-semibold">
                   <span className="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span>
-                  Active (API key configured)
+                  Active ({activeIds.length} key{activeIds.length > 1 ? 's' : ''} enabled - rotating for parallel requests)
                 </span>
               ) : (
                 <span className="inline-flex items-center gap-2 text-slate-700 dark:text-slate-400 font-semibold">
@@ -333,31 +333,38 @@ export default function ApiKey() {
             </svg>
           </div>
           <div className="flex-1">
-            <div className="text-lg font-bold text-slate-900 dark:text-white">Performance</div>
+            <div className="text-lg font-bold text-slate-900 dark:text-white">Performance (Per-Key Concurrency)</div>
             <div className="text-sm text-slate-600 dark:text-slate-400 mt-1">
-              Increase this to allow more parallel AI requests (avoid too high to prevent rate limits).
+              Số request song song <strong>mỗi API key</strong>.
+              {activeIds.length > 0 && (
+                <span className="text-violet-600 dark:text-violet-400 font-medium ml-1">
+                  Bạn có {activeIds.length} keys × {concurrency} = <strong>{activeIds.length * concurrency} request song song</strong> tổng cộng.
+                </span>
+              )}
             </div>
 
             <div className="mt-4 flex flex-col gap-3">
               <div className="flex items-center gap-3">
-                <label className="text-sm font-semibold text-slate-700 dark:text-slate-300 w-48">AI concurrency (1–16)</label>
+                <label className="text-sm font-semibold text-slate-700 dark:text-slate-300 w-48">Per-key concurrency (1–8)</label>
                 <input
                   type="number"
                   min={1}
-                  max={16}
+                  max={8}
                   step={1}
                   value={concurrencyInput}
                   onChange={(e) => setConcurrencyInput(e.target.value)}
                   className="input-field bg-slate-50 dark:bg-slate-700 w-28"
                 />
-                <div className="text-xs text-slate-500 dark:text-slate-400">Current: {concurrency}</div>
+                <div className="text-xs text-slate-500 dark:text-slate-400">
+                  Current: {concurrency}/key
+                </div>
               </div>
 
               <div className="flex items-center gap-3">
                 <input
                   type="range"
                   min={1}
-                  max={16}
+                  max={8}
                   step={1}
                   value={Number(concurrencyInput) || concurrency}
                   onChange={(e) => setConcurrencyInput(e.target.value)}
@@ -371,6 +378,12 @@ export default function ApiKey() {
                   Save
                 </button>
               </div>
+              
+              {activeIds.length > 0 && (
+                <div className="text-xs text-slate-500 dark:text-slate-400 bg-slate-100 dark:bg-slate-700 p-2 rounded">
+                  💡 Ví dụ: {activeIds.length} keys × {concurrency} concurrency = {activeIds.length * concurrency} requests chạy song song cùng lúc trên server Google.
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -477,7 +490,7 @@ export default function ApiKey() {
           </div>
           <div>
             <div className="text-lg font-bold text-slate-900 dark:text-white">Your API Keys</div>
-            <div className="text-xs text-slate-600 dark:text-slate-400">Select one to enable auto-translation</div>
+            <div className="text-xs text-slate-600 dark:text-slate-400">Select multiple keys for parallel API calls (keys rotate automatically)</div>
           </div>
         </div>
 
@@ -497,23 +510,24 @@ export default function ApiKey() {
           </div>
         ) : (
           <div className="space-y-3">
-            {items.map((it) => (
+            {items.map((it) => {
+              const isActive = activeIds.includes(it.id)
+              return (
               <div 
                 key={it.id} 
                 className={`flex items-center gap-4 p-4 border-2 rounded-xl transition-all ${
-                  activeId === it.id
+                  isActive
                     ? "bg-gradient-to-r from-violet-50 to-purple-50 dark:from-violet-900/20 dark:to-purple-900/20 border-violet-500 shadow-md"
                     : "bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 hover:border-violet-300 dark:hover:border-violet-600 hover:shadow-md"
                 }`}
               >
                 <label className="flex items-center gap-3 min-w-0 flex-1 cursor-pointer">
                   <input
-                    type="radio"
-                    name="activeKey"
-                    checked={activeId === it.id}
-                    onChange={() => handleSelect(it.id)}
+                    type="checkbox"
+                    checked={isActive}
+                    onChange={(e) => handleToggle(it.id, e.target.checked)}
                     disabled={loading}
-                    className="w-5 h-5 text-violet-600 focus:ring-2 focus:ring-violet-500"
+                    className="w-5 h-5 text-violet-600 focus:ring-2 focus:ring-violet-500 rounded"
                   />
                   <div className="flex-1 min-w-0">
                     <div className="text-sm font-semibold text-slate-900 dark:text-white truncate">
@@ -521,7 +535,7 @@ export default function ApiKey() {
                     </div>
                     <div className="text-xs text-slate-500 dark:text-slate-400 font-mono mt-0.5">{it.masked}</div>
                   </div>
-                  {activeId === it.id && (
+                  {isActive && (
                     <span className="badge bg-gradient-to-r from-violet-500 to-purple-600 text-white px-3 py-1">
                       Active
                     </span>
@@ -536,7 +550,7 @@ export default function ApiKey() {
                   Delete
                 </button>
               </div>
-            ))}
+            )})}
           </div>
         )}
       </div>

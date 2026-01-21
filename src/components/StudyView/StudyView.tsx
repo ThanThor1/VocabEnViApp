@@ -2,8 +2,12 @@ import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react'
 import './StudyView.css'
 import ErrorBoundary from '../ErrorBoundary/ErrorBoundary'
 import ConfirmModal from '../ConfirmModal/ConfirmModal'
+import DifficultySelector from '../DifficultySelector/DifficultySelector'
+import ReviewCalendar from '../ReviewCalendar/ReviewCalendar'
 import { useLocation } from 'react-router-dom'
 import { usePersistedState } from '../../hooks/usePersistedState'
+import { VocabularyStore, useVocabularyStore } from '../../store/VocabularyStore'
+import type { VocabRecord } from '../../store/VocabularyStore'
 
 function shuffle<T>(a:T[]){
   for(let i=a.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[a[i],a[j]]=[a[j],a[i]]}
@@ -23,7 +27,7 @@ type StudyMode = 'spelling' | 'match'
 type StudyTab = 'custom' | 'smart'
 
 // ==================== SPACED REPETITION SYSTEM (SRS) ====================
-// SM-2 Algorithm inspired by SuperMemo
+// NOTE: Smart Review uses VocabularyStore as the single source of truth.
 
 interface SRSCardData {
   // Unique key: source||word||meaning
@@ -65,8 +69,16 @@ function calculateSM2(item: SRSCardData, quality: number): SRSCardData {
     interval = 1
   } else {
     // Correct
+    // New behavior: For the *first* correct (repetitions === 0) apply a sensible
+    // initial interval based on the quality so user choice matters.
+    // - q === 3 (Hard/correct with difficulty) -> 1 day
+    // - q === 4 (Good) -> 3 days
+    // - q === 5 (Easy/perfect) -> 7 days
     if (repetitions === 0) {
-      interval = 1
+      if (q === 3) interval = 1
+      else if (q === 4) interval = 3
+      else if (q === 5) interval = 7
+      else interval = 1
     } else if (repetitions === 1) {
       interval = 6
     } else {
@@ -158,7 +170,7 @@ type CardId = {
 
 type StudySessionV1 = {
   v: 1
-  phase: 'idle' | 'mode-select' | 'studying' | 'review-result' | 'summary' | 'match-game' | 'match-summary' | 'srs-studying' | 'srs-review-result' | 'srs-summary'
+  phase: 'idle' | 'mode-select' | 'studying' | 'review-result' | 'summary' | 'difficulty-select' | 'match-game' | 'match-summary' | 'srs-studying' | 'srs-review-result' | 'srs-summary'
   round?: number
   selectedFiles: string[]
   fileConfigs: Record<string, FileStudyConfig>
@@ -172,6 +184,12 @@ type StudySessionV1 = {
 }
 
 export default function Study(){
+  // Tick "now" so Smart Review reacts when the system date/time changes (useful for testing by changing OS date).
+  const [nowTick, setNowTick] = useState(() => Date.now())
+  useEffect(() => {
+    const t = window.setInterval(() => setNowTick(Date.now()), 1500)
+    return () => window.clearInterval(t)
+  }, [])
   const location = useLocation();
   const [tree, setTree] = useState<any[]>([])
   const [pdfList, setPdfList] = useState<any[]>([])
@@ -183,7 +201,7 @@ export default function Study(){
   const [index, setIndex] = useState<number>(0)
   const [revealLevel, setRevealLevel] = useState(0) // 0 = all underscores, 1+ = reveal that many chars
   const [input, setInput] = useState("")
-  const [phase, setPhase] = useState<'idle'|'mode-select'|'studying'|'review-result'|'summary'|'match-game'|'match-summary'|'srs-studying'|'srs-review-result'|'srs-summary'>('idle')
+  const [phase, setPhase] = useState<'idle'|'mode-select'|'studying'|'review-result'|'summary'|'difficulty-select'|'match-game'|'match-summary'|'srs-studying'|'srs-review-result'|'srs-summary'>('idle')
   const [studyMode, setStudyMode] = usePersistedState<StudyMode>('study_mode', 'spelling')
   const [studyTab, setStudyTab] = usePersistedState<StudyTab>('study_tab', 'custom')
   const [lastAnswerCorrect, setLastAnswerCorrect] = useState<boolean | null>(null)
@@ -192,12 +210,23 @@ export default function Study(){
   const [round, setRound] = useState<number>(1)
   const [stats, setStats] = usePersistedState('study_stats', { correct: 0, incorrect: 0, hard: 0, easy: 0 })
   const inputRef = useRef<HTMLInputElement|null>(null)
+  
+  // Track words that were wrong in current round (for next round review)
+  const [wrongInCurrentRound, setWrongInCurrentRound] = useState<Set<string>>(new Set())
+  const wrongInCurrentRoundRef = useRef<Set<string>>(new Set())
+  
+  // Track all reviewed words for difficulty selection at end
+  const [reviewedWords, setReviewedWords] = useState<Card[]>([])
+  const reviewedWordsRef = useRef<Card[]>([])
 
   // SRS State
-  const [srsStore, setSrsStore] = useState<SRSStore>(() => loadSRSStore())
-  const [srsQueue, setSrsQueue] = useState<SRSCardData[]>([])
+  useVocabularyStore()
+  const [srsQueue, setSrsQueue] = useState<VocabRecord[]>([])
   const [srsIndex, setSrsIndex] = useState(0)
   const [srsStats, setSrsStats] = useState({ reviewed: 0, correct: 0, incorrect: 0 })
+  const [difficultySelectMode, setDifficultySelectMode] = useState<'custom' | 'smart'>('custom')
+  const [srsReviewedWords, setSrsReviewedWords] = useState<VocabRecord[]>([])
+  const srsReviewedWordsRef = useRef<VocabRecord[]>([])
 
   // Match game state
   const [matchCards, setMatchCards] = useState<Card[]>([])
@@ -219,6 +248,7 @@ export default function Study(){
   const [fileCardsLoading, setFileCardsLoading] = useState<Record<string, boolean>>({})
   const [uiError, setUiError] = useState<string>('')
   const [confirmQuitOpen, setConfirmQuitOpen] = useState(false)
+  const [smartCalendarView, setSmartCalendarView] = usePersistedState<'month' | '14days'>('smart_calendar_view', 'month')
 
   const [session, setSession] = usePersistedState<StudySessionV1 | null>('study_session_v1', null)
   const didInitialRestoreRef = useRef(false)
@@ -232,7 +262,8 @@ export default function Study(){
     p === 'match-summary' ||
     p === 'srs-studying' ||
     p === 'srs-review-result' ||
-    p === 'srs-summary'
+    p === 'srs-summary' ||
+    p === 'difficulty-select'
 
   const makeCardKey = (source: string | undefined, word: string, meaning: string) => {
     const s = String(source || '').trim()
@@ -265,6 +296,14 @@ export default function Study(){
   useEffect(() => {
     toReviewRef.current = toReview
   }, [toReview])
+
+  useEffect(() => {
+    wrongInCurrentRoundRef.current = wrongInCurrentRound
+  }, [wrongInCurrentRound])
+
+  useEffect(() => {
+    reviewedWordsRef.current = reviewedWords
+  }, [reviewedWords])
 
   // Restore an in-progress session on initial mount
   useEffect(() => {
@@ -629,45 +668,69 @@ export default function Study(){
       setStats((s) => ({ ...s, correct: s.correct + 1 }))
     } else {
       setStats((s) => ({ ...s, incorrect: s.incorrect + 1 }))
+      // ✅ NEW: Mark as wrong in current round (will be reviewed next round)
+      const cardKey = makeCardKey(card.source, card.word, card.meaning)
+      setWrongInCurrentRound(prev => {
+        const next = new Set(prev)
+        next.add(cardKey)
+        return next
+      })
     }
     setPhase('review-result')
   }
 
-  // user choice after reveal: 1 replay, 2 easy, 3 hard
-  function handleChoice(choice: 1|2|3){
+  // ==================== NEW ROUND-BASED LEARNING ====================
+  // Only 2 choices: "Làm lại" (retry immediately) or "Cho qua" (pass to next word)
+  // Words that were wrong ALWAYS go to next round, regardless of retry result
+  
+  function handleRetry() {
+    // User wants to retry immediately - clear input and stay on same card
+    setInput('')
+    setRevealLevel(0)
+    setLastAnswerCorrect(null)
+    setPhase('studying')
+    // Focus input after state update
+    setTimeout(() => inputRef.current?.focus(), 50)
+  }
+  
+  function handlePass() {
     const card = queue[index]
     if (!card) return
-
-    // Round-based learning:
-    // - Round 1: all words
-    // - Round N+1: all words that were wrong OR marked Again/Hard in round N
-    const shouldReviewNextRound = choice === 1 || choice === 3 || lastAnswerCorrect === false
-    if (shouldReviewNextRound) {
-      const k = makeCardKey(card.source, card.word, card.meaning)
+    
+    const cardKey = makeCardKey(card.source, card.word, card.meaning)
+    
+    // ✅ Track reviewed words for difficulty selection at end
+    const alreadyTracked = reviewedWordsRef.current.some(
+      c => makeCardKey(c.source, c.word, c.meaning) === cardKey
+    )
+    if (!alreadyTracked) {
+      const next = [...reviewedWordsRef.current, card]
+      reviewedWordsRef.current = next
+      setReviewedWords(next)
+    }
+    
+    // ✅ If wrong in current round, add to next round's review list
+    if (wrongInCurrentRoundRef.current.has(cardKey)) {
       const prev = toReviewRef.current || []
-      const exists = prev.some((c) => makeCardKey(c.source, c.word, c.meaning) === k)
+      const exists = prev.some((c) => makeCardKey(c.source, c.word, c.meaning) === cardKey)
       if (!exists) {
         const next = [...prev, card]
         toReviewRef.current = next
         setToReview(next)
       }
     }
-
-    if (choice === 2){
-      // mark easy: do nothing (card considered learned)
-      setStats((s) => ({ ...s, easy: s.easy + 1 }))
-      // ✅ Thêm từ vào SRS khi user đánh dấu Easy (đã thuộc)
-      addCardToSRS(card)
-    } else if (choice === 3){
-      // mark hard: requeue
-      setStats((s) => ({ ...s, hard: s.hard + 1 }))
-      // ✅ Cũng thêm vào SRS nhưng với interval ngắn hơn (sẽ được xử lý trong addCardToSRS)
-      addCardToSRS(card)
-    }
-    // choice === 1 (Again): không thêm vào SRS, để user học lại round sau
-
-    // advance
+    
+    // Advance to next word
     advanceAfterResult()
+  }
+  
+  // Legacy function - kept for backwards compatibility with keyboard shortcuts
+  function handleChoice(choice: 1|2|3){
+    if (choice === 1) {
+      handleRetry()
+    } else {
+      handlePass()
+    }
   }
 
   function advanceAfterResult(){
@@ -688,15 +751,19 @@ export default function Study(){
       setQueue(shuffle([...reviewCards]))
       setToReview([])
       toReviewRef.current = []
+      // ✅ Clear wrongInCurrentRound for new round
+      setWrongInCurrentRound(new Set())
+      wrongInCurrentRoundRef.current = new Set()
       setIndex(0)
       setRound((r) => (Number(r) || 1) + 1)
       setPhase('studying')
       return
     }
 
-    // Done: all words were marked easy in the last round
+    // ✅ Done: Go to difficulty selection phase instead of summary
     setIndex(0)
-    setPhase('summary')
+    setDifficultySelectMode('custom')
+    setPhase('difficulty-select')
   }
 
   function quitStudy(){
@@ -715,6 +782,11 @@ export default function Study(){
     setLastAnswerCorrect(null)
     setRound(1)
     setStats({ correct: 0, incorrect: 0, hard: 0, easy: 0 })
+    // Reset round-based learning state
+    setWrongInCurrentRound(new Set())
+    wrongInCurrentRoundRef.current = new Set()
+    setReviewedWords([])
+    reviewedWordsRef.current = []
     // Reset match game state
     if (matchTimerRef.current) {
       window.clearInterval(matchTimerRef.current)
@@ -735,6 +807,9 @@ export default function Study(){
     setSrsQueue([])
     setSrsIndex(0)
     setSrsStats({ reviewed: 0, correct: 0, incorrect: 0 })
+    setSrsReviewedWords([])
+    srsReviewedWordsRef.current = []
+    setDifficultySelectMode('custom')
   }
 
   // ==================== MATCH GAME LOGIC ====================
@@ -854,8 +929,7 @@ export default function Study(){
               window.clearInterval(matchTimerRef.current)
               matchTimerRef.current = null
             }
-            // ✅ Thêm tất cả từ đã match vào SRS khi hoàn thành game
-            matchCards.forEach(card => addCardToSRS(card))
+            // Vocabulary is persisted via DifficultySelector after Custom Study.
             setPhase('match-summary')
           } else {
             setMatchRound(nextRound)
@@ -881,80 +955,25 @@ export default function Study(){
 
   // ==================== SRS FUNCTIONS ====================
   
-  // Calculate SRS stats - chỉ hiển thị từ đã học qua Custom Study
-  const srsStatsComputed = useMemo(() => {
-    const dueCards = getDueCards(srsStore)
-    const totalInSRS = Object.keys(srsStore).length
-    
-    return {
-      due: dueCards.length,
-      total: totalInSRS,
-      mastered: Object.values(srsStore).filter(c => c.repetitions >= 5).length,
-    }
-  }, [srsStore])
+  // Calculate Smart Review stats from VocabularyStore
+  // (re-evaluated on nowTick so due-today updates when you change system date)
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const _nowTickForRerender = nowTick
+  const vocabStats = VocabularyStore.getStats()
+  const srsStatsComputed = {
+    due: vocabStats.dueToday,
+    total: Math.max(0, vocabStats.total - vocabStats.new),
+    mastered: vocabStats.mastered,
+  }
 
-  // Calendar data for SRS - group words by scheduled review date
-  const [calendarExpandedDay, setCalendarExpandedDay] = useState<string | null>(null)
-  
-  const srsCalendarData = useMemo(() => {
-    const now = new Date()
-    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate())
-    const cards = Object.values(srsStore)
-    
-    // Create map for next 14 days
-    const dayMap: Record<string, { date: Date; dateStr: string; dayName: string; cards: SRSCardData[]; isToday: boolean; isPast: boolean }> = {}
-    
-    for (let i = 0; i < 14; i++) {
-      const d = new Date(today)
-      d.setDate(d.getDate() + i)
-      const key = d.toISOString().split('T')[0]
-      const dayNames = ['CN', 'T2', 'T3', 'T4', 'T5', 'T6', 'T7']
-      dayMap[key] = {
-        date: d,
-        dateStr: `${d.getDate()}/${d.getMonth() + 1}`,
-        dayName: dayNames[d.getDay()],
-        cards: [],
-        isToday: i === 0,
-        isPast: false,
-      }
-    }
-    
-    // Also track overdue (past due)
-    let overdueCards: SRSCardData[] = []
-    
-    // Assign cards to days
-    for (const card of cards) {
-      const reviewDate = new Date(card.nextReview)
-      const reviewDay = new Date(reviewDate.getFullYear(), reviewDate.getMonth(), reviewDate.getDate())
-      const key = reviewDay.toISOString().split('T')[0]
-      
-      if (reviewDay < today) {
-        overdueCards.push(card)
-      } else if (dayMap[key]) {
-        dayMap[key].cards.push(card)
-      }
-      // Cards beyond 14 days are not shown in calendar
-    }
-    
-    // Sort cards within each day by word
-    for (const key of Object.keys(dayMap)) {
-      dayMap[key].cards.sort((a, b) => a.word.localeCompare(b.word))
-    }
-    overdueCards.sort((a, b) => a.word.localeCompare(b.word))
-    
-    return {
-      days: Object.values(dayMap),
-      overdue: overdueCards,
-    }
-  }, [srsStore])
+  // Calendar and schedule actions are handled by ReviewCalendar via VocabularyStore
 
   // Start SRS session - CHỈ ôn các từ đã học qua Custom Study
   async function startSRSSession() {
-    // Get due cards from SRS store (chỉ những từ đã học trước đó)
-    const dueCards = getDueCards(srsStore)
+    const dueCards = VocabularyStore.getDueCards()
     
     if (dueCards.length === 0) {
-      if (Object.keys(srsStore).length === 0) {
+      if (VocabularyStore.getAll().filter(r => r.state !== 'new').length === 0) {
         setUiError('Chưa có từ nào trong hệ thống ôn tập. Hãy học từ mới qua Custom Study trước!')
       } else {
         setUiError('Tuyệt vời! Bạn đã ôn tập hết tất cả từ hôm nay. Quay lại sau nhé!')
@@ -965,27 +984,15 @@ export default function Study(){
     setSrsQueue(shuffle([...dueCards]))
     setSrsIndex(0)
     setSrsStats({ reviewed: 0, correct: 0, incorrect: 0 })
+    setSrsReviewedWords([])
+    srsReviewedWordsRef.current = []
     setInput('')
     setRevealLevel(0)
     setLastAnswerCorrect(null)
     setPhase('srs-studying')
   }
 
-  // Thêm từ vào SRS store khi học xong ở Custom Study
-  function addCardToSRS(card: Card) {
-    const key = makeSRSKey(card.source, card.word, card.meaning)
-    if (srsStore[key]) return // Đã có rồi
-    
-    const srsCard = cardToSRSData(card)
-    // Đặt nextReview là ngày mai (đã học xong hôm nay, ôn lại ngày mai)
-    srsCard.nextReview = Date.now() + 24 * 60 * 60 * 1000
-    srsCard.interval = 1
-    srsCard.repetitions = 1 // Đã học 1 lần
-    
-    const newStore = { ...srsStore, [key]: srsCard }
-    setSrsStore(newStore)
-    saveSRSStore(newStore)
-  }
+  // Custom Study feeds Smart Review via DifficultySelector (VocabularyStore).
 
   // Handle SRS answer submission
   async function submitSRSAnswer() {
@@ -1002,39 +1009,54 @@ export default function Study(){
     // Lookup IPA if missing
     if (!ipaCore(card.pronunciation || '')) {
       const ipa = await lookupIPA(card.word)
-      if (ipa) card.pronunciation = ipaCore(ipa)
+      if (ipa) {
+        VocabularyStore.upsert({
+          word: card.word,
+          meaning: card.meaning,
+          pronunciation: ipaCore(ipa),
+          source: card.source,
+        })
+      }
     }
-    
-    if (isCorrect) {
-      setSrsStats(s => ({ ...s, correct: s.correct + 1 }))
-    } else {
-      setSrsStats(s => ({ ...s, incorrect: s.incorrect + 1 }))
-    }
-    
+
     setPhase('srs-review-result')
   }
 
-  // Handle SRS quality rating (1=Again, 2=Hard, 3=Good, 4=Easy)
-  function handleSRSQuality(quality: 1 | 2 | 3 | 4) {
+  // Smart Review: per-card only 2 choices: Làm lại / Cho qua.
+  // We record correct/incorrect on "Cho qua" and rate difficulty after the whole session.
+  function handleSRSRetry() {
+    setInput('')
+    setRevealLevel(0)
+    setLastAnswerCorrect(null)
+    setPhase('srs-studying')
+    setTimeout(() => inputRef.current?.focus(), 50)
+  }
+
+  function handleSRSPass() {
     const card = srsQueue[srsIndex]
     if (!card) return
-    
-    // Map user choice to SM-2 quality (0-5)
-    // 1 (Again) -> 1 (incorrect)
-    // 2 (Hard)  -> 3 (correct with difficulty)  
-    // 3 (Good)  -> 4 (correct with hesitation)
-    // 4 (Easy)  -> 5 (perfect)
-    const sm2Quality = quality === 1 ? 1 : quality === 2 ? 3 : quality === 3 ? 4 : 5
-    
-    // Update SRS data
-    const updatedCard = calculateSM2(card, sm2Quality)
-    const newStore = { ...srsStore, [updatedCard.key]: updatedCard }
-    setSrsStore(newStore)
-    saveSRSStore(newStore)
-    
-    setSrsStats(s => ({ ...s, reviewed: s.reviewed + 1 }))
-    
-    // Advance to next card
+
+    const wasCorrect = !!lastAnswerCorrect
+
+    // Update SRS stats for this reviewed card
+    setSrsStats(s => ({
+      reviewed: s.reviewed + 1,
+      correct: s.correct + (wasCorrect ? 1 : 0),
+      incorrect: s.incorrect + (wasCorrect ? 0 : 1),
+    }))
+
+    // Record review outcome (repetitions/easeFactor updates); scheduling is recomputed later
+    // once the user rates overall difficulty for this session.
+    // NOTE: Scheduling does NOT depend on correctness inside the session.
+
+    // Track reviewed words for end-of-session difficulty selection
+    const alreadyTracked = srsReviewedWordsRef.current.some(r => r.id === card.id)
+    if (!alreadyTracked) {
+      const next = [...srsReviewedWordsRef.current, card]
+      srsReviewedWordsRef.current = next
+      setSrsReviewedWords(next)
+    }
+
     advanceAfterSRSResult()
   }
 
@@ -1051,7 +1073,8 @@ export default function Study(){
     }
     
     // Session complete
-    setPhase('srs-summary')
+    setDifficultySelectMode('smart')
+    setPhase('difficulty-select')
   }
 
   // Format next review time
@@ -1078,7 +1101,7 @@ export default function Study(){
     if (phase !== 'review-result' && phase !== 'srs-review-result') return
     const onKey = (e: KeyboardEvent) => {
       const validKeys = phase === 'srs-review-result' 
-        ? ['1', '2', '3', '4'] 
+        ? ['1', '2'] 
         : ['1', '2', '3']
       if (!validKeys.includes(e.key)) return
 
@@ -1099,7 +1122,8 @@ export default function Study(){
       }
 
       if (phase === 'srs-review-result') {
-        handleSRSQuality(Number(e.key) as 1 | 2 | 3 | 4)
+        if (e.key === '1') handleSRSRetry()
+        if (e.key === '2') handleSRSPass()
       } else {
         handleChoice(Number(e.key) as 1 | 2 | 3)
       }
@@ -1133,9 +1157,9 @@ export default function Study(){
     return files
   }
 
-  // Get all PDF deck files
+  // Get all PDF deck files (exclude trashed)
   function getPdfDeckFiles(): any[] {
-    return (pdfList || []).map((pdf) => ({ 
+    return (pdfList || []).filter((pdf: any) => !pdf.trashed).map((pdf) => ({ 
       name: `${pdf.baseName} (PDF)`, 
       path: pdf.deckCsvPath 
     }))
@@ -1207,6 +1231,7 @@ export default function Study(){
           }}
         />
       )}
+      
       <div className="study-page min-h-screen bg-gradient-to-br from-violet-50 via-purple-50/30 to-pink-50/20 dark:from-slate-900 dark:via-slate-900 dark:to-slate-800 p-6">
 
       {needsQueueButEmpty && (
@@ -1312,14 +1337,17 @@ export default function Study(){
           {/* Custom Study Tab */}
           {studyTab === 'custom' && (
             <div className="card animate-scale-in">
-              <div className="card-header text-2xl">
-                <div className="w-10 h-10 bg-gradient-to-br from-violet-500 to-purple-600 rounded-xl flex items-center justify-center shadow-lg shadow-violet-500/30">
-                  <svg className="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                  </svg>
-                </div>
-                Select Files to Study
-              </div>
+              <div className="card-header text-2xl flex items-center gap-3">
+  <div className="w-10 h-10 bg-gradient-to-br from-violet-500 to-purple-600 rounded-xl flex items-center justify-center shadow-lg shadow-violet-500/30">
+    <svg className="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+    </svg>
+  </div>
+
+  <span className="text-slate-900 dark:text-white font-bold tracking-tight">
+    Select Files to Study
+  </span>
+</div>
             
               {allFiles.length === 0 && getPdfDeckFiles().length === 0 ? (
                 <div className="text-center py-16">
@@ -1649,158 +1677,37 @@ export default function Study(){
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
                       </svg>
                     </div>
-                    <h3 className="font-bold text-slate-800 dark:text-slate-200">📅 Lịch ôn tập (14 ngày tới)</h3>
-                  </div>
-                  
-                  {/* Overdue Warning */}
-                  {srsCalendarData.overdue.length > 0 && (
-                    <div 
-                      className="mb-4 p-3 bg-gradient-to-r from-red-100 to-orange-100 dark:from-red-900/40 dark:to-orange-900/40 rounded-xl border-2 border-red-300 dark:border-red-700 cursor-pointer hover:shadow-md transition-all"
-                      onClick={() => setCalendarExpandedDay(calendarExpandedDay === 'overdue' ? null : 'overdue')}
-                    >
-                      <div className="flex items-center justify-between">
-                        <div className="flex items-center gap-2">
-                          <span className="text-2xl">⚠️</span>
-                          <div>
-                            <div className="font-bold text-red-700 dark:text-red-300">Quá hạn!</div>
-                            <div className="text-sm text-red-600 dark:text-red-400">{srsCalendarData.overdue.length} từ cần ôn ngay</div>
-                          </div>
-                        </div>
-                        <svg className={`w-5 h-5 text-red-600 dark:text-red-400 transition-transform ${calendarExpandedDay === 'overdue' ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-                        </svg>
-                      </div>
-                      {calendarExpandedDay === 'overdue' && (
-                        <div className="mt-3 pt-3 border-t border-red-200 dark:border-red-700">
-                          <div className="flex flex-wrap gap-2 max-h-32 overflow-y-auto">
-                            {srsCalendarData.overdue.map((card, i) => (
-                              <span key={i} className="px-2 py-1 bg-white/80 dark:bg-slate-800/80 rounded-lg text-sm font-medium text-slate-700 dark:text-slate-300 border border-red-200 dark:border-red-700">
-                                {card.word}
-                              </span>
-                            ))}
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  )}
-                  
-                  {/* Calendar Grid */}
-                  <div className="grid grid-cols-7 gap-2">
-                    {srsCalendarData.days.map((day, idx) => {
-                      const hasCards = day.cards.length > 0
-                      const isExpanded = calendarExpandedDay === day.date.toISOString()
-                      const intensity = Math.min(day.cards.length, 10) // Cap at 10 for color intensity
-                      
-                      return (
-                        <div
-                          key={idx}
-                          className={`relative rounded-xl border-2 transition-all cursor-pointer hover:shadow-lg ${
-                            day.isToday
-                              ? 'border-emerald-400 dark:border-emerald-500 bg-gradient-to-br from-emerald-50 to-teal-50 dark:from-emerald-900/30 dark:to-teal-900/30 ring-2 ring-emerald-400/50'
-                              : hasCards
-                                ? 'border-blue-300 dark:border-blue-600 bg-gradient-to-br from-blue-50 to-indigo-50 dark:from-blue-900/20 dark:to-indigo-900/20'
-                                : 'border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/50'
-                          }`}
-                          onClick={() => hasCards && setCalendarExpandedDay(isExpanded ? null : day.date.toISOString())}
-                        >
-                          <div className="p-2 text-center">
-                            <div className={`text-xs font-bold mb-1 ${
-                              day.isToday ? 'text-emerald-600 dark:text-emerald-400' : 'text-slate-500 dark:text-slate-400'
-                            }`}>
-                              {day.dayName}
-                            </div>
-                            <div className={`text-lg font-bold ${
-                              day.isToday ? 'text-emerald-700 dark:text-emerald-300' : 'text-slate-700 dark:text-slate-300'
-                            }`}>
-                              {day.date.getDate()}
-                            </div>
-                            {hasCards ? (
-                              <div className={`mt-1 text-xs font-bold px-2 py-0.5 rounded-full ${
-                                day.isToday
-                                  ? 'bg-emerald-500 text-white'
-                                  : 'bg-blue-500 text-white'
-                              }`}>
-                                {day.cards.length} từ
-                              </div>
-                            ) : (
-                              <div className="mt-1 text-xs text-slate-400 dark:text-slate-500">—</div>
-                            )}
-                            {day.isToday && (
-                              <div className="absolute -top-1 -right-1 w-3 h-3 bg-emerald-500 rounded-full animate-pulse" />
-                            )}
-                          </div>
-                        </div>
-                      )
-                    })}
-                  </div>
-                  
-                  {/* Expanded Day Details */}
-                  {calendarExpandedDay && calendarExpandedDay !== 'overdue' && (() => {
-                    const expandedDayData = srsCalendarData.days.find(d => d.date.toISOString() === calendarExpandedDay)
-                    if (!expandedDayData || expandedDayData.cards.length === 0) return null
-                    
-                    return (
-                      <div className="mt-4 p-4 bg-gradient-to-br from-blue-50 to-indigo-50 dark:from-blue-900/20 dark:to-indigo-900/20 rounded-xl border border-blue-200 dark:border-blue-700 animate-scale-in">
-                        <div className="flex items-center justify-between mb-3">
-                          <div className="flex items-center gap-2">
-                            <span className="text-xl">📖</span>
-                            <span className="font-bold text-slate-800 dark:text-slate-200">
-                              {expandedDayData.isToday ? 'Hôm nay' : `${expandedDayData.dayName}, ${expandedDayData.dateStr}`}
-                            </span>
-                            <span className="px-2 py-0.5 bg-blue-500 text-white text-xs font-bold rounded-full">
-                              {expandedDayData.cards.length} từ
-                            </span>
-                          </div>
-                          <button
-                            onClick={(e) => { e.stopPropagation(); setCalendarExpandedDay(null) }}
-                            className="p-1 hover:bg-slate-200 dark:hover:bg-slate-700 rounded-lg transition-colors"
-                          >
-                            <svg className="w-5 h-5 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                            </svg>
-                          </button>
-                        </div>
-                        <div className="flex flex-wrap gap-2 max-h-40 overflow-y-auto">
-                          {expandedDayData.cards.map((card, i) => (
-                            <div
-                              key={i}
-                              className="group relative px-3 py-2 bg-white dark:bg-slate-800 rounded-xl border border-blue-200 dark:border-blue-700 hover:shadow-md transition-all"
-                            >
-                              <div className="font-semibold text-slate-800 dark:text-slate-200">{card.word}</div>
-                              <div className="text-xs text-slate-500 dark:text-slate-400 truncate max-w-[150px]">{card.meaning}</div>
-                              {/* Tooltip with more info */}
-                              <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 px-3 py-2 bg-slate-900 dark:bg-slate-700 text-white text-xs rounded-lg opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none whitespace-nowrap z-10 shadow-xl">
-                                <div className="font-bold">{card.word}</div>
-                                <div className="text-slate-300">{card.meaning}</div>
-                                <div className="mt-1 text-emerald-400">Đã ôn {card.repetitions} lần</div>
-                                <div className="absolute top-full left-1/2 -translate-x-1/2 border-4 border-transparent border-t-slate-900 dark:border-t-slate-700" />
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    )
-                  })()}
-                  
-                  {/* Legend */}
-                  <div className="mt-4 flex flex-wrap items-center gap-4 text-xs text-slate-500 dark:text-slate-400">
-                    <div className="flex items-center gap-1.5">
-                      <div className="w-3 h-3 rounded-full bg-emerald-500" />
-                      <span>Hôm nay</span>
-                    </div>
-                    <div className="flex items-center gap-1.5">
-                      <div className="w-3 h-3 rounded-full bg-blue-500" />
-                      <span>Có từ cần ôn</span>
-                    </div>
-                    <div className="flex items-center gap-1.5">
-                      <div className="w-3 h-3 rounded-full bg-slate-300 dark:bg-slate-600" />
-                      <span>Không có từ</span>
-                    </div>
-                    <div className="flex items-center gap-1.5">
-                      <div className="w-3 h-3 rounded-full bg-red-500" />
-                      <span>Quá hạn</span>
+                    <h3 className="font-bold text-slate-800 dark:text-slate-200">📅 Lịch ôn tập</h3>
+
+                    <div className="ml-auto inline-flex rounded-xl border border-slate-200 dark:border-slate-700 overflow-hidden shadow-sm">
+                      <button
+                        type="button"
+                        onClick={() => setSmartCalendarView('14days')}
+                        className={`px-3 py-1.5 text-sm font-semibold transition-colors ${
+                          smartCalendarView === '14days'
+                            ? 'bg-indigo-600 text-white'
+                            : 'bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700'
+                        }`}
+                      >
+                        14 ngày
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setSmartCalendarView('month')}
+                        className={`px-3 py-1.5 text-sm font-semibold transition-colors ${
+                          smartCalendarView === 'month'
+                            ? 'bg-indigo-600 text-white'
+                            : 'bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700'
+                        }`}
+                      >
+                        Tháng
+                      </button>
                     </div>
                   </div>
+
+                  <ReviewCalendar
+                    view={smartCalendarView}
+                  />
                 </div>
               )}
 
@@ -2089,44 +1996,41 @@ export default function Study(){
                   </div>
                 </div>
 
-                {/* Action Buttons - Enhanced */}
+                {/* Action Buttons - 2 choices: Làm lại / Cho qua */}
                 <div>
                   <div className="text-center mb-4">
-                    <p className="text-sm font-semibold text-slate-700 dark:text-slate-300">How difficult was this word?</p>
-                    <p className="text-xs text-slate-500 dark:text-slate-400">Use keyboard shortcuts 1, 2, or 3</p>
+                    {!lastAnswerCorrect && (
+                      <div className="inline-flex items-center gap-2 px-3 py-1.5 bg-amber-100 dark:bg-amber-900/40 text-amber-800 dark:text-amber-300 rounded-xl mb-3">
+                        <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
+                          <path fillRule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clipRule="evenodd" />
+                        </svg>
+                        <span className="text-sm font-semibold">Từ này sẽ được ôn lại lượt sau</span>
+                      </div>
+                    )}
+                    <p className="text-sm font-semibold text-slate-700 dark:text-slate-300">Bạn muốn làm gì?</p>
+                    <p className="text-xs text-slate-500 dark:text-slate-400">Nhấn phím 1 hoặc 2</p>
                   </div>
-                  <div className="grid grid-cols-3 gap-3">
+                  <div className="grid grid-cols-2 gap-4">
                     <button
-                      onClick={() => handleChoice(1)}
-                      className="group relative p-3 bg-gradient-to-br from-slate-100 to-slate-200 dark:from-slate-600 dark:to-slate-700 hover:from-slate-200 hover:to-slate-300 dark:hover:from-slate-500 dark:hover:to-slate-600 rounded-2xl border-2 border-slate-400 dark:border-slate-500 hover:border-slate-500 dark:hover:border-slate-400 transition-all active:scale-95 shadow-lg hover:shadow-xl"
+                      onClick={handleRetry}
+                      className="group relative p-4 bg-gradient-to-br from-amber-100 to-orange-200 dark:from-amber-900/50 dark:to-orange-900/50 hover:from-amber-200 hover:to-orange-300 dark:hover:from-amber-800/50 dark:hover:to-orange-800/50 rounded-2xl border-2 border-amber-400 dark:border-amber-600 hover:border-amber-500 dark:hover:border-amber-500 transition-all active:scale-95 shadow-lg hover:shadow-xl shadow-amber-500/20"
                     >
-                      <div className="text-2xl mb-1">🔄</div>
-                      <div className="font-bold text-sm text-slate-800 dark:text-slate-200">Again (next round)</div>
-                      <div className="text-xs text-slate-600 dark:text-slate-400 mt-1">Press 1</div>
-                      <div className="absolute top-2 right-2 w-6 h-6 bg-slate-700 dark:bg-slate-500 text-white rounded-lg flex items-center justify-center font-bold text-xs">
+                      <div className="text-3xl mb-2">🔄</div>
+                      <div className="font-bold text-base text-amber-800 dark:text-amber-300">Làm lại</div>
+                      <div className="text-xs text-slate-600 dark:text-slate-400 mt-1">Thử lại ngay</div>
+                      <div className="absolute top-2 right-2 w-7 h-7 bg-amber-600 text-white rounded-lg flex items-center justify-center font-bold text-sm shadow-md">
                         1
                       </div>
                     </button>
                     <button
-                      onClick={() => handleChoice(2)}
-                      className="group relative p-3 bg-gradient-to-br from-green-100 to-emerald-200 dark:from-green-900/50 dark:to-emerald-900/50 hover:from-green-200 hover:to-emerald-300 dark:hover:from-green-800/50 dark:hover:to-emerald-800/50 rounded-2xl border-2 border-green-400 dark:border-green-600 hover:border-green-500 dark:hover:border-green-500 transition-all active:scale-95 shadow-lg hover:shadow-xl shadow-green-500/20"
+                      onClick={handlePass}
+                      className="group relative p-4 bg-gradient-to-br from-emerald-100 to-teal-200 dark:from-emerald-900/50 dark:to-teal-900/50 hover:from-emerald-200 hover:to-teal-300 dark:hover:from-emerald-800/50 dark:hover:to-teal-800/50 rounded-2xl border-2 border-emerald-400 dark:border-emerald-600 hover:border-emerald-500 dark:hover:border-emerald-500 transition-all active:scale-95 shadow-lg hover:shadow-xl shadow-emerald-500/20"
                     >
-                      <div className="text-2xl mb-1">✅</div>
-                      <div className="font-bold text-sm text-green-800 dark:text-green-300">Easy</div>
-                      <div className="text-xs text-slate-600 dark:text-slate-400 mt-1">Press 2</div>
-                      <div className="absolute top-2 right-2 w-6 h-6 bg-green-700 text-white rounded-lg flex items-center justify-center font-bold text-xs">
+                      <div className="text-3xl mb-2">➡️</div>
+                      <div className="font-bold text-base text-emerald-800 dark:text-emerald-300">Cho qua</div>
+                      <div className="text-xs text-slate-600 dark:text-slate-400 mt-1">Tiếp tục từ mới</div>
+                      <div className="absolute top-2 right-2 w-7 h-7 bg-emerald-600 text-white rounded-lg flex items-center justify-center font-bold text-sm shadow-md">
                         2
-                      </div>
-                    </button>
-                    <button
-                      onClick={() => handleChoice(3)}
-                      className="group relative p-3 bg-gradient-to-br from-red-100 to-pink-200 dark:from-red-900/50 dark:to-pink-900/50 hover:from-red-200 hover:to-pink-300 dark:hover:from-red-800/50 dark:hover:to-pink-800/50 rounded-2xl border-2 border-red-400 dark:border-red-600 hover:border-red-500 dark:hover:border-red-500 transition-all active:scale-95 shadow-lg hover:shadow-xl shadow-red-500/20"
-                    >
-                      <div className="text-2xl mb-1">🔥</div>
-                      <div className="font-bold text-sm text-red-800 dark:text-red-300">Hard (next round)</div>
-                      <div className="text-xs text-slate-600 dark:text-slate-400 mt-1">Press 3</div>
-                      <div className="absolute top-2 right-2 w-6 h-6 bg-red-700 text-white rounded-lg flex items-center justify-center font-bold text-xs">
-                        3
                       </div>
                     </button>
                   </div>
@@ -2135,6 +2039,37 @@ export default function Study(){
             )}
 
           </div>
+        </div>
+      )}
+
+      {/* Difficulty Selection Phase - NEW */}
+      {phase === 'difficulty-select' && (
+        <div className="max-w-5xl mx-auto animate-fade-in">
+          <DifficultySelector
+            mode={difficultySelectMode}
+            words={(difficultySelectMode === 'custom' ? reviewedWords : srsReviewedWords).map((card: any) => ({
+              id: difficultySelectMode === 'custom' ? makeCardKey(card.source, card.word, card.meaning) : card.id,
+              word: card.word,
+              meaning: card.meaning,
+              pronunciation: card.pronunciation,
+              source: card.source,
+            }))}
+            onComplete={() => {
+              // DifficultySelector already saved to VocabularyStore
+              setPhase(difficultySelectMode === 'smart' ? 'srs-summary' : 'summary')
+            }}
+            onSkip={() => {
+              // For Smart mode: treat this session as non-existent (no scheduling saved).
+              // Restart Smart Review so the user can continue learning more.
+              if (difficultySelectMode === 'smart') {
+                void startSRSSession()
+                return
+              }
+
+              // Custom mode: just skip rating and show summary.
+              setPhase('summary')
+            }}
+          />
         </div>
       )}
 
@@ -2616,43 +2551,39 @@ export default function Study(){
                   </div>
                 </div>
 
-                {/* Quality Rating Buttons */}
+                {/* Action Buttons - 2 choices: Làm lại / Cho qua */}
                 <div className="pt-4">
+                  {!lastAnswerCorrect && (
+                    <div className="text-center mb-3">
+                      <div className="inline-flex items-center gap-2 px-3 py-1.5 bg-amber-100 dark:bg-amber-900/40 text-amber-800 dark:text-amber-300 rounded-xl">
+                        <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
+                          <path fillRule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clipRule="evenodd" />
+                        </svg>
+                        <span className="text-sm font-semibold">Bạn có thể làm lại ngay hoặc cho qua</span>
+                      </div>
+                    </div>
+                  )}
                   <div className="text-center text-sm font-semibold text-slate-600 dark:text-slate-400 mb-3">
-                    How well did you know this? (Press 1-4)
+                    Nhấn phím 1 hoặc 2
                   </div>
-                  <div className="grid grid-cols-4 gap-2">
+                  <div className="grid grid-cols-2 gap-4">
                     <button
-                      onClick={() => handleSRSQuality(1)}
-                      className="p-3 rounded-xl border-2 border-red-300 dark:border-red-700 bg-gradient-to-br from-red-50 to-orange-50 dark:from-red-900/30 dark:to-orange-900/30 hover:border-red-500 dark:hover:border-red-500 transition-all group"
+                      onClick={handleSRSRetry}
+                      className="group relative p-4 bg-gradient-to-br from-amber-100 to-orange-200 dark:from-amber-900/50 dark:to-orange-900/50 hover:from-amber-200 hover:to-orange-300 dark:hover:from-amber-800/50 dark:hover:to-orange-800/50 rounded-2xl border-2 border-amber-400 dark:border-amber-600 hover:border-amber-500 dark:hover:border-amber-500 transition-all active:scale-95 shadow-lg hover:shadow-xl shadow-amber-500/20"
                     >
-                      <div className="text-2xl mb-1">🔄</div>
-                      <div className="font-bold text-red-700 dark:text-red-300 group-hover:scale-105 transition-transform">Again</div>
-                      <div className="text-xs text-slate-500 dark:text-slate-400">1m</div>
+                      <div className="text-3xl mb-2">🔄</div>
+                      <div className="font-bold text-base text-amber-800 dark:text-amber-300">Làm lại</div>
+                      <div className="text-xs text-slate-600 dark:text-slate-400 mt-1">Thử lại ngay</div>
+                      <div className="absolute top-2 right-2 w-7 h-7 bg-amber-600 text-white rounded-lg flex items-center justify-center font-bold text-sm shadow-md">1</div>
                     </button>
                     <button
-                      onClick={() => handleSRSQuality(2)}
-                      className="p-3 rounded-xl border-2 border-orange-300 dark:border-orange-700 bg-gradient-to-br from-orange-50 to-amber-50 dark:from-orange-900/30 dark:to-amber-900/30 hover:border-orange-500 dark:hover:border-orange-500 transition-all group"
+                      onClick={handleSRSPass}
+                      className="group relative p-4 bg-gradient-to-br from-emerald-100 to-teal-200 dark:from-emerald-900/50 dark:to-teal-900/50 hover:from-emerald-200 hover:to-teal-300 dark:hover:from-emerald-800/50 dark:hover:to-teal-800/50 rounded-2xl border-2 border-emerald-400 dark:border-emerald-600 hover:border-emerald-500 dark:hover:border-emerald-500 transition-all active:scale-95 shadow-lg hover:shadow-xl shadow-emerald-500/20"
                     >
-                      <div className="text-2xl mb-1">😓</div>
-                      <div className="font-bold text-orange-700 dark:text-orange-300 group-hover:scale-105 transition-transform">Hard</div>
-                      <div className="text-xs text-slate-500 dark:text-slate-400">~1d</div>
-                    </button>
-                    <button
-                      onClick={() => handleSRSQuality(3)}
-                      className="p-3 rounded-xl border-2 border-green-300 dark:border-green-700 bg-gradient-to-br from-green-50 to-emerald-50 dark:from-green-900/30 dark:to-emerald-900/30 hover:border-green-500 dark:hover:border-green-500 transition-all group"
-                    >
-                      <div className="text-2xl mb-1">👍</div>
-                      <div className="font-bold text-green-700 dark:text-green-300 group-hover:scale-105 transition-transform">Good</div>
-                      <div className="text-xs text-slate-500 dark:text-slate-400">~3d</div>
-                    </button>
-                    <button
-                      onClick={() => handleSRSQuality(4)}
-                      className="p-3 rounded-xl border-2 border-blue-300 dark:border-blue-700 bg-gradient-to-br from-blue-50 to-cyan-50 dark:from-blue-900/30 dark:to-cyan-900/30 hover:border-blue-500 dark:hover:border-blue-500 transition-all group"
-                    >
-                      <div className="text-2xl mb-1">🚀</div>
-                      <div className="font-bold text-blue-700 dark:text-blue-300 group-hover:scale-105 transition-transform">Easy</div>
-                      <div className="text-xs text-slate-500 dark:text-slate-400">~7d</div>
+                      <div className="text-3xl mb-2">➡️</div>
+                      <div className="font-bold text-base text-emerald-800 dark:text-emerald-300">Cho qua</div>
+                      <div className="text-xs text-slate-600 dark:text-slate-400 mt-1">Tới từ tiếp theo</div>
+                      <div className="absolute top-2 right-2 w-7 h-7 bg-emerald-600 text-white rounded-lg flex items-center justify-center font-bold text-sm shadow-md">2</div>
                     </button>
                   </div>
                 </div>

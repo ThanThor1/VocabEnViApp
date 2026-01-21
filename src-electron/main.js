@@ -26,6 +26,15 @@ try {
 } catch (e) {
 }
 
+// Optional: disable hardware acceleration to reduce noisy GPU mailbox errors on some Windows GPUs.
+// Enable by setting ELECTRON_DISABLE_HARDWARE_ACCELERATION=1 in userData/.env
+try {
+  if (String(process.env.ELECTRON_DISABLE_HARDWARE_ACCELERATION || '').trim() === '1') {
+    app.disableHardwareAcceleration()
+  }
+} catch (e) {
+}
+
 try {
   const dotenv = require('dotenv')
   const candidates = []
@@ -226,11 +235,62 @@ const AZURE_TRANSLATOR_ENDPOINT = 'https://api.cognitive.microsofttranslator.com
 const pendingAutoMeaning = new Map()
 
 // --- Google AI Studio concurrency + caching ---
-const GOOGLE_AI_MAX_CONCURRENCY = Math.max(1, Math.min(16, Number(process.env.GOOGLE_AI_STUDIO_CONCURRENCY || 4) || 4))
+let googleAiMaxConcurrency = Math.max(1, Math.min(16, Number(process.env.GOOGLE_AI_STUDIO_CONCURRENCY || 4) || 4))
 const GOOGLE_AI_CACHE_TTL_MS = Math.max(0, Number(process.env.GOOGLE_AI_STUDIO_CACHE_TTL_MS || 5 * 60 * 1000) || 0)
 let googleAiActive = 0
 const googleAiQueue = []
 const googleAiCache = new Map() // key -> { t: number, v: string }
+
+// --- Google AI Studio multi-key rotation ---
+let googleAiKeyCursor = 0
+let googleAiKeysCache = { t: 0, store: null }
+
+async function getGoogleAiStudioKeysStoreCached() {
+  const now = Date.now()
+  if (googleAiKeysCache.store && now - googleAiKeysCache.t < 1500) return googleAiKeysCache.store
+  const store = await ensureGoogleAiStudioKeysStore()
+  googleAiKeysCache = { t: now, store }
+  return store
+}
+
+async function selectGoogleAiStudioKey(payload) {
+  const req = payload || {}
+  const explicitKey = String(req.apiKey || req.key || '').trim()
+  if (explicitKey) return { key: explicitKey, keyId: req.keyId ? String(req.keyId) : null }
+
+  const store = await getGoogleAiStudioKeysStoreCached()
+  const items = Array.isArray(store.items) ? store.items : []
+  const envKey = process.env.GOOGLE_AI_STUDIO_API_KEY || process.env.GOOGLE_API_KEY
+
+  // If the user has disabled auto-translation (activeId=null), do not use saved keys.
+  // (But still allow legacy env var if present.)
+  if (!store.activeId) {
+    const k = String(envKey || '').trim()
+    if (!k) throw new Error('Missing GOOGLE_AI_STUDIO_API_KEY')
+    return { key: k, keyId: null }
+  }
+
+  if (items.length === 0) {
+    const envKey = process.env.GOOGLE_AI_STUDIO_API_KEY || process.env.GOOGLE_API_KEY
+    const k = String(envKey || '').trim()
+    if (!k) throw new Error('Missing GOOGLE_AI_STUDIO_API_KEY')
+    return { key: k, keyId: null }
+  }
+
+  // If the renderer asked for a specific saved keyId, honor it.
+  const requestedId = String(req.keyId || '').trim()
+  if (requestedId) {
+    const found = items.find((x) => x && x.id === requestedId)
+    if (found && found.key) return { key: found.key, keyId: found.id }
+  }
+
+  // Round-robin across all saved keys (not only the active one) to increase parallelism.
+  const activeIndex = store.activeId ? items.findIndex((x) => x && x.id === store.activeId) : 0
+  const start = activeIndex >= 0 ? activeIndex : 0
+  const idx = (start + (googleAiKeyCursor++ % items.length)) % items.length
+  const chosen = items[idx]
+  return { key: chosen.key, keyId: chosen.id }
+}
 
 function googleAiCacheGet(key) {
   if (!GOOGLE_AI_CACHE_TTL_MS) return null
@@ -262,7 +322,7 @@ function runGoogleAiTask(taskFn) {
 }
 
 function pumpGoogleAiQueue() {
-  while (googleAiActive < GOOGLE_AI_MAX_CONCURRENCY && googleAiQueue.length > 0) {
+  while (googleAiActive < googleAiMaxConcurrency && googleAiQueue.length > 0) {
     const job = googleAiQueue.shift()
     if (!job) return
     googleAiActive++
@@ -292,11 +352,9 @@ function sleepMs(ms, signal) {
 }
 
 function getGoogleAiStudioConfig(payload) {
-  const key = process.env.GOOGLE_AI_STUDIO_API_KEY || process.env.GOOGLE_API_KEY
   const model = process.env.GOOGLE_AI_STUDIO_MODEL || 'gemma-3-27b-it'
   const endpoint = process.env.GOOGLE_AI_STUDIO_ENDPOINT || 'https://generativelanguage.googleapis.com/v1beta'
-  if (!key) throw new Error('Missing GOOGLE_AI_STUDIO_API_KEY')
-  return { key, model, endpoint }
+  return { model, endpoint }
 }
 
 async function googleAiStudioGenerateContent({ key, endpoint, model, prompt, signal }) {
@@ -704,16 +762,19 @@ async function autoMeaningCore(payload) {
     // 1) Primary: Gemma suggests meanings + POS using context (LLM sense disambiguation).
     // If Google AI Studio key is missing, skip Gemma and rely on Azure dictionary fallback (or return empty).
     let g = null
+    let sel = null
     try {
       g = getGoogleAiStudioConfig(req)
+      sel = await selectGoogleAiStudioKey(req)
     } catch (e) {
       g = null
+      sel = null
     }
 
-    if (g) {
+    if (g && sel) {
       try {
         const gemma = await gemmaSuggestMeaningCandidates({
-          key: g.key,
+          key: sel.key,
           endpoint: g.endpoint,
           model: g.model,
           word,
@@ -732,7 +793,7 @@ async function autoMeaningCore(payload) {
       if (contextSentenceEn) {
         try {
           contextSentenceVi = await googleTranslatePlain({
-            key: g.key,
+            key: sel.key,
             endpoint: g.endpoint,
             model: g.model,
             from,
@@ -1189,9 +1250,10 @@ ipcMain.handle('enhanceWordInBackground', async (ev, fileRelOrAbsPath, word, mea
     if (!pronunciation || !pronunciation.trim() || pronunciation === '//') {
       try {
         const g = getGoogleAiStudioConfig();
-        if (g) {
+        const sel = await selectGoogleAiStudioKey();
+        if (g && sel) {
           const ipa = await gemmaSuggestIpa({
-            key: g.key,
+            key: sel.key,
             endpoint: g.endpoint,
             model: g.model,
             word: word.trim(),
@@ -1229,9 +1291,10 @@ ipcMain.handle('enhanceWordInBackground', async (ev, fileRelOrAbsPath, word, mea
     if (!example || !example.trim()) {
       try {
         const g = getGoogleAiStudioConfig();
-        if (g) {
+        const sel = await selectGoogleAiStudioKey();
+        if (g && sel) {
           const exampleSentence = await gemmaSuggestExampleSentence({
-            key: g.key,
+            key: sel.key,
             endpoint: g.endpoint,
             model: g.model,
             word: word.trim(),
@@ -1353,12 +1416,13 @@ ipcMain.handle('copyWords', async (ev, srcRel, dstRel, indices) => {
 ipcMain.handle('translator:suggestExampleSentence', async (ev, payload) => {
   const ctrl = new AbortController()
   try {
-    const { key, model, endpoint } = getGoogleAiStudioConfig(payload)
+    const { model, endpoint } = getGoogleAiStudioConfig(payload)
+    const sel = await selectGoogleAiStudioKey(payload)
     const word = payload && payload.word ? payload.word : ''
     const meaningVi = payload && payload.meaningVi ? payload.meaningVi : ''
     const pos = payload && payload.pos ? payload.pos : ''
     const contextSentenceEn = payload && payload.contextSentenceEn ? payload.contextSentenceEn : ''
-    return await gemmaSuggestExampleSentence({ key, endpoint, model, word, meaningVi, pos, contextSentenceEn, signal: ctrl.signal })
+    return await gemmaSuggestExampleSentence({ key: sel.key, endpoint, model, word, meaningVi, pos, contextSentenceEn, signal: ctrl.signal })
   } finally {
     try { ctrl.abort() } catch {}
   }
@@ -1367,10 +1431,11 @@ ipcMain.handle('translator:suggestExampleSentence', async (ev, payload) => {
 ipcMain.handle('translator:suggestIpa', async (ev, payload) => {
   const ctrl = new AbortController()
   try {
-    const { key, model, endpoint } = getGoogleAiStudioConfig(payload)
+    const { model, endpoint } = getGoogleAiStudioConfig(payload)
+    const sel = await selectGoogleAiStudioKey(payload)
     const word = payload && payload.word ? payload.word : ''
     const dialect = payload && payload.dialect ? payload.dialect : 'US'
-    return await gemmaSuggestIpa({ key, endpoint, model, word, dialect, signal: ctrl.signal })
+    return await gemmaSuggestIpa({ key: sel.key, endpoint, model, word, dialect, signal: ctrl.signal })
   } finally {
     try { ctrl.abort() } catch {}
   }
@@ -1640,12 +1705,29 @@ ipcMain.handle('translator:translatePlain', async (ev, payload) => {
   if (!text) return ''
 
   const g = getGoogleAiStudioConfig(req)
-  return await googleTranslatePlain({ key: g.key, endpoint: g.endpoint, model: g.model, from, to, text })
+  const sel = await selectGoogleAiStudioKey(req)
+  return await googleTranslatePlain({ key: sel.key, endpoint: g.endpoint, model: g.model, from, to, text })
+})
+
+ipcMain.handle('settings:getGoogleAiStudioConcurrency', async () => {
+  return { concurrency: googleAiMaxConcurrency }
+})
+
+ipcMain.handle('settings:setGoogleAiStudioConcurrency', async (ev, nextValue) => {
+  const raw = Number(nextValue)
+  const v = Math.max(1, Math.min(16, Number.isFinite(raw) ? Math.floor(raw) : 4))
+  googleAiMaxConcurrency = v
+  await setUserEnvVar('GOOGLE_AI_STUDIO_CONCURRENCY', String(v))
+  // In case the queue is waiting, kick it.
+  try { pumpGoogleAiQueue() } catch {}
+  return { concurrency: googleAiMaxConcurrency }
 })
 
 ipcMain.handle('settings:getGoogleAiStudioStatus', async () => {
-  const hasKey = !!(process.env.GOOGLE_AI_STUDIO_API_KEY || process.env.GOOGLE_API_KEY)
-  return { hasKey }
+  const envHasKey = !!String(process.env.GOOGLE_AI_STUDIO_API_KEY || process.env.GOOGLE_API_KEY || '').trim()
+  const store = await ensureGoogleAiStudioKeysStore()
+  const enabledByStore = !!store.activeId
+  return { hasKey: envHasKey || enabledByStore }
 })
 
 ipcMain.handle('settings:setGoogleAiStudioApiKey', async (ev, apiKey) => {

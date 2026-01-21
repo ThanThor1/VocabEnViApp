@@ -3,7 +3,7 @@ import './PdfReaderView.css'
 import ErrorBoundary from '../ErrorBoundary/ErrorBoundary'
 import PdfLibrary from '../PdfLibrary/PdfLibrary'
 import PdfViewer from '../PdfViewer/PdfViewer'
-import PdfVocabPanel from '../PdfVocabPanel/PdfVocabPanel'
+import { PassagesProvider } from '../../contexts/PassagesContext'
 import { usePersistedState } from '../../hooks/usePersistedState'
 
 type PdfItem = {
@@ -14,13 +14,13 @@ type PdfItem = {
   createdAt: string
 }
 
-export default function PdfReader() {
+function PdfReaderInner() {
   const [pdfs, setPdfs] = useState<PdfItem[]>([])
   const [selectedPdfId, setSelectedPdfId] = usePersistedState<string | null>('pdfReader_selectedPdfId', null)
   const [refreshKey, setRefreshKey] = useState(0)
   const [errorMessage, setErrorMessage] = useState<string>('')
   const [showLibrary, setShowLibrary] = usePersistedState('pdfReader_showLibrary', true)
-  const [showVocab, setShowVocab] = usePersistedState('pdfReader_showVocab', true)
+  
 
   useEffect(() => {
     loadPdfs()
@@ -129,43 +129,17 @@ export default function PdfReader() {
           </div>
         )}
       </div>
-
-      {/* Right: Vocab Panel (collapsible) */}
-      {selectedPdf && (
-        showVocab ? (
-          <div className="w-80 border-l border-slate-200/60 dark:border-slate-700/60 bg-white/95 dark:bg-slate-800/95 backdrop-blur-sm overflow-y-auto relative shadow-xl">
-            <div className="absolute top-4 left-4 z-10">
-              <button
-                title="Collapse vocab panel"
-                onClick={() => setShowVocab(false)}
-                className="btn-icon !w-9 !h-9"
-              >
-                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
-                </svg>
-              </button>
-            </div>
-            <PdfVocabPanel
-              pdfId={selectedPdf.pdfId}
-              baseName={selectedPdf.baseName}
-              deckCsvPath={selectedPdf.deckCsvPath}
-            />
-          </div>
-        ) : (
-          <div className="w-14 flex items-center justify-center border-l border-slate-200/60 dark:border-slate-700/60 bg-white/95 dark:bg-slate-800/95 backdrop-blur-sm">
-            <button
-              title="Expand vocab panel"
-              onClick={() => setShowVocab(true)}
-              className="btn-icon !w-10 !h-10"
-            >
-              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
-              </svg>
-            </button>
-          </div>
-        )
-      )}
       </div>
     </ErrorBoundary>
   )
 }
+
+// Main component wrapped with PassagesProvider
+export default function PdfReader() {
+  return (
+    <PassagesProvider>
+      <PdfReaderInner />
+    </PassagesProvider>
+  )
+}
+

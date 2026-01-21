@@ -20,3 +20,9 @@ export { default as ManagerPdfView } from './ManagerPdfView'
 export { default as StudyView } from './StudyView'
 export { default as PdfReaderView } from './PdfReaderView'
 export { default as ApiKeyView } from './ApiKeyView'
+
+// New components for enhanced study experience
+export { ReviewCalendar } from './ReviewCalendar'
+export { DifficultySelector } from './DifficultySelector'
+export { PendingPassagesSidebar, usePendingPassages } from './PendingPassagesSidebar'
+export type { PendingPassage } from './PendingPassagesSidebar'

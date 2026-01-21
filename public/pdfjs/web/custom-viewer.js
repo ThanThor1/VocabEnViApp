@@ -246,11 +246,33 @@ function initializeCustomFeatures(container) {
   console.log('Initializing custom PDF features');
   
   // ===== XỬ LÝ TEXT SELECTION =====
-  container.addEventListener('mouseup', function(e) {
-    // Đợi một chút để selection hoàn tất
+  // Use a pending timer so dblclick can cancel the mouseup handler
+  let selectionPendingTimer = null;
+
+  // Handle double-click explicitly (mouse double-click to select word)
+  container.addEventListener('dblclick', function(e) {
+    // Cancel any pending mouseup handler
+    if (selectionPendingTimer) {
+      clearTimeout(selectionPendingTimer);
+      selectionPendingTimer = null;
+    }
+    // Double-click: handle immediately (browser has already selected the word)
     setTimeout(function() {
       handleTextSelection();
-    }, 50);
+    }, 10);
+  });
+
+  container.addEventListener('mouseup', function(e) {
+    // Cancel any existing pending timer
+    if (selectionPendingTimer) {
+      clearTimeout(selectionPendingTimer);
+    }
+    // Delay mouseup handling to give dblclick a chance to fire and cancel this
+    // Browser dblclick detection is typically within 300-500ms
+    selectionPendingTimer = setTimeout(function() {
+      selectionPendingTimer = null;
+      handleTextSelection();
+    }, 250);
   });
   
   // Cũng xử lý khi dùng keyboard để select

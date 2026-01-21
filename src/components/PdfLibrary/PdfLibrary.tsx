@@ -1,4 +1,5 @@
 import React from 'react'
+import ReactDOM from 'react-dom'
 import ErrorBoundary from '../ErrorBoundary/ErrorBoundary'
 import ConfirmModal from '../ConfirmModal/ConfirmModal'
 
@@ -22,8 +23,53 @@ interface Props {
 export default function PdfLibrary({ pdfs, selectedPdfId, onSelectPdf, onImport, onChange }: Props) {
   const [mode, setMode] = React.useState<'library' | 'trash'>('library')
   const [contextMenu, setContextMenu] = React.useState<{ x: number; y: number; pdfId: string } | null>(null)
+  const contextMenuRef = React.useRef<HTMLDivElement | null>(null)
+  const [contextMenuPos, setContextMenuPos] = React.useState<{ left: number; top: number } | null>(null)
   const [errorMessage, setErrorMessage] = React.useState<string>('')
   const [confirmPermanentDeleteId, setConfirmPermanentDeleteId] = React.useState<string | null>(null)
+
+  React.useEffect(() => {
+    if (!contextMenu) return
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setContextMenu(null)
+    }
+    const onMouseDown = (e: MouseEvent) => {
+      if (e.button !== 0) return
+      const menuEl = contextMenuRef.current
+      if (menuEl && e.target instanceof Node && menuEl.contains(e.target)) return
+      setContextMenu(null)
+    }
+    window.addEventListener('keydown', onKeyDown)
+    window.addEventListener('mousedown', onMouseDown, true)
+    return () => {
+      window.removeEventListener('keydown', onKeyDown)
+      window.removeEventListener('mousedown', onMouseDown, true)
+    }
+  }, [contextMenu])
+
+  React.useLayoutEffect(() => {
+    if (!contextMenu) {
+      setContextMenuPos(null)
+      return
+    }
+
+    // Default position at cursor; then clamp once menu has a size.
+    const padding = 8
+    const menuEl = contextMenuRef.current
+    const menuWidth = menuEl?.offsetWidth ?? 240
+    const menuHeight = menuEl?.offsetHeight ?? 120
+    const maxLeft = Math.max(padding, window.innerWidth - menuWidth - padding)
+    const maxTop = Math.max(padding, window.innerHeight - menuHeight - padding)
+    const left = Math.min(Math.max(contextMenu.x, padding), maxLeft)
+    const top = Math.min(Math.max(contextMenu.y, padding), maxTop)
+    setContextMenuPos({ left, top })
+  }, [contextMenu])
+
+  const openContextMenu = (e: React.MouseEvent, pdfId: string) => {
+    e.preventDefault()
+    e.stopPropagation()
+    setContextMenu({ x: e.clientX, y: e.clientY, pdfId })
+  }
 
   const handleTrash = async (pdfId: string) => {
     try {
@@ -180,10 +226,8 @@ export default function PdfLibrary({ pdfs, selectedPdfId, onSelectPdf, onImport,
                   onClick={() => {
                     if (mode === 'library') onSelectPdf(pdf.pdfId)
                   }}
-                  onContextMenu={(e) => {
-                    e.preventDefault()
-                    setContextMenu({ x: e.clientX, y: e.clientY, pdfId: pdf.pdfId })
-                  }}
+                  // Use capture phase so parent handlers can't swallow it.
+                  onContextMenuCapture={(e) => openContextMenu(e, pdf.pdfId)}
                   className={`p-4 rounded-xl cursor-pointer transition-all ${
                     selectedPdfId === pdf.pdfId && mode === 'library'
                       ? 'bg-gradient-to-r from-violet-500 to-purple-600 text-white shadow-lg transform scale-[1.02]'
@@ -212,50 +256,54 @@ export default function PdfLibrary({ pdfs, selectedPdfId, onSelectPdf, onImport,
         )}
       </div>
 
-      {contextMenu && (
-        <>
-          <div className="fixed inset-0 z-40" onClick={() => setContextMenu(null)} />
-          <div
-            style={{ left: contextMenu.x, top: contextMenu.y }}
-            className="fixed z-50 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl shadow-2xl text-sm overflow-hidden"
-            onMouseLeave={() => setContextMenu(null)}
-          >
-            <div className="py-1">
-              {mode === 'library' ? (
+      {contextMenu && ReactDOM.createPortal(
+        <div
+          ref={contextMenuRef}
+          style={{ 
+            left: (contextMenuPos?.left ?? contextMenu.x), 
+            top: (contextMenuPos?.top ?? contextMenu.y),
+            position: 'fixed',
+            pointerEvents: 'auto'
+          }}
+          className="z-[9999] bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl shadow-2xl text-sm overflow-hidden min-w-[200px]"
+          onMouseDown={(e) => e.stopPropagation()}
+        >
+          <div className="py-1">
+            {mode === 'library' ? (
+              <button
+                className="w-full px-4 py-2.5 hover:bg-red-50 dark:hover:bg-red-900/30 text-left text-red-600 dark:text-red-400 font-semibold flex items-center gap-2"
+                onClick={() => handleTrash(contextMenu.pdfId)}
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                </svg>
+                Move to Trash
+              </button>
+            ) : (
+              <>
                 <button
-                  className="w-full px-4 py-2.5 hover:bg-red-50 dark:hover:bg-red-900/30 text-left text-red-600 dark:text-red-400 font-semibold flex items-center gap-2"
-                  onClick={() => handleTrash(contextMenu.pdfId)}
+                  className="w-full px-4 py-2.5 hover:bg-green-50 dark:hover:bg-green-900/30 text-left text-green-600 dark:text-green-400 font-semibold flex items-center gap-2"
+                  onClick={() => handleRestore(contextMenu.pdfId)}
                 >
                   <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6" />
                   </svg>
-                  Move to Trash
+                  Restore
                 </button>
-              ) : (
-                <>
-                  <button
-                    className="w-full px-4 py-2.5 hover:bg-green-50 dark:hover:bg-green-900/30 text-left text-green-600 dark:text-green-400 font-semibold flex items-center gap-2"
-                    onClick={() => handleRestore(contextMenu.pdfId)}
-                  >
-                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6" />
-                    </svg>
-                    Restore
-                  </button>
-                  <button
-                    className="w-full px-4 py-2.5 hover:bg-red-50 dark:hover:bg-red-900/30 text-left text-red-600 dark:text-red-400 font-semibold flex items-center gap-2 border-t border-slate-200 dark:border-slate-700"
-                    onClick={() => handleDeletePermanent(contextMenu.pdfId)}
-                  >
-                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                    </svg>
-                    Delete Permanently
-                  </button>
-                </>
-              )}
-            </div>
+                <button
+                  className="w-full px-4 py-2.5 hover:bg-red-50 dark:hover:bg-red-900/30 text-left text-red-600 dark:text-red-400 font-semibold flex items-center gap-2 border-t border-slate-200 dark:border-slate-700"
+                  onClick={() => handleDeletePermanent(contextMenu.pdfId)}
+                >
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                  Delete Permanently
+                </button>
+              </>
+            )}
           </div>
-        </>
+        </div>,
+        document.body
       )}
     </div>
     </ErrorBoundary>

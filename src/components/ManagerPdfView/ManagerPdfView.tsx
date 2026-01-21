@@ -123,7 +123,7 @@ export default function ManagerPdf() {
         </div>
 
         <div className="p-4 space-y-2">
-          {pdfs.length === 0 ? (
+          {pdfs.filter((p: any) => !p.trashed).length === 0 ? (
             <div className="text-center py-12 text-slate-500 dark:text-slate-400">
               <svg className="w-16 h-16 mx-auto mb-4 text-slate-300 dark:text-slate-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
@@ -131,7 +131,7 @@ export default function ManagerPdf() {
               <p className="text-sm">No PDFs available</p>
             </div>
           ) : (
-            pdfs.map((p: any) => (
+            pdfs.filter((p: any) => !p.trashed).map((p: any) => (
               <div
                 key={p.pdfId}
                 className={`p-4 rounded-xl cursor-pointer transition-all ${

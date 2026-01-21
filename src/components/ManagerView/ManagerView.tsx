@@ -1194,8 +1194,8 @@ export default function Manager() {
               <button className="text-sm text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-300" onClick={() => setShowPdfChooser(false)}>Close</button>
             </div>
             <div className="max-h-64 overflow-y-auto">
-              {pdfList.length === 0 && <div className="text-sm text-slate-500 dark:text-slate-400">No PDFs found</div>}
-              {pdfList.map((p:any) => (
+              {pdfList.filter((p:any) => !p.trashed).length === 0 && <div className="text-sm text-slate-500 dark:text-slate-400">No PDFs found</div>}
+              {pdfList.filter((p:any) => !p.trashed).map((p:any) => (
                 <div key={p.pdfId} className="flex items-center justify-between p-2 border-b border-slate-200 dark:border-slate-700">
                   <div className="truncate mr-2">
                     <div className="text-sm font-medium dark:text-slate-200">{p.baseName}</div>

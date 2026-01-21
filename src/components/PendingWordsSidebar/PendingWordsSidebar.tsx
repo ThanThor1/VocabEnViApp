@@ -50,13 +50,14 @@ function PendingWordItem({
   isSelected: boolean
   onClick: () => void
 }) {
+  const displayText = String(item.word || item.text || '').trim() || String(item.text || '')
   return (
     <div
       className={`pending-word-item ${isSelected ? 'selected' : ''} ${item.isApiComplete ? 'api-complete' : ''}`}
       onClick={onClick}
     >
       <div className="pending-word-content">
-        <div className="pending-word-text">{item.text}</div>
+        <div className="pending-word-text">{displayText}</div>
         {item.meaning && (
           <div className="pending-word-meaning">{item.meaning}</div>
         )}
@@ -127,9 +128,13 @@ function WordEditForm({
 
   const handleSelectCandidate = (candidate: AutoMeaningCandidate) => {
     setMeaning(candidate.vi)
+    onUpdateWord({ meaning: candidate.vi })
     if (candidate.pos) {
       const normalized = normalizePos(candidate.pos)
-      if (normalized) setPos(normalized)
+      if (normalized) {
+        setPos(normalized)
+        onUpdateWord({ pos: normalized })
+      }
     }
   }
 
@@ -165,7 +170,11 @@ function WordEditForm({
         <input
           type="text"
           value={word}
-          onChange={(e) => setWord(e.target.value)}
+          onChange={(e) => {
+            const v = e.target.value
+            setWord(v)
+            onUpdateWord({ word: v })
+          }}
           placeholder="Nhập từ..."
         />
       </div>
@@ -179,7 +188,11 @@ function WordEditForm({
         <input
           type="text"
           value={meaning}
-          onChange={(e) => setMeaning(e.target.value)}
+          onChange={(e) => {
+            const v = e.target.value
+            setMeaning(v)
+            onUpdateWord({ meaning: v })
+          }}
           placeholder="Nhập nghĩa..."
         />
       </div>
@@ -206,7 +219,14 @@ function WordEditForm({
       {/* POS select */}
       <div className="form-group">
         <label>Loại từ</label>
-        <select value={pos} onChange={(e) => setPos(e.target.value)}>
+        <select
+          value={pos}
+          onChange={(e) => {
+            const v = e.target.value
+            setPos(v)
+            onUpdateWord({ pos: v })
+          }}
+        >
           <option value="">-- Chọn --</option>
           {POS_OPTIONS.map((opt) => (
             <option key={opt.value} value={opt.value}>
@@ -222,7 +242,11 @@ function WordEditForm({
         <input
           type="text"
           value={pronunciation}
-          onChange={(e) => setPronunciation(e.target.value)}
+          onChange={(e) => {
+            const v = e.target.value
+            setPronunciation(v)
+            onUpdateWord({ pronunciation: v })
+          }}
           placeholder="/ˈeksəmpəl/"
         />
       </div>
@@ -232,7 +256,11 @@ function WordEditForm({
         <label>Ví dụ</label>
         <textarea
           value={example}
-          onChange={(e) => setExample(e.target.value)}
+          onChange={(e) => {
+            const v = e.target.value
+            setExample(v)
+            onUpdateWord({ example: v })
+          }}
           placeholder="Nhập câu ví dụ..."
           rows={2}
         />
