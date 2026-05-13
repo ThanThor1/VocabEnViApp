@@ -2,14 +2,13 @@
   "compilerOptions": {
     "target": "ES2020",
     "module": "ESNext",
+    "moduleResolution": "Bundler",
     "jsx": "react-jsx",
-    "moduleResolution": "Node",
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
     "strict": true,
     "skipLibCheck": true,
-    "resolveJsonModule": true,
-    "baseUrl": "./"
+    "resolveJsonModule": true
   },
   "include": ["src", "electron", "electron.d.ts"],
   "exclude": ["src/renderer/**", "dist/**", "dist-electron/**", "release/**"]
