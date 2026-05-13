@@ -13,6 +13,7 @@ export interface PendingPassage {
   // Translation result - support both naming conventions
   translatedText?: string
   translation?: string
+  explanation?: string
   
   // Status
   isLoading: boolean
@@ -118,13 +119,14 @@ export default function PendingPassagesSidebar({
           passages.map(passage => {
             const isExpanded = expandedId === passage.id
             const isCopied = copiedId === passage.id
+            const passageComplete = isComplete(passage)
             
             return (
               <div
                 key={passage.id}
                 className={`
                   rounded-xl border-2 transition-all overflow-hidden
-                  ${passage.isComplete 
+                  ${passageComplete 
                     ? 'border-green-200 dark:border-green-800 bg-green-50 dark:bg-green-900/20'
                     : passage.error
                       ? 'border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-900/20'
@@ -144,7 +146,7 @@ export default function PendingPassagesSidebar({
                     <div className="flex-shrink-0 mt-0.5">
                       {passage.isLoading ? (
                         <div className="w-5 h-5 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
-                      ) : passage.isComplete ? (
+                      ) : isComplete(passage) ? (
                         <div className="w-5 h-5 bg-green-500 rounded-full flex items-center justify-center">
                           <svg className="w-3 h-3 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" />
@@ -171,9 +173,43 @@ export default function PendingPassagesSidebar({
                       </div>
                     </div>
 
+                    {/* Quick Actions - Always visible */}
+                    <div className="flex items-center gap-1 flex-shrink-0">
+                      {isComplete(passage) && getTranslation(passage) && (
+                        <button
+                          onClick={(e) => { e.stopPropagation(); handleCopy(passage); }}
+                          className={`p-1.5 rounded-lg transition-all ${
+                            isCopied 
+                              ? 'bg-green-500 text-white'
+                              : 'bg-blue-100 dark:bg-blue-900/50 text-blue-600 dark:text-blue-400 hover:bg-blue-200 dark:hover:bg-blue-800'
+                          }`}
+                          title={isCopied ? 'Đã copy' : 'Copy'}
+                        >
+                          {isCopied ? (
+                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                            </svg>
+                          ) : (
+                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                            </svg>
+                          )}
+                        </button>
+                      )}
+                      <button
+                        onClick={(e) => { e.stopPropagation(); onRemove(passage.id); }}
+                        className="p-1.5 rounded-lg bg-slate-100 dark:bg-slate-700 text-slate-500 dark:text-slate-400 hover:bg-red-100 dark:hover:bg-red-900/50 hover:text-red-600 dark:hover:text-red-400 transition-colors"
+                        title="Xóa"
+                      >
+                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                        </svg>
+                      </button>
+                    </div>
+
                     {/* Expand Icon */}
                     <svg 
-                      className={`w-5 h-5 text-slate-400 transition-transform ${isExpanded ? 'rotate-180' : ''}`} 
+                      className={`w-5 h-5 text-slate-400 transition-transform flex-shrink-0 ${isExpanded ? 'rotate-180' : ''}`} 
                       fill="none" 
                       stroke="currentColor" 
                       viewBox="0 0 24 24"
@@ -208,6 +244,18 @@ export default function PendingPassagesSidebar({
                       </div>
                     )}
 
+                    {/* Explanation */}
+                    {passage.explanation && (
+                      <div className="mb-3">
+                        <div className="text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase mb-1">
+                          Giải thích
+                        </div>
+                        <div className="text-sm text-slate-700 dark:text-slate-300 bg-emerald-100 dark:bg-emerald-900/40 rounded-lg p-3 max-h-40 overflow-y-auto whitespace-pre-wrap">
+                          {passage.explanation}
+                        </div>
+                      </div>
+                    )}
+
                     {/* Error Message */}
                     {passage.error && (
                       <div className="mb-3 p-2 bg-red-100 dark:bg-red-900/40 text-red-700 dark:text-red-300 rounded-lg text-sm">
@@ -215,59 +263,18 @@ export default function PendingPassagesSidebar({
                       </div>
                     )}
 
-                    {/* Actions */}
-                    <div className="flex gap-2">
-                      {isComplete(passage) && getTranslation(passage) && (
-                        <button
-                          onClick={() => handleCopy(passage)}
-                          className={`
-                            flex-1 py-2 rounded-lg font-medium text-sm transition-all flex items-center justify-center gap-1
-                            ${isCopied 
-                              ? 'bg-green-500 text-white'
-                              : 'bg-blue-500 hover:bg-blue-600 text-white'
-                            }
-                          `}
-                        >
-                          {isCopied ? (
-                            <>
-                              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-                              </svg>
-                              Đã copy
-                            </>
-                          ) : (
-                            <>
-                              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
-                              </svg>
-                              Copy
-                            </>
-                          )}
-                        </button>
-                      )}
-                      
-                      {passage.error && (
-                        <button
-                          onClick={() => onRetry(passage.id)}
-                          className="flex-1 py-2 bg-amber-500 hover:bg-amber-600 text-white rounded-lg font-medium text-sm transition-colors flex items-center justify-center gap-1"
-                        >
-                          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                          </svg>
-                          Thử lại
-                        </button>
-                      )}
-                      
+                    {/* Retry button for errors */}
+                    {passage.error && (
                       <button
-                        onClick={() => onRemove(passage.id)}
-                        className="px-3 py-2 border-2 border-slate-300 dark:border-slate-600 text-slate-600 dark:text-slate-400 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors"
-                        title="Xóa"
+                        onClick={() => onRetry(passage.id)}
+                        className="w-full py-2 bg-amber-500 hover:bg-amber-600 text-white rounded-lg font-medium text-sm transition-colors flex items-center justify-center gap-1"
                       >
                         <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
                         </svg>
+                        Thử lại
                       </button>
-                    </div>
+                    )}
                   </div>
                 )}
               </div>

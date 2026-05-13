@@ -275,6 +275,187 @@
   border-radius: 50%;
 }
 
+/* Word Family section (PDF translate -> add) */
+.word-family-section {
+  margin-top: 0.75rem;
+  padding: 0.75rem;
+  border: 1px solid rgba(226, 232, 240, 0.9);
+  border-radius: 0.75rem;
+  background: linear-gradient(180deg, rgba(248, 250, 252, 0.9) 0%, rgba(255, 255, 255, 0.9) 100%);
+}
+
+:root.dark .word-family-section,
+.dark .word-family-section {
+  border-color: rgba(51, 65, 85, 0.9);
+  background: linear-gradient(180deg, rgba(15, 23, 42, 0.55) 0%, rgba(30, 41, 59, 0.55) 100%);
+}
+
+.word-family-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.word-family-title {
+  font-size: 0.75rem;
+  font-weight: 800;
+  color: #334155;
+}
+
+:root.dark .word-family-title,
+.dark .word-family-title {
+  color: #e2e8f0;
+}
+
+.word-family-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.7rem;
+  color: #64748b;
+  user-select: none;
+}
+
+.word-family-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.word-family-edit-btn {
+  appearance: none;
+  border: none;
+  background: transparent;
+  padding: 0;
+  font-size: 0.7rem;
+  font-weight: 700;
+  color: #64748b;
+  cursor: pointer;
+}
+
+.word-family-edit-btn:hover {
+  text-decoration: underline;
+}
+
+:root.dark .word-family-toggle,
+.dark .word-family-toggle {
+  color: #94a3b8;
+}
+
+:root.dark .word-family-edit-btn,
+.dark .word-family-edit-btn {
+  color: #94a3b8;
+}
+
+.word-family-meta {
+  margin-top: 0.35rem;
+  font-size: 0.7rem;
+  color: #64748b;
+}
+
+:root.dark .word-family-meta,
+.dark .word-family-meta {
+  color: #94a3b8;
+}
+
+.word-family-list {
+  margin-top: 0.5rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.word-family-editor {
+  margin-top: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.word-family-editor-row {
+  padding: 0.75rem;
+  border-radius: 0.75rem;
+  border: 1px dashed rgba(226, 232, 240, 0.9);
+  background: rgba(255, 255, 255, 0.6);
+}
+
+:root.dark .word-family-editor-row,
+.dark .word-family-editor-row {
+  border-color: rgba(51, 65, 85, 0.9);
+  background: rgba(30, 41, 59, 0.35);
+}
+
+.word-family-editor-title {
+  font-size: 0.72rem;
+  font-weight: 800;
+  color: #334155;
+  margin-bottom: 0.5rem;
+}
+
+:root.dark .word-family-editor-title,
+.dark .word-family-editor-title {
+  color: #e2e8f0;
+}
+
+.word-family-editor-relation {
+  font-weight: 700;
+  opacity: 0.7;
+}
+
+.word-family-editor-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0.65rem;
+}
+
+.word-family-chip {
+  border: 1px solid rgba(226, 232, 240, 0.9);
+  background: #ffffff;
+  color: #334155;
+  border-radius: 999px;
+  padding: 0.25rem 0.5rem;
+  font-size: 0.7rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.word-family-chip:hover {
+  transform: translateY(-1px);
+}
+
+.word-family-chip.selected {
+  border-color: rgba(139, 92, 246, 0.55);
+  background: rgba(139, 92, 246, 0.12);
+  color: #6d28d9;
+}
+
+:root.dark .word-family-chip,
+.dark .word-family-chip {
+  border-color: rgba(51, 65, 85, 0.9);
+  background: rgba(30, 41, 59, 0.9);
+  color: #e2e8f0;
+}
+
+:root.dark .word-family-chip.selected,
+.dark .word-family-chip.selected {
+  border-color: rgba(167, 139, 250, 0.6);
+  background: rgba(139, 92, 246, 0.18);
+  color: #c4b5fd;
+}
+
+.word-family-pos {
+  margin-left: 0.25rem;
+  font-weight: 700;
+  opacity: 0.75;
+}
+
+.word-family-pending {
+  margin-left: 0.25rem;
+  opacity: 0.65;
+}
+
 :root.dark .pending-word-status .pending-dot,
 .dark .pending-word-status .pending-dot {
   background: linear-gradient(135deg, #475569 0%, #64748b 100%);

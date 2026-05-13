@@ -1,6 +1,8 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react'
 import { POS_OPTIONS, normalizePos } from '../posOptions/posOptions'
 import './PendingWordsSidebar.css'
+import { enrichWordFamilyMembers, getWordFamily, type EnrichedWordFamilyMember } from '../../utils/wordFamily'
+import { enrichSynonyms, getSynonymFamilies, getSynonyms } from '../../utils/synonyms'
 
 interface Rect {
   xPct: number
@@ -9,15 +11,26 @@ interface Rect {
   hPct: number
 }
 
+// Rect with page information for multi-page selections
+export interface RectWithPage extends Rect {
+  pageNumber: number
+}
+
 export interface PendingWord {
   id: string
   text: string
   pageNumber: number
   rects: Rect[]
+  rectsWithPage?: RectWithPage[] // For multi-page selections
+  pageNumbers?: number[] // List of pages involved in selection
   contextSentenceEn: string
   // Auto-fetched data
   word: string
   meaning: string
+  meaningEn?: string
+  meaningVi?: string
+  meaningNoteVi: string
+  meaningNoteVie?: string
   pronunciation: string
   pos: string
   example: string
@@ -33,7 +46,16 @@ type AutoMeaningCandidate = { vi: string; pos?: string; back?: string[] }
 
 interface Props {
   pendingWords: PendingWord[]
-  onSave: (wordId: string, word: string, meaning: string, pronunciation: string, pos: string, example: string) => void
+  onSave: (
+    wordId: string,
+    word: string,
+    meaning: string,
+    meaningNoteVi: string,
+    pronunciation: string,
+    pos: string,
+    example: string,
+    extraWords?: Array<{ word: string; meaning: string; meaningNoteVi: string; pronunciation: string; pos: string; example: string }>
+  ) => void
   onRemove: (wordId: string) => void
   onUpdateWord: (wordId: string, updates: Partial<PendingWord>) => void
   onSaveAll?: () => void
@@ -90,7 +112,15 @@ function WordEditForm({
   onUpdateWord
 }: {
   item: PendingWord
-  onSave: (word: string, meaning: string, pronunciation: string, pos: string, example: string) => void
+  onSave: (
+    word: string,
+    meaning: string,
+    meaningNoteVi: string,
+    pronunciation: string,
+    pos: string,
+    example: string,
+    extraWords?: Array<{ word: string; meaning: string; meaningNoteVi: string; pronunciation: string; pos: string; example: string }>
+  ) => void
   onRemove: () => void
   onClose: () => void
   onUpdateWord: (updates: Partial<PendingWord>) => void
@@ -101,6 +131,36 @@ function WordEditForm({
   const [pos, setPos] = useState(item.pos || '')
   const [example, setExample] = useState(item.example || '')
   const [errorMessage, setErrorMessage] = useState('')
+
+  const WORD_FAMILY_FEATURE_ENABLED = false
+  const SYNONYM_FAMILIES_FEATURE_ENABLED = false
+
+  const [wordFamilyEnabled, setWordFamilyEnabled] = useState(false)
+  const [wordFamilyLoading, setWordFamilyLoading] = useState(false)
+  const [wordFamilyError, setWordFamilyError] = useState('')
+  const [wordFamilyMembers, setWordFamilyMembers] = useState<EnrichedWordFamilyMember[]>([])
+  const [wordFamilySelected, setWordFamilySelected] = useState<Set<string>>(new Set())
+  const wordFamilyReqRef = useRef<string>('')
+
+  const [synonymsEnabled, setSynonymsEnabled] = useState(true)
+  const [synonymsIncludeFamilies, setSynonymsIncludeFamilies] = useState(false)
+  const [synonymsLoading, setSynonymsLoading] = useState(false)
+  const [synonymsError, setSynonymsError] = useState('')
+  const [synonymsMembers, setSynonymsMembers] = useState<EnrichedWordFamilyMember[]>([])
+  const [synonymsSelected, setSynonymsSelected] = useState<Set<string>>(new Set())
+  const [synonymFamilyMembers, setSynonymFamilyMembers] = useState<EnrichedWordFamilyMember[]>([])
+  const [synonymFamilySelected, setSynonymFamilySelected] = useState<Set<string>>(new Set())
+  const synonymsReqRef = useRef<string>('')
+  const [exampleLoading, setExampleLoading] = useState(false)
+  const [exampleError, setExampleError] = useState('')
+  const lastExampleKeyRef = useRef<string>('')
+
+  const [relatedEditTarget, setRelatedEditTarget] = useState<
+    | { group: 'family'; word: string }
+    | { group: 'synonym'; word: string }
+    | { group: 'synonymFamily'; word: string }
+    | null
+  >(null)
 
   // Sync from item when API completes
   useEffect(() => {
@@ -117,13 +177,191 @@ function WordEditForm({
     return `/${core}/`
   }
 
+  // Word Family: fetch + enrich in background when editing a word (PDF translate flow)
+  const cleanWord = useMemo(() => String(word || '').trim(), [word])
+  useEffect(() => {
+    if (!WORD_FAMILY_FEATURE_ENABLED || !wordFamilyEnabled) {
+      setWordFamilyMembers([])
+      setWordFamilySelected(new Set())
+      setWordFamilyLoading(false)
+      setWordFamilyError('')
+      return
+    }
+    const w = cleanWord
+    const api = (window as any)?.api
+    if (!w || /\s/.test(w) || w.length > 40) {
+      setWordFamilyMembers([])
+      setWordFamilySelected(new Set())
+      setWordFamilyLoading(false)
+      setWordFamilyError('')
+      return
+    }
+    if (!api?.getWordFamily) {
+      setWordFamilyMembers([])
+      setWordFamilySelected(new Set())
+      setWordFamilyLoading(false)
+      setWordFamilyError('')
+      return
+    }
+
+    const rid = `${Date.now()}_${Math.random().toString(16).slice(2)}`
+    wordFamilyReqRef.current = rid
+    setWordFamilyLoading(true)
+    setWordFamilyError('')
+    setWordFamilyMembers([])
+    setWordFamilySelected(new Set())
+
+    ;(async () => {
+      try {
+        const resp = await getWordFamily(w)
+        if (wordFamilyReqRef.current !== rid) return
+        const members = Array.isArray(resp?.family) ? resp!.family : []
+        const enriched = await enrichWordFamilyMembers(members, { concurrency: 2, contextSentenceEn: item.contextSentenceEn || '' })
+        if (wordFamilyReqRef.current !== rid) return
+        setWordFamilyMembers(enriched)
+        setWordFamilySelected(new Set(enriched.map((m) => m.word)))
+      } catch {
+        if (wordFamilyReqRef.current !== rid) return
+        setWordFamilyError('Failed to fetch word family')
+        setWordFamilyMembers([])
+        setWordFamilySelected(new Set())
+      } finally {
+        if (wordFamilyReqRef.current === rid) setWordFamilyLoading(false)
+      }
+    })()
+
+    return () => {
+      if (wordFamilyReqRef.current === rid) wordFamilyReqRef.current = ''
+    }
+  }, [cleanWord, item.contextSentenceEn, wordFamilyEnabled])
+
+  // Synonyms: fetch + enrich in background when editing a word (PDF translate flow)
+  useEffect(() => {
+    const w = cleanWord
+    const api = (window as any)?.api
+    if (!synonymsEnabled) {
+      setSynonymsMembers([])
+      setSynonymsSelected(new Set())
+      setSynonymFamilyMembers([])
+      setSynonymFamilySelected(new Set())
+      setSynonymsLoading(false)
+      setSynonymsError('')
+      return
+    }
+    if (!w || /\s/.test(w) || w.length > 40) {
+      setSynonymsMembers([])
+      setSynonymsSelected(new Set())
+      setSynonymFamilyMembers([])
+      setSynonymFamilySelected(new Set())
+      setSynonymsLoading(false)
+      setSynonymsError('')
+      return
+    }
+    if (!api?.getSynonyms) {
+      setSynonymsMembers([])
+      setSynonymsSelected(new Set())
+      setSynonymFamilyMembers([])
+      setSynonymFamilySelected(new Set())
+      setSynonymsLoading(false)
+      setSynonymsError('')
+      return
+    }
+
+    const rid = `${Date.now()}_${Math.random().toString(16).slice(2)}`
+    synonymsReqRef.current = rid
+    setSynonymsLoading(true)
+    setSynonymsError('')
+    setSynonymsMembers([])
+    setSynonymsSelected(new Set())
+    setSynonymFamilyMembers([])
+    setSynonymFamilySelected(new Set())
+
+    ;(async () => {
+      try {
+        const resp = await getSynonyms(w)
+        if (synonymsReqRef.current !== rid) return
+        const members = Array.isArray(resp?.synonyms) ? resp!.synonyms : []
+        const enriched = await enrichSynonyms(members, { concurrency: 2, contextSentenceEn: item.contextSentenceEn || '' })
+        if (synonymsReqRef.current !== rid) return
+        setSynonymsMembers(enriched)
+        setSynonymsSelected(new Set(enriched.map((m) => m.word)))
+
+        if (SYNONYM_FAMILIES_FEATURE_ENABLED && synonymsIncludeFamilies && api?.getWordFamily) {
+          const fam = await getSynonymFamilies(enriched, { maxSynonyms: 3, contextSentenceEn: item.contextSentenceEn || '' })
+          if (synonymsReqRef.current !== rid) return
+          const famEnriched = await enrichSynonyms(fam, { concurrency: 2, contextSentenceEn: item.contextSentenceEn || '' })
+          if (synonymsReqRef.current !== rid) return
+          setSynonymFamilyMembers(famEnriched)
+          setSynonymFamilySelected(new Set(famEnriched.map((m) => m.word)))
+        }
+      } catch {
+        if (synonymsReqRef.current !== rid) return
+        setSynonymsError('Failed to fetch synonyms')
+        setSynonymsMembers([])
+        setSynonymsSelected(new Set())
+        setSynonymFamilyMembers([])
+        setSynonymFamilySelected(new Set())
+      } finally {
+        if (synonymsReqRef.current === rid) setSynonymsLoading(false)
+      }
+    })()
+
+    return () => {
+      if (synonymsReqRef.current === rid) synonymsReqRef.current = ''
+    }
+  }, [cleanWord, item.contextSentenceEn, synonymsEnabled, synonymsIncludeFamilies])
+
   const handleSave = () => {
     if (!word.trim() || !meaning.trim() || !pos.trim()) {
       setErrorMessage('Cần điền: từ, nghĩa, và loại từ')
       setTimeout(() => setErrorMessage(''), 3000)
       return
     }
-    onSave(word.trim(), meaning.trim(), ensureIpaSlashes(pronunciation), pos.trim(), example.trim())
+    const baseWord = word.trim()
+    const baseMeaning = meaning.trim()
+    const basePos = pos.trim()
+    const basePron = ensureIpaSlashes(pronunciation)
+    const baseExample = example.trim()
+
+    const toExtraRows = (list: EnrichedWordFamilyMember[], selected: Set<string>) =>
+      (Array.isArray(list) ? list : [])
+        .filter((m) => {
+          const mw = String(m?.word || '').trim()
+          if (!mw) return false
+          if (!selected.has(mw)) return false
+          const mm = String(m?.meaning || '').trim()
+          const mp = String(m?.pos || '').trim()
+          return !!mm && !!mp
+        })
+        .map((m) => ({
+          word: String(m.word || '').trim(),
+          meaning: String(m.meaning || '').trim(),
+          meaningNoteVi: '',
+          pronunciation: ensureIpaSlashes(String(m.pronunciation || '')),
+          pos: String(m.pos || '').trim(),
+          example: String(m.example || '').trim()
+        }))
+
+    const extraWordsRaw = [
+      ...(WORD_FAMILY_FEATURE_ENABLED && wordFamilyEnabled ? toExtraRows(wordFamilyMembers, wordFamilySelected) : []),
+      ...(synonymsEnabled ? toExtraRows(synonymsMembers, synonymsSelected) : []),
+      ...(synonymsEnabled && SYNONYM_FAMILIES_FEATURE_ENABLED && synonymsIncludeFamilies
+        ? toExtraRows(synonymFamilyMembers, synonymFamilySelected)
+        : [])
+    ]
+
+    const seen = new Set<string>()
+    const extraWords = extraWordsRaw.filter((r) => {
+      const w = String(r.word || '').trim()
+      if (!w) return false
+      const key = w.toLowerCase()
+      if (key === baseWord.toLowerCase()) return false
+      if (seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+
+    onSave(baseWord, baseMeaning, '', basePron, basePos, baseExample, extraWords.length > 0 ? extraWords : undefined)
   }
 
   const handleSelectCandidate = (candidate: AutoMeaningCandidate) => {
@@ -136,6 +374,33 @@ function WordEditForm({
         onUpdateWord({ pos: normalized })
       }
     }
+    // Auto-generate example sentence after user selects meaning from API suggestions.
+    void (async () => {
+      try {
+        if (String(example || '').trim()) return
+        if (!(window as any)?.api?.suggestExampleSentence) return
+        const key = `${String(word || item.text || '')}__${candidate.vi}`.toLowerCase()
+        if (lastExampleKeyRef.current === key) return
+        lastExampleKeyRef.current = key
+        setExampleError('')
+        setExample('')
+        setExampleLoading(true)
+        const out = await (window as any).api.suggestExampleSentence({
+          word: String(word || item.text || ''),
+          meaningVi: candidate.vi,
+          pos: candidate.pos || pos,
+          contextSentenceEn: item.contextSentenceEn || ''
+        })
+        if (String(out || '').trim()) {
+          setExample(String(out || '').trim())
+          onUpdateWord({ example: String(out || '').trim() })
+        }
+      } catch (e) {
+        setExampleError('Failed to suggest example')
+      } finally {
+        setExampleLoading(false)
+      }
+    })()
   }
 
   return (
@@ -253,7 +518,7 @@ function WordEditForm({
 
       {/* Example input */}
       <div className="form-group">
-        <label>Ví dụ</label>
+        <label>Ví dụ {exampleLoading && <span className="loading-text"> (Generating…)</span>}</label>
         <textarea
           value={example}
           onChange={(e) => {
@@ -265,6 +530,333 @@ function WordEditForm({
           rows={2}
         />
       </div>
+
+      {(wordFamilyLoading || wordFamilyError || wordFamilyMembers.length > 0) && (
+        <div className="word-family-section">
+          <div className="word-family-header">
+            <div className="word-family-title">Word Family</div>
+            <div className="word-family-actions">
+              <label className="word-family-toggle">
+                <input
+                  type="checkbox"
+                  checked={wordFamilyEnabled}
+                  onChange={(e) => setWordFamilyEnabled(e.target.checked)}
+                />
+                Auto-add
+              </label>
+            </div>
+          </div>
+
+          <div className="word-family-meta">
+            {wordFamilyLoading && 'Finding related forms…'}
+            {!wordFamilyLoading && wordFamilyError && wordFamilyError}
+            {!wordFamilyLoading && !wordFamilyError && wordFamilyMembers.length === 0 && 'No word family found.'}
+          </div>
+
+          {wordFamilyMembers.length > 0 && (
+            <div className="word-family-list">
+              {wordFamilyMembers.map((m) => {
+                const mw = String(m.word || '').trim()
+                const selected = wordFamilySelected.has(mw)
+                const ready = !!String(m.meaning || '').trim() && !!String(m.pos || '').trim()
+                return (
+                  <button
+                    key={mw}
+                    type="button"
+                    className={`word-family-chip ${selected ? 'selected' : ''}`}
+                    onContextMenu={(e) => {
+                      e.preventDefault()
+                      e.stopPropagation()
+                      setWordFamilySelected((prev) => {
+                        const next = new Set(prev)
+                        next.add(mw)
+                        return next
+                      })
+                      setRelatedEditTarget({ group: 'family', word: mw })
+                    }}
+                    onClick={() => {
+                      setWordFamilySelected((prev) => {
+                        const next = new Set(prev)
+                        if (next.has(mw)) next.delete(mw)
+                        else next.add(mw)
+                        return next
+                      })
+                    }}
+                    title={m.relation || ''}
+                  >
+                    {mw}
+                    {m.pos ? <span className="word-family-pos">({m.pos})</span> : null}
+                    {!ready ? <span className="word-family-pending">…</span> : null}
+                  </button>
+                )
+              })}
+            </div>
+          )}
+
+          {relatedEditTarget?.group === 'family' && (() => {
+            const mw = String(relatedEditTarget?.word || '').trim()
+            if (!mw) return null
+            const m = (Array.isArray(wordFamilyMembers) ? wordFamilyMembers : []).find((x) => String(x?.word || '').trim() === mw)
+            if (!m) return null
+            return (
+              <div className="word-family-editor">
+                <div className="word-family-editor-row">
+                  <div className="word-family-editor-title">
+                    Edit: {mw}{m.relation ? <span className="word-family-editor-relation"> ({m.relation})</span> : null}
+                    <button
+                      type="button"
+                      className="word-family-edit-btn"
+                      style={{ marginLeft: '0.5rem' }}
+                      onClick={() => setRelatedEditTarget(null)}
+                    >
+                      Close
+                    </button>
+                  </div>
+
+                  <div className="word-family-editor-grid">
+                    <div className="form-group">
+                      <label>Nghĩa</label>
+                      <input
+                        type="text"
+                        value={String(m.meaning || '')}
+                        onChange={(e) => {
+                          const v = e.target.value
+                          setWordFamilyMembers((prev) => prev.map((x) => (String(x.word || '').trim() === mw ? { ...x, meaning: v } : x)))
+                        }}
+                        placeholder="Nhập nghĩa..."
+                      />
+                    </div>
+
+                    <div className="form-group">
+                      <label>Loại từ</label>
+                      <select
+                        value={String(m.pos || '')}
+                        onChange={(e) => {
+                          const v = e.target.value
+                          setWordFamilyMembers((prev) => prev.map((x) => (String(x.word || '').trim() === mw ? { ...x, pos: v } : x)))
+                        }}
+                      >
+                        <option value="">-- Chọn --</option>
+                        {POS_OPTIONS.map((opt) => (
+                          <option key={opt.value} value={opt.value}>
+                            {opt.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div className="form-group">
+                      <label>Phát âm (IPA)</label>
+                      <input
+                        type="text"
+                        value={String(m.pronunciation || '')}
+                        onChange={(e) => {
+                          const v = e.target.value
+                          setWordFamilyMembers((prev) => prev.map((x) => (String(x.word || '').trim() === mw ? { ...x, pronunciation: v } : x)))
+                        }}
+                        placeholder="/…/"
+                      />
+                    </div>
+
+                    <div className="form-group">
+                      <label>Ví dụ</label>
+                      <textarea
+                        value={String(m.example || '')}
+                        onChange={(e) => {
+                          const v = e.target.value
+                          setWordFamilyMembers((prev) => prev.map((x) => (String(x.word || '').trim() === mw ? { ...x, example: v } : x)))
+                        }}
+                        placeholder="Nhập câu ví dụ..."
+                        rows={2}
+                      />
+                    </div>
+                  </div>
+                </div>
+                <div className="word-family-meta">Tip: Chuột phải vào chip để edit.</div>
+              </div>
+            )
+          })()}
+        </div>
+      )}
+
+      {(synonymsLoading || synonymsError || synonymsMembers.length > 0 || synonymFamilyMembers.length > 0) && (
+        <div className="word-family-section">
+          <div className="word-family-header">
+            <div className="word-family-title">Synonyms</div>
+            <div className="word-family-actions">
+              <label className="word-family-toggle">
+                <input
+                  type="checkbox"
+                  checked={synonymsEnabled}
+                  onChange={(e) => setSynonymsEnabled(e.target.checked)}
+                />
+                Auto-add
+              </label>
+            </div>
+          </div>
+
+          <div className="word-family-meta">
+            {synonymsLoading && 'Finding synonyms…'}
+            {!synonymsLoading && synonymsError && synonymsError}
+            {!synonymsLoading && !synonymsError && synonymsMembers.length === 0 && 'No synonyms found.'}
+          </div>
+
+          <div className="word-family-meta" style={{ marginTop: '0.25rem' }}>
+            {SYNONYM_FAMILIES_FEATURE_ENABLED && (
+              <label className="word-family-toggle">
+                <input
+                  type="checkbox"
+                  checked={synonymsIncludeFamilies}
+                  onChange={(e) => setSynonymsIncludeFamilies(e.target.checked)}
+                  disabled={!synonymsEnabled}
+                />
+                Include synonym families
+              </label>
+            )}
+          </div>
+
+          {synonymsMembers.length > 0 && (
+            <div className="word-family-list">
+              {synonymsMembers.map((m) => {
+                const mw = String(m.word || '').trim()
+                const selected = synonymsSelected.has(mw)
+                const ready = !!String(m.meaning || '').trim() && !!String(m.pos || '').trim()
+                return (
+                  <button
+                    key={`syn_${mw}`}
+                    type="button"
+                    className={`word-family-chip ${selected ? 'selected' : ''}`}
+                    onContextMenu={(e) => {
+                      e.preventDefault()
+                      e.stopPropagation()
+                      setSynonymsSelected((prev) => {
+                        const next = new Set(prev)
+                        next.add(mw)
+                        return next
+                      })
+                      setRelatedEditTarget({ group: 'synonym', word: mw })
+                    }}
+                    onClick={() => {
+                      setSynonymsSelected((prev) => {
+                        const next = new Set(prev)
+                        if (next.has(mw)) next.delete(mw)
+                        else next.add(mw)
+                        return next
+                      })
+                    }}
+                    title={m.relation || 'synonym'}
+                  >
+                    {mw}
+                    {m.pos ? <span className="word-family-pos">({m.pos})</span> : null}
+                    {!ready ? <span className="word-family-pending">…</span> : null}
+                  </button>
+                )
+              })}
+            </div>
+          )}
+
+          {SYNONYM_FAMILIES_FEATURE_ENABLED && synonymsIncludeFamilies && synonymFamilyMembers.length > 0 && (
+            <div className="word-family-list">
+              {synonymFamilyMembers.map((m) => {
+                const mw = String(m.word || '').trim()
+                const selected = synonymFamilySelected.has(mw)
+                const ready = !!String(m.meaning || '').trim() && !!String(m.pos || '').trim()
+                return (
+                  <button
+                    key={`sf_${mw}`}
+                    type="button"
+                    className={`word-family-chip ${selected ? 'selected' : ''}`}
+                    onContextMenu={(e) => {
+                      e.preventDefault()
+                      e.stopPropagation()
+                      setSynonymFamilySelected((prev) => {
+                        const next = new Set(prev)
+                        next.add(mw)
+                        return next
+                      })
+                      setRelatedEditTarget({ group: 'synonymFamily', word: mw })
+                    }}
+                    onClick={() => {
+                      setSynonymFamilySelected((prev) => {
+                        const next = new Set(prev)
+                        if (next.has(mw)) next.delete(mw)
+                        else next.add(mw)
+                        return next
+                      })
+                    }}
+                    title={m.relation || ''}
+                  >
+                    {mw}
+                    {m.pos ? <span className="word-family-pos">({m.pos})</span> : null}
+                    {!ready ? <span className="word-family-pending">…</span> : null}
+                  </button>
+                )
+              })}
+            </div>
+          )}
+
+          {(relatedEditTarget?.group === 'synonym' || relatedEditTarget?.group === 'synonymFamily') && (() => {
+            const mw = String(relatedEditTarget?.word || '').trim()
+            if (!mw) return null
+            const combined = [...(Array.isArray(synonymsMembers) ? synonymsMembers : []), ...(Array.isArray(synonymFamilyMembers) ? synonymFamilyMembers : [])]
+            const m = combined.find((x) => String(x?.word || '').trim() === mw)
+            if (!m) return null
+
+            const updateBoth = (patch: Partial<EnrichedWordFamilyMember>) => {
+              setSynonymsMembers((prev) => prev.map((x) => (String(x.word || '').trim() === mw ? { ...x, ...patch } : x)))
+              setSynonymFamilyMembers((prev) => prev.map((x) => (String(x.word || '').trim() === mw ? { ...x, ...patch } : x)))
+            }
+
+            return (
+              <div className="word-family-editor">
+                <div className="word-family-editor-row">
+                  <div className="word-family-editor-title">
+                    Edit: {mw}{m.relation ? <span className="word-family-editor-relation"> ({m.relation})</span> : null}
+                    <button
+                      type="button"
+                      className="word-family-edit-btn"
+                      style={{ marginLeft: '0.5rem' }}
+                      onClick={() => setRelatedEditTarget(null)}
+                    >
+                      Close
+                    </button>
+                  </div>
+
+                  <div className="word-family-editor-grid">
+                    <div className="form-group">
+                      <label>Nghĩa</label>
+                      <input type="text" value={String(m.meaning || '')} onChange={(e) => updateBoth({ meaning: e.target.value })} placeholder="Nhập nghĩa..." />
+                    </div>
+
+                    <div className="form-group">
+                      <label>Loại từ</label>
+                      <select value={String(m.pos || '')} onChange={(e) => updateBoth({ pos: e.target.value })}>
+                        <option value="">-- Chọn --</option>
+                        {POS_OPTIONS.map((opt) => (
+                          <option key={opt.value} value={opt.value}>
+                            {opt.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div className="form-group">
+                      <label>Phát âm (IPA)</label>
+                      <input type="text" value={String(m.pronunciation || '')} onChange={(e) => updateBoth({ pronunciation: e.target.value })} placeholder="/…/" />
+                    </div>
+
+                    <div className="form-group">
+                      <label>Ví dụ</label>
+                      <textarea value={String(m.example || '')} onChange={(e) => updateBoth({ example: e.target.value })} placeholder="Nhập câu ví dụ..." rows={2} />
+                    </div>
+                  </div>
+                </div>
+                <div className="word-family-meta">Tip: Chuột phải vào chip để edit.</div>
+              </div>
+            )
+          })()}
+        </div>
+      )}
 
       {/* Action buttons */}
       <div className="form-actions">
@@ -370,8 +962,8 @@ export default function PendingWordsSidebar({
           <WordEditForm
             key={selectedWord.id}
             item={selectedWord}
-            onSave={(word, meaning, pronunciation, pos, example) => {
-              onSave(selectedWord.id, word, meaning, pronunciation, pos, example)
+            onSave={(word, meaning, meaningNoteVi, pronunciation, pos, example, extraWords) => {
+              onSave(selectedWord.id, word, meaning, meaningNoteVi, pronunciation, pos, example, extraWords)
             }}
             onRemove={() => onRemove(selectedWord.id)}
             onClose={() => setSelectedWordId(null)}

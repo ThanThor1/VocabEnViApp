@@ -1,11 +1,12 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import ErrorBoundary from '../ErrorBoundary/ErrorBoundary'
 import TranslateTextModal from '../TranslateTextModal/TranslateTextModal'
-import { PendingWordsSidebar, PendingWord } from '../PendingWordsSidebar'
+import { PendingWordsSidebar, PendingWord, RectWithPage } from '../PendingWordsSidebar'
 import PendingPassagesSidebar from '../PendingPassagesSidebar/PendingPassagesSidebar'
 import { normalizePos } from '../posOptions/posOptions'
 import { useBackgroundTasks } from '../../contexts/BackgroundTasksContext'
 import { usePassages } from '../../contexts/PassagesContext'
+import { playSound } from '../../utils/sounds'
 
 interface Rect {
   xPct: number;
@@ -16,9 +17,11 @@ interface Rect {
 
 interface Highlight {
   id: string;
-  pageNumber: number; // 1-based
+  pageNumber: number; // 1-based (primary page for single-page, start page for multi-page)
   text: string;
   rects: Rect[];
+  rectsWithPage?: RectWithPage[]; // For multi-page selections
+  pageNumbers?: number[]; // List of pages involved in selection
   wordKey: string;
   meaning?: string;
   pronunciation?: string;
@@ -126,6 +129,9 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
             contextSentenceEn: task.contextSentenceEn,
             word: task.word,
             meaning: task.meaning || '',
+            meaningEn: task.meaningEn || '',
+            meaningVi: task.meaningVi || '',
+            meaningNoteVi: task.meaningVi || task.meaningNoteVi || '',
             pronunciation: task.pronunciation || '',
             pos: task.pos || '',
             example: task.example || '',
@@ -160,6 +166,9 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
           return prev.map(w => w.id === task.id ? {
             ...w,
             meaning: task.meaning || w.meaning,
+            meaningEn: task.meaningEn || w.meaningEn,
+            meaningVi: task.meaningVi || w.meaningVi,
+            meaningNoteVi: task.meaningVi || task.meaningNoteVi || w.meaningNoteVi,
             pronunciation: task.pronunciation || w.pronunciation,
             pos: task.pos || w.pos,
             example: task.example || w.example,
@@ -190,6 +199,9 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
           return prev.map(w => w.id === task.id ? {
             ...w,
             meaning: task.meaning || w.meaning,
+            meaningEn: task.meaningEn || w.meaningEn,
+            meaningVi: task.meaningVi || w.meaningVi,
+            meaningNoteVi: task.meaningVi || task.meaningNoteVi || w.meaningNoteVi,
             pronunciation: task.pronunciation || w.pronunciation,
             pos: task.pos || w.pos,
             example: task.example || w.example,
@@ -370,15 +382,21 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
         const contextSentence = typeof event.data?.contextSentenceEn === 'string' ? event.data.contextSentenceEn : '';
         const pageNum = event.data.pageNumber;
         const rects = Array.isArray(event.data?.rects) ? event.data.rects : [];
+        // Multi-page selection support
+        const rectsWithPage = Array.isArray(event.data?.rectsWithPage) ? event.data.rectsWithPage : [];
+        const pageNumbers = Array.isArray(event.data?.pageNumbers) ? event.data.pageNumbers : [pageNum];
         
         const newPendingWord: PendingWord = {
           id: wordId,
           text: rawText,
           pageNumber: pageNum,
           rects: rects,
+          rectsWithPage: rectsWithPage.length > 0 ? rectsWithPage : undefined,
+          pageNumbers: pageNumbers.length > 1 ? pageNumbers : undefined,
           contextSentenceEn: contextSentence,
           word: rawText,
           meaning: '',
+          meaningNoteVi: '',
           pronunciation: '',
           pos: '',
           example: '',
@@ -399,6 +417,8 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
           deckCsvPath: deckCsvPath,
           pageNumber: pageNum,
           rects: rects,
+          rectsWithPage: rectsWithPage.length > 0 ? rectsWithPage : undefined,
+          pageNumbers: pageNumbers.length > 1 ? pageNumbers : undefined,
         });
         
         // NOTE: Removed fetchWordData() call here - background task handles it
@@ -528,7 +548,9 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
     }
 
     try {
-      let updates: Partial<PendingWord> = { isApiLoading: false }
+      const updates: Partial<PendingWord> = { isApiLoading: false }
+      let meaningEn = ''
+      let meaningVi = ''
 
       const enrichWord = (window as any)?.api?.enrichWord
       if (enrichWord) {
@@ -545,8 +567,14 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
         if (!resp || resp.requestId !== requestId) return
 
         const suggested = String(resp.meaningSuggested || '').trim()
+        meaningEn = String((resp as any).meaningEn || '').trim()
+        meaningVi = String((resp as any).meaningVi || '').trim()
+        const meaningNoteVi = String((resp as any).meaningNoteVi || '').trim()
         updates.isApiComplete = !!suggested
         if (suggested) updates.meaning = suggested
+        if (meaningEn) updates.meaningEn = meaningEn
+        if (meaningVi) updates.meaningVi = meaningVi
+        if (meaningNoteVi) updates.meaningNoteVi = meaningNoteVi
         updates.candidates = Array.isArray(resp.candidates) ? resp.candidates : []
         updates.contextVi = String(resp.contextSentenceVi || '').trim()
 
@@ -615,6 +643,12 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
             const resp = data.value
             const s = String(resp.meaningSuggested || '').trim()
             if (s) updates.meaning = s
+            const meaningEn = String((resp as any).meaningEn || '').trim()
+            const meaningVi = String((resp as any).meaningVi || '').trim()
+            if (meaningEn) updates.meaningEn = meaningEn
+            if (meaningVi) updates.meaningVi = meaningVi
+            const note = String(resp.meaningNoteVie || resp.meaningNoteVi || '').trim()
+            if (note) updates.meaningNoteVi = note
             updates.candidates = Array.isArray(resp.candidates) ? resp.candidates : []
             updates.contextVi = String(resp.contextSentenceVi || '').trim()
 
@@ -638,6 +672,7 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
       }
 
       if (updates.isApiComplete) {
+        playSound('pop')
         try {
           const t = pendingRetryTimersRef.current.get(wordId)
           if (t) {
@@ -706,9 +741,11 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
     wordId: string,
     word: string,
     meaning: string,
+    meaningNoteVi: string,
     pronunciation: string,
     pos: string,
-    example: string
+    example: string,
+    extraWords?: Array<{ word: string; meaning: string; meaningNoteVi: string; pronunciation: string; pos: string; example: string }>
   ) => {
     if (!deckCsvPath) return;
 
@@ -733,13 +770,35 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
 
     enqueueBackgroundAdd(async () => {
       try {
+        const baseMeaningEn = String((pendingWord as any).meaningEn || '').trim()
+        const baseMeaningVi = String((pendingWord as any).meaningVi || '').trim()
         await window.api.addWord(deckCsvPath, {
           word,
           meaning,
+          meaningEn: baseMeaningEn,
+          meaningVi: baseMeaningVi,
           pronunciation,
           pos,
           example
         });
+
+        if (Array.isArray(extraWords) && extraWords.length > 0) {
+          for (const ew of extraWords) {
+            const w2 = String(ew?.word || '').trim();
+            const m2 = String(ew?.meaning || '').trim();
+            const p2 = String(ew?.pos || '').trim();
+            if (!w2 || !m2 || !p2) continue;
+            await window.api.addWord(deckCsvPath, {
+              word: w2,
+              meaning: m2,
+              meaningEn: String((ew as any)?.meaningEn || '').trim(),
+              meaningVi: String((ew as any)?.meaningVi || '').trim(),
+              pronunciation: String(ew?.pronunciation || '').trim(),
+              pos: p2,
+              example: String(ew?.example || '').trim()
+            });
+          }
+        }
 
         if (selectionSnapshot) {
           const wordKey = `${word}_${meaning}`.toLowerCase();
@@ -799,6 +858,8 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
         id: w.id,
         word: String(w.word || w.text || '').trim(),
         meaning: String(w.meaning || '').trim(),
+        meaningEn: String((w as any).meaningEn || '').trim(),
+        meaningVi: String((w as any).meaningVi || '').trim(),
         pronunciation: String(w.pronunciation || '').trim(),
         pos: String(w.pos || '').trim(),
         example: String(w.example || '').trim()
@@ -820,7 +881,7 @@ const PdfViewer: React.FC<PdfViewerProps> = ({ pdfId }) => {
 
     // Use the existing save path (serialized queue + highlight write + background task cleanup).
     for (const item of valid) {
-      handleSaveWord(item.id, item.word, item.meaning, item.pronunciation, item.pos, item.example);
+      handleSaveWord(item.id, item.word, item.meaning, String(item.meaningEn || ''), String(item.meaningVi || ''), item.pronunciation, item.pos, item.example);
     }
   };
 
