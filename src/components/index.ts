@@ -20,6 +20,7 @@ export { default as ManagerPdfView } from './ManagerPdfView'
 export { default as StudyView } from './StudyView'
 export { default as PdfReaderView } from './PdfReaderView'
 export { default as ApiKeyView } from './ApiKeyView'
+export { default as SRSManagerView } from './SRSManagerView'
 
 // New components for enhanced study experience
 export { ReviewCalendar } from './ReviewCalendar'

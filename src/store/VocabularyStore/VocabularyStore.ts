@@ -6,6 +6,11 @@ export interface VocabRecord {
   id: string // unique: `${source}||${word}||${meaning}`
   word: string
   meaning: string
+  meaningEn?: string
+  meaningVi?: string
+  meaningNoteVi?: string
+  meaningNoteVie?: string
+  meaningNoteEn?: string
   pronunciation?: string
   pos?: string // part of speech
   example?: string
@@ -50,6 +55,18 @@ export interface VocabRecord {
 export type VocabState = 'new' | 'learning' | 'reviewing' | 'mastered'
 
 const VOCAB_STORE_KEY = 'vocab_store_v2'
+
+// Persist only the most recent history event to keep storage small.
+// Increase this if you want to retain a small tail for debugging.
+const MAX_PERSISTED_HISTORY_EVENTS = 1
+
+type HistoryEvent = VocabRecord['history'][number]
+
+function appendHistory(prev: unknown, ...events: HistoryEvent[]): HistoryEvent[] {
+  const existing = Array.isArray(prev) ? (prev as HistoryEvent[]) : []
+  if (MAX_PERSISTED_HISTORY_EVENTS <= 0) return []
+  return [...existing, ...events].slice(-MAX_PERSISTED_HISTORY_EVENTS)
+}
 
 // SM-2 Algorithm implementation
 function calculateSM2(record: VocabRecord, quality: number): Partial<VocabRecord> {
@@ -124,17 +141,95 @@ class VocabularyStoreClass {
   private records: Map<string, VocabRecord> = new Map()
   private listeners: Set<() => void> = new Set()
   private initialized = false
+  private _version = 0
+
+  // Version counter - increments on any mutation, used for useMemo dependencies
+  get version(): number {
+    return this._version
+  }
 
   constructor() {
     this.load()
+  }
+
+  private normalizeLoadedRecord(id: string, raw: any): { record: VocabRecord; changed: boolean } {
+    const now = Date.now()
+
+    const state: VocabState =
+      raw?.state === 'new' || raw?.state === 'learning' || raw?.state === 'reviewing' || raw?.state === 'mastered'
+        ? raw.state
+        : 'new'
+
+    const historyRaw = raw?.history
+    const historyArr = Array.isArray(historyRaw) ? historyRaw : []
+    const history = appendHistory(historyArr)
+
+    // We persist SM-2 progress fields (easeFactor/repetitions/...) so Smart Review scheduling can resume
+    // correctly after app restart. Mark as changed when older stored shapes are missing these fields.
+    const missingSm2ProgressFields =
+      raw == null ||
+      !Object.prototype.hasOwnProperty.call(raw, 'easeFactor') ||
+      !Object.prototype.hasOwnProperty.call(raw, 'repetitions') ||
+      !Object.prototype.hasOwnProperty.call(raw, 'timesReviewed') ||
+      !Object.prototype.hasOwnProperty.call(raw, 'timesCorrect') ||
+      !Object.prototype.hasOwnProperty.call(raw, 'streak')
+    const missingMeaningEn = raw == null || (!Object.prototype.hasOwnProperty.call(raw, 'meaningEn') && !Object.prototype.hasOwnProperty.call(raw, 'meaningNoteEn'))
+    const missingMeaningVi = raw == null || (!Object.prototype.hasOwnProperty.call(raw, 'meaningVi') && !Object.prototype.hasOwnProperty.call(raw, 'meaningNoteVi') && !Object.prototype.hasOwnProperty.call(raw, 'meaningNoteVie'))
+
+    const changed = !Array.isArray(historyRaw) || historyArr.length !== history.length || missingSm2ProgressFields || missingMeaningEn || missingMeaningVi
+
+    const meaningEn = String(raw?.meaningEn ?? raw?.meaningNoteEn ?? '')
+    const meaningVi = String(raw?.meaningVi ?? raw?.meaningNoteVi ?? raw?.meaningNoteVie ?? '')
+
+    const record: VocabRecord = {
+      id: String(raw?.id ?? id),
+      word: String(raw?.word ?? ''),
+      meaning: String(raw?.meaning ?? ''),
+      meaningEn,
+      meaningVi,
+      meaningNoteVi: meaningVi,
+      meaningNoteVie: meaningVi,
+      meaningNoteEn: meaningEn,
+      pronunciation: raw?.pronunciation ?? '',
+      pos: raw?.pos ?? '',
+      example: raw?.example ?? '',
+      source: raw?.source ?? '',
+      state,
+      nextReviewDate: Number.isFinite(Number(raw?.nextReviewDate)) ? Number(raw.nextReviewDate) : now,
+      interval: Number.isFinite(Number(raw?.interval)) ? Number(raw.interval) : 0,
+      easeFactor: Number.isFinite(Number(raw?.easeFactor)) ? Number(raw.easeFactor) : 2.5,
+      repetitions: Number.isFinite(Number(raw?.repetitions)) ? Number(raw.repetitions) : 0,
+      lastReviewDate: typeof raw?.lastReviewDate === 'number' ? raw.lastReviewDate : undefined,
+      lastLapseAt: typeof raw?.lastLapseAt === 'number' ? raw.lastLapseAt : undefined,
+      timesReviewed: Number.isFinite(Number(raw?.timesReviewed)) ? Number(raw.timesReviewed) : 0,
+      timesCorrect: Number.isFinite(Number(raw?.timesCorrect)) ? Number(raw.timesCorrect) : 0,
+      streak: Number.isFinite(Number(raw?.streak)) ? Number(raw.streak) : 0,
+      wrongInCurrentRound: Boolean(raw?.wrongInCurrentRound ?? false),
+      needsNextRound: Boolean(raw?.needsNextRound ?? false),
+      difficultyRating: typeof raw?.difficultyRating === 'number' ? raw.difficultyRating : undefined,
+      history,
+      createdAt: Number.isFinite(Number(raw?.createdAt)) ? Number(raw.createdAt) : now,
+      updatedAt: Number.isFinite(Number(raw?.updatedAt)) ? Number(raw.updatedAt) : now,
+      tags: Array.isArray(raw?.tags) ? raw.tags : undefined,
+    }
+
+    return { record, changed }
   }
 
   private load() {
     try {
       const raw = localStorage.getItem(VOCAB_STORE_KEY)
       if (raw) {
-        const data = JSON.parse(raw) as Record<string, VocabRecord>
-        this.records = new Map(Object.entries(data))
+        const data = JSON.parse(raw) as Record<string, any>
+        let migrated = false
+        const entries: Array<[string, VocabRecord]> = []
+        for (const [id, rec] of Object.entries(data)) {
+          const normalized = this.normalizeLoadedRecord(id, rec)
+          migrated ||= normalized.changed
+          entries.push([id, normalized.record])
+        }
+        this.records = new Map(entries)
+        if (migrated) this.save()
       }
       this.initialized = true
     } catch (e) {
@@ -146,8 +241,52 @@ class VocabularyStoreClass {
 
   private save() {
     try {
-      const data: Record<string, VocabRecord> = {}
-      this.records.forEach((v, k) => { data[k] = v })
+      // Persist full SM-2 progress fields so review scheduling/state survives app restarts.
+      const data: Record<string, Partial<VocabRecord>> = {}
+      this.records.forEach((v, k) => {
+        data[k] = {
+          // Identity + content
+          id: v.id,
+          word: v.word,
+          meaning: v.meaning,
+          meaningEn: v.meaningEn,
+          meaningVi: v.meaningVi,
+          meaningNoteVi: v.meaningNoteVi,
+          meaningNoteVie: v.meaningNoteVie,
+          meaningNoteEn: v.meaningNoteEn,
+          pronunciation: v.pronunciation,
+          pos: v.pos,
+          example: v.example,
+          source: v.source,
+
+          // Scheduling + state
+          state: v.state,
+          nextReviewDate: v.nextReviewDate,
+          interval: v.interval,
+          difficultyRating: v.difficultyRating,
+
+          // SM-2 progress (critical for stable Smart Review scheduling)
+          easeFactor: v.easeFactor,
+          repetitions: v.repetitions,
+          lastReviewDate: v.lastReviewDate,
+          lastLapseAt: v.lastLapseAt,
+          timesReviewed: v.timesReviewed,
+          timesCorrect: v.timesCorrect,
+          streak: v.streak,
+
+          // Session / round-based flags (keep for resume)
+          wrongInCurrentRound: v.wrongInCurrentRound,
+          needsNextRound: v.needsNextRound,
+
+          // Keep only a tiny history tail (already truncated via appendHistory)
+          history: appendHistory(v.history),
+
+          // Metadata
+          createdAt: v.createdAt,
+          updatedAt: v.updatedAt,
+          tags: v.tags,
+        }
+      })
       localStorage.setItem(VOCAB_STORE_KEY, JSON.stringify(data))
     } catch (e) {
       console.error('[VocabStore] Failed to save:', e)
@@ -155,6 +294,7 @@ class VocabularyStoreClass {
   }
 
   private notify() {
+    this._version++
     this.listeners.forEach(fn => fn())
   }
 
@@ -175,6 +315,13 @@ class VocabularyStoreClass {
   // Get all records
   getAll(): VocabRecord[] {
     return Array.from(this.records.values())
+  }
+
+  // Iterate records without allocating an array (perf for large stores)
+  private forEachRecord(fn: (record: VocabRecord) => void) {
+    for (const record of this.records.values()) {
+      fn(record)
+    }
   }
 
   // Get record by ID
@@ -203,12 +350,17 @@ class VocabularyStoreClass {
       const updated: VocabRecord = {
         ...existing,
         ...data,
+        meaningEn: typeof data.meaningEn === 'string'
+          ? data.meaningEn
+          : (typeof data.meaningNoteEn === 'string' ? data.meaningNoteEn : existing.meaningEn),
+        meaningVi: typeof data.meaningVi === 'string'
+          ? data.meaningVi
+          : (typeof data.meaningNoteVi === 'string'
+            ? data.meaningNoteVi
+            : (typeof data.meaningNoteVie === 'string' ? data.meaningNoteVie : existing.meaningVi)),
         id,
         updatedAt: now,
-        history: [
-          ...existing.history,
-          { timestamp: now, action: 'reviewed', data }
-        ]
+        history: appendHistory(existing.history, { timestamp: now, action: 'reviewed', data })
       }
       this.records.set(id, updated)
       this.save()
@@ -220,22 +372,27 @@ class VocabularyStoreClass {
         id,
         word: data.word,
         meaning: data.meaning,
+        meaningEn: data.meaningEn || data.meaningNoteEn || '',
+        meaningVi: data.meaningVi || data.meaningNoteVi || data.meaningNoteVie || '',
+        meaningNoteVi: data.meaningNoteVi || data.meaningNoteVie || '',
+        meaningNoteVie: data.meaningNoteVie || data.meaningNoteVi || '',
+        meaningNoteEn: data.meaningNoteEn || data.meaningEn || '',
         pronunciation: data.pronunciation || '',
         pos: data.pos || '',
         example: data.example || '',
         source: data.source || '',
-        state: 'new',
-        nextReviewDate: now,
-        interval: 0,
-        easeFactor: 2.5,
-        repetitions: 0,
-        timesReviewed: 0,
-        timesCorrect: 0,
-        streak: 0,
-        wrongInCurrentRound: false,
-        needsNextRound: false,
-        history: [{ timestamp: now, action: 'created' }],
-        createdAt: now,
+        state: data.state || 'new',
+        nextReviewDate: data.nextReviewDate ?? now,
+        interval: data.interval ?? 0,
+        easeFactor: data.easeFactor ?? 2.5,
+        repetitions: data.repetitions ?? 0,
+        timesReviewed: data.timesReviewed ?? 0,
+        timesCorrect: data.timesCorrect ?? 0,
+        streak: data.streak ?? 0,
+        wrongInCurrentRound: data.wrongInCurrentRound ?? false,
+        needsNextRound: data.needsNextRound ?? false,
+        history: appendHistory([], { timestamp: now, action: 'created' }),
+        createdAt: data.createdAt ?? now,
         updatedAt: now
       }
       this.records.set(id, newRecord)
@@ -243,6 +400,29 @@ class VocabularyStoreClass {
       this.notify()
       return newRecord
     }
+  }
+
+  update(id: string, updates: Partial<VocabRecord>): VocabRecord | undefined {
+    const record = this.records.get(id)
+    if (!record) return undefined
+
+    const now = Date.now()
+    const updated: VocabRecord = {
+      ...record,
+      ...updates,
+      meaningNoteVi: typeof updates.meaningNoteVi === 'string'
+        ? updates.meaningNoteVi
+        : (typeof updates.meaningNoteVie === 'string' ? updates.meaningNoteVie : record.meaningNoteVi),
+      meaningNoteVie: typeof updates.meaningNoteVie === 'string'
+        ? updates.meaningNoteVie
+        : (typeof updates.meaningNoteVi === 'string' ? updates.meaningNoteVi : record.meaningNoteVie),
+      id,
+      updatedAt: now,
+    }
+    this.records.set(id, updated)
+    this.save()
+    this.notify()
+    return updated
   }
 
   // Record a review result
@@ -268,6 +448,24 @@ class VocabularyStoreClass {
       : record
 
     const updates = calculateSM2(baseRecord, quality)
+
+    const lapsedEvent: HistoryEvent | undefined = lapsed
+      ? {
+          timestamp: now,
+          action: 'lapsed' as const,
+          data: {
+            gapDays: lastReviewAt ? Math.round((now - lastReviewAt) / dayMs) : undefined,
+            prevInterval: record.interval,
+            thresholdDays: Math.round(lapseThresholdMs / dayMs),
+          },
+        }
+      : undefined
+
+    const resultEvent: HistoryEvent = {
+      timestamp: now,
+      action: (wasCorrect ? 'correct' : 'incorrect') as 'correct' | 'incorrect',
+      data: { quality },
+    }
     
     const updated: VocabRecord = {
       ...record,
@@ -275,27 +473,7 @@ class VocabularyStoreClass {
       wrongInCurrentRound: !wasCorrect || record.wrongInCurrentRound,
       needsNextRound: !wasCorrect || record.needsNextRound,
       lastLapseAt: lapsed ? now : record.lastLapseAt,
-      history: [
-        ...record.history,
-        ...(lapsed
-          ? [
-              {
-                timestamp: now,
-                action: 'lapsed' as const,
-                data: {
-                  gapDays: lastReviewAt ? Math.round((now - lastReviewAt) / dayMs) : undefined,
-                  prevInterval: record.interval,
-                  thresholdDays: Math.round(lapseThresholdMs / dayMs),
-                },
-              },
-            ]
-          : []),
-        { 
-          timestamp: now, 
-          action: (wasCorrect ? 'correct' : 'incorrect') as 'correct' | 'incorrect',
-          data: { quality }
-        }
-      ]
+      history: appendHistory(record.history, ...(lapsedEvent ? [lapsedEvent] : []), resultEvent)
     }
     
     this.records.set(id, updated)
@@ -368,14 +546,11 @@ class VocabularyStoreClass {
       nextReviewDate,
       wrongInCurrentRound: !wasCorrect || record.wrongInCurrentRound,
       needsNextRound: !wasCorrect || record.needsNextRound,
-      history: [
-        ...record.history,
-        {
-          timestamp: now,
-          action: wasCorrect ? 'correct' : 'incorrect',
-          data: { difficulty: d, quality, interval }
-        }
-      ]
+      history: appendHistory(record.history, {
+        timestamp: now,
+        action: wasCorrect ? 'correct' : 'incorrect',
+        data: { difficulty: d, quality, interval },
+      })
     }
 
     this.records.set(id, updated)
@@ -418,12 +593,35 @@ class VocabularyStoreClass {
     }
 
     const prevInterval = Math.max(0, record.interval || 0)
-    let interval = 1
-    if (prevInterval <= 0) {
-      interval = baseIntervalDays[d]
-    } else {
-      interval = Math.max(1, Math.round(prevInterval * multiplier[d]))
+    const basePredict = (dd: 1 | 2 | 3 | 4): number => {
+      if (prevInterval <= 0) return baseIntervalDays[dd]
+      const raw = prevInterval * multiplier[dd]
+      // Rounding policy:
+      // - For 1/2/3 (easier): round up so interval grows as expected.
+      // - For 4 (hardest): round down so interval can shrink.
+      return Math.max(1, dd === 4 ? Math.floor(raw) : Math.ceil(raw))
     }
+
+    // Compute from hardest -> easiest, then bump easier levels by +1 day
+    // if rounding causes collisions (or would otherwise make them not strictly later).
+    const predicted: Record<1 | 2 | 3 | 4, number> = {
+      1: basePredict(1),
+      2: basePredict(2),
+      3: basePredict(3),
+      4: basePredict(4),
+    }
+    const ordered: Array<1 | 2 | 3 | 4> = [4, 3, 2, 1]
+    let lastDays: number | null = null
+    for (const dd of ordered) {
+      let days = predicted[dd]
+      if (lastDays != null && days <= lastDays) {
+        days = lastDays + 1
+        predicted[dd] = days
+      }
+      lastDays = predicted[dd]
+    }
+
+    const interval = predicted[d]
 
     const nextReviewDate = todayStart + interval * 24 * 60 * 60 * 1000
 
@@ -434,10 +632,11 @@ class VocabularyStoreClass {
       nextReviewDate,
       state: record.state === 'new' ? 'reviewing' : record.state,
       updatedAt: now,
-      history: [
-        ...record.history,
-        { timestamp: now, action: 'difficulty_set', data: { difficulty: d, interval, recomputed: true } }
-      ]
+      history: appendHistory(record.history, {
+        timestamp: now,
+        action: 'difficulty_set',
+        data: { difficulty: d, interval, recomputed: true },
+      })
     }
 
     this.records.set(id, updated)
@@ -490,10 +689,11 @@ class VocabularyStoreClass {
       interval,
       state: 'reviewing',
       updatedAt: now,
-      history: [
-        ...record.history,
-        { timestamp: now, action: 'difficulty_set', data: { difficulty: d, interval } }
-      ]
+      history: appendHistory(record.history, {
+        timestamp: now,
+        action: 'difficulty_set',
+        data: { difficulty: d, interval },
+      })
     }
     
     this.records.set(id, updated)
@@ -515,10 +715,7 @@ class VocabularyStoreClass {
       nextReviewDate: newDate,
       interval: Math.max(1, daysDiff),
       updatedAt: now,
-      history: [
-        ...record.history,
-        { timestamp: now, action: 'rescheduled', data: { newDate } }
-      ]
+      history: appendHistory(record.history, { timestamp: now, action: 'rescheduled', data: { newDate } })
     }
     
     this.records.set(id, updated)
@@ -546,10 +743,11 @@ class VocabularyStoreClass {
       nextReviewDate: todayStart,
       interval: 1,
       updatedAt: now,
-      history: [
-        ...record.history,
-        { timestamp: now, action: 'rescheduled', data: { newDate: todayStart, scheduledForToday: true, reason } }
-      ]
+      history: appendHistory(record.history, {
+        timestamp: now,
+        action: 'rescheduled',
+        data: { newDate: todayStart, scheduledForToday: true, reason },
+      })
     }
 
     this.records.set(id, updated)
@@ -579,10 +777,11 @@ class VocabularyStoreClass {
       nextReviewDate: newDate,
       interval: farFutureDays,
       updatedAt: now,
-      history: [
-        ...record.history,
-        { timestamp: now, action: 'rescheduled', data: { newDate, removedFromSchedule: true } }
-      ]
+      history: appendHistory(record.history, {
+        timestamp: now,
+        action: 'rescheduled',
+        data: { newDate, removedFromSchedule: true },
+      })
     }
 
     this.records.set(id, updated)
@@ -620,9 +819,12 @@ class VocabularyStoreClass {
   // Get due cards for review
   getDueCards(): VocabRecord[] {
     const now = Date.now()
-    return this.getAll().filter(r => 
-      r.state !== 'new' && r.nextReviewDate <= now
-    )
+    const out: VocabRecord[] = []
+    this.forEachRecord((r) => {
+      if (r.state === 'new') return
+      if ((r.nextReviewDate || 0) <= now) out.push(r)
+    })
+    return out
   }
 
   // Get cards not yet in SRS (new words from custom study)
@@ -666,14 +868,16 @@ class VocabularyStoreClass {
 
   // Get overdue cards
   getOverdueCards(): VocabRecord[] {
-    const now = Date.now()
     const today = new Date()
     today.setHours(0, 0, 0, 0)
     const todayStart = today.getTime()
-    
-    return this.getAll().filter(r => 
-      r.state !== 'new' && r.nextReviewDate < todayStart
-    )
+
+    const out: VocabRecord[] = []
+    this.forEachRecord((r) => {
+      if (r.state === 'new') return
+      if ((r.nextReviewDate || 0) < todayStart) out.push(r)
+    })
+    return out
   }
 
   // Delete a record
@@ -734,17 +938,43 @@ class VocabularyStoreClass {
 
   // Get statistics
   getStats() {
-    const all = this.getAll()
     const now = Date.now()
-    
+
+    const todayStart = (() => {
+      const d = new Date(now)
+      d.setHours(0, 0, 0, 0)
+      return d.getTime()
+    })()
+
+    let total = 0
+    let countNew = 0
+    let learning = 0
+    let reviewing = 0
+    let mastered = 0
+    let dueToday = 0
+    let overdue = 0
+
+    this.forEachRecord((r) => {
+      total += 1
+      if (r.state === 'new') {
+        countNew += 1
+        return
+      }
+      if ((r.nextReviewDate || 0) <= now) dueToday += 1
+      if ((r.nextReviewDate || 0) < todayStart) overdue += 1
+      if (r.state === 'learning') learning += 1
+      else if (r.state === 'reviewing') reviewing += 1
+      else if (r.state === 'mastered') mastered += 1
+    })
+
     return {
-      total: all.length,
-      new: all.filter(r => r.state === 'new').length,
-      learning: all.filter(r => r.state === 'learning').length,
-      reviewing: all.filter(r => r.state === 'reviewing').length,
-      mastered: all.filter(r => r.state === 'mastered').length,
-      dueToday: all.filter(r => r.state !== 'new' && r.nextReviewDate <= now).length,
-      overdue: this.getOverdueCards().length
+      total,
+      new: countNew,
+      learning,
+      reviewing,
+      mastered,
+      dueToday,
+      overdue,
     }
   }
 }
@@ -761,7 +991,8 @@ export function useVocabularyStore() {
 
     // Time-based UI (due/overdue/calendar “today”) should update even when the store doesn't change.
     // This also makes OS date-change testing work without restarting the app.
-    const tick = window.setInterval(() => forceUpdate({}), 2000)
+    // NOTE: Keep this relatively infrequent to avoid UI jank when the store grows large.
+    const tick = window.setInterval(() => forceUpdate({}), 30000)
 
     const onWake = () => forceUpdate({})
     window.addEventListener('focus', onWake)

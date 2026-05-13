@@ -12,11 +12,16 @@ export interface BackgroundTranslationTask {
   deckCsvPath: string
   pageNumber: number
   rects: any[]
+  rectsWithPage?: any[] // For multi-page selections
+  pageNumbers?: number[] // List of pages involved in selection
   // Status
   status: 'pending' | 'running' | 'completed' | 'error'
   progress: string
   // Results
   meaning?: string
+  meaningEn?: string
+  meaningVi?: string
+  meaningNoteVi?: string
   pronunciation?: string
   pos?: string
   example?: string
@@ -94,6 +99,9 @@ export function BackgroundTasksProvider({ children }: { children: React.ReactNod
 
       let pronunciation = ''
       let meaning = ''
+      let meaningEn = ''
+      let meaningVi = ''
+      let meaningNoteVi = ''
       let candidates: AutoMeaningCandidate[] = []
       let contextVi = ''
       let pos = ''
@@ -113,6 +121,8 @@ export function BackgroundTasksProvider({ children }: { children: React.ReactNod
 
           if (resp) {
             meaning = String(resp.meaningSuggested || '').trim()
+            meaningEn = String(resp.meaningNoteEn || resp.meaningEn || '').trim()
+            meaningNoteVi = String(resp.meaningNoteVie || resp.meaningNoteVi || '').trim()
             candidates = Array.isArray(resp.candidates) ? resp.candidates : []
             contextVi = String(resp.contextSentenceVi || '').trim()
             example = String((resp as any).example || '').trim()
@@ -132,6 +142,18 @@ export function BackgroundTasksProvider({ children }: { children: React.ReactNod
         } catch (e) {
           console.warn('[BackgroundTask] enrichWord error:', e)
         }
+
+        try {
+          const translateMeaningNoteVie = (window as any)?.api?.translateMeaningNoteVie
+          if (translateMeaningNoteVie && (meaningEn || meaning)) {
+            const translated = await translateMeaningNoteVie({
+              word: cleanWord,
+              englishMeaning: meaningEn || meaning,
+              contextSentenceEn: cleanContext,
+            })
+            meaningVi = String(translated || '').trim()
+          }
+        } catch (e) {}
 
         if (!pronunciation && !/\s/.test(cleanWord)) {
           pronunciation = await fetchDictionaryIpa()
@@ -178,6 +200,8 @@ export function BackgroundTasksProvider({ children }: { children: React.ReactNod
 
             if (resp) {
               meaning = (resp.meaningSuggested || '').trim()
+              meaningEn = String(resp.meaningNoteEn || resp.meaningEn || '').trim()
+              meaningNoteVi = String(resp.meaningNoteVie || resp.meaningNoteVi || '').trim()
               candidates = Array.isArray(resp.candidates) ? resp.candidates : []
               contextVi = (resp.contextSentenceVi || '').trim()
 
@@ -188,8 +212,20 @@ export function BackgroundTasksProvider({ children }: { children: React.ReactNod
           }
         } catch (e) {}
 
+        try {
+          const translateMeaningNoteVie = (window as any)?.api?.translateMeaningNoteVie
+          if (translateMeaningNoteVie && (meaningEn || meaning)) {
+            const translated = await translateMeaningNoteVie({
+              word: cleanWord,
+              englishMeaning: meaningEn || meaning,
+              contextSentenceEn: cleanContext,
+            })
+            meaningVi = String(translated || '').trim()
+          }
+        } catch (e) {}
+
         if (abortController.signal.aborted) return
-        updateTask(task.id, { meaning, candidates, contextVi, pos, progress: 'Đang tạo câu ví dụ...' })
+        updateTask(task.id, { meaning, meaningEn, meaningVi, meaningNoteVi, candidates, contextVi, pos, progress: 'Đang tạo câu ví dụ...' })
 
         if (meaning && (window as any)?.api?.suggestExampleSentence) {
           try {
@@ -207,7 +243,7 @@ export function BackgroundTasksProvider({ children }: { children: React.ReactNod
       if (abortController.signal.aborted) return
 
       // Persist results to task state
-      updateTask(task.id, { pronunciation, meaning, candidates, contextVi, pos, example })
+      updateTask(task.id, { pronunciation, meaning, meaningEn, meaningVi, meaningNoteVi, candidates, contextVi, pos, example })
 
       // Done
       updateTask(task.id, { status: 'completed', progress: 'Hoàn tất!', completedAt: Date.now() })

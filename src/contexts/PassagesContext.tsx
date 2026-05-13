@@ -1,9 +1,11 @@
 import React, { createContext, useContext, useState, useCallback, ReactNode } from 'react'
+import { playSound } from '../utils/sounds'
 
 export interface PendingPassage {
   id: string
   text: string
   translation?: string
+  explanation?: string
   isLoading: boolean
   createdAt: number
 }
@@ -13,6 +15,7 @@ interface PassagesContextValue {
   addPassage: (text: string) => string
   removePassage: (id: string) => void
   updatePassageTranslation: (id: string, translation: string) => void
+  updatePassageExplanation: (id: string, explanation: string) => void
   setPassageLoading: (id: string, loading: boolean) => void
   clearAll: () => void
   translatePassage: (id: string) => Promise<void>
@@ -59,6 +62,12 @@ export function PassagesProvider({ children }: PassagesProviderProps) {
     ))
   }, [])
 
+  const updatePassageExplanation = useCallback((id: string, explanation: string) => {
+    setPassages(prev => prev.map(p =>
+      p.id === id ? { ...p, explanation } : p
+    ))
+  }, [])
+
   const setPassageLoading = useCallback((id: string, loading: boolean) => {
     setPassages(prev => prev.map(p => 
       p.id === id ? { ...p, isLoading: loading } : p
@@ -75,15 +84,32 @@ export function PassagesProvider({ children }: PassagesProviderProps) {
       const cleanText = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim()
       
       // Call translation API
-      const result = await (window as any).api.translatePlain({ text: cleanText, from: 'en', to: 'vi' })
-      if (result) {
-        setPassages(prev => prev.map(p => 
-          p.id === id ? { ...p, translation: String(result || ''), isLoading: false } : p
-        ))
+      if ((window as any)?.api?.translateExplain) {
+        const resp = await (window as any).api.translateExplain({ text: cleanText, from: 'en', to: 'vi' })
+        const translated = String(resp?.translation || '').trim()
+        const explanation = String(resp?.explanation || '').trim()
+        if (translated) {
+          setPassages(prev => prev.map(p =>
+            p.id === id ? { ...p, translation: translated, explanation, isLoading: false } : p
+          ))
+          playSound('complete')
+        } else {
+          setPassages(prev => prev.map(p =>
+            p.id === id ? { ...p, isLoading: false } : p
+          ))
+        }
       } else {
-        setPassages(prev => prev.map(p => 
-          p.id === id ? { ...p, isLoading: false } : p
-        ))
+        const result = await (window as any).api.translatePlain({ text: cleanText, from: 'en', to: 'vi' })
+        if (result) {
+          setPassages(prev => prev.map(p => 
+            p.id === id ? { ...p, translation: String(result || ''), isLoading: false } : p
+          ))
+          playSound('complete')
+        } else {
+          setPassages(prev => prev.map(p => 
+            p.id === id ? { ...p, isLoading: false } : p
+          ))
+        }
       }
     } catch (err) {
       console.error('Translation error:', err)
@@ -110,6 +136,8 @@ export function PassagesProvider({ children }: PassagesProviderProps) {
       addPassage,
       removePassage,
       updatePassageTranslation,
+      // optional helper (not used by all call sites)
+      updatePassageExplanation,
       setPassageLoading,
       clearAll,
       translatePassage,
