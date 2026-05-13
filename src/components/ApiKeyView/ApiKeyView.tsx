@@ -106,6 +106,25 @@ export default function ApiKey() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  useEffect(() => {
+    if (!api?.onGoogleAiStudioKeyInvalid) return
+    const handler = (data: { id: string; name?: string; masked: string; reason?: string }) => {
+      try {
+        refresh()
+      } catch {}
+      const label = data?.name ? `${data.name} (${data.masked})` : data?.masked
+      setStatusMsg(`API key ${label || ''} is invalid and was disabled.`)
+      setTimeout(() => setStatusMsg(''), 4000)
+    }
+    api.onGoogleAiStudioKeyInvalid(handler)
+    return () => {
+      try {
+        api.offGoogleAiStudioKeyInvalid?.(handler)
+      } catch {}
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   const handleSaveConcurrency = async () => {
     try {
       setStatusMsg('')

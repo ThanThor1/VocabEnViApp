@@ -4,29 +4,37 @@ import { POS_OPTIONS } from '../posOptions/posOptions'
 type Props = {
   word: string;
   meaning: string;
+  meaningEn?: string;
+  meaningVi?: string;
   pronunciation: string;
   pos: string;
   onClose: () => void;
   example?: string;
-  onSave: (word: string, meaning: string, pronunciation: string, pos: string, example: string) => void;
+  onSave: (word: string, meaning: string, meaningEn: string, meaningVi: string, pronunciation: string, pos: string, example: string) => void;
 };
 
-export default function EditWordModal({ word, meaning, pronunciation, pos, example, onClose, onSave }: Props) {
+export default function EditWordModal({ word, meaning, meaningEn, meaningVi, pronunciation, pos, example, onClose, onSave }: Props) {
   const [editWord, setEditWord] = useState(word);
   const [editMeaning, setEditMeaning] = useState(meaning);
+  const [editMeaningEn, setEditMeaningEn] = useState(meaningEn || '');
+  const [editMeaningVi, setEditMeaningVi] = useState(meaningVi || '');
   const [editExample, setEditExample] = useState(example || '');
   const [editPronunciation, setEditPronunciation] = useState(pronunciation);
   const [editPos, setEditPos] = useState(pos || '');
   const [errorMessage, setErrorMessage] = useState('');
+  const [fillingEnMeaning, setFillingEnMeaning] = useState(false);
+  const [fillingVieMeaning, setFillingVieMeaning] = useState(false);
 
   useEffect(() => {
     setEditWord(word);
     setEditMeaning(meaning);
+    setEditMeaningEn(meaningEn || '');
+    setEditMeaningVi(meaningVi || '');
     setEditExample(example || '');
     setEditPronunciation(pronunciation);
     setEditPos(pos || '');
     setErrorMessage('');
-  }, [word, meaning, pronunciation, pos, example]);
+  }, [word, meaning, meaningEn, meaningVi, pronunciation, pos, example]);
 
   function handleSave() {
     if (!editWord.trim()) {
@@ -37,7 +45,60 @@ export default function EditWordModal({ word, meaning, pronunciation, pos, examp
       setErrorMessage('Part of speech is required');
       return;
     }
-    onSave(editWord.trim(), editMeaning.trim(), editPronunciation.trim(), editPos.trim(), editExample.trim());
+    onSave(editWord.trim(), editMeaning.trim(), editMeaningEn.trim(), editMeaningVi.trim(), editPronunciation.trim(), editPos.trim(), editExample.trim());
+  }
+
+  async function handleFillEnMeaning() {
+    const targetWord = editWord.trim();
+    if (!targetWord || fillingEnMeaning) return;
+
+    setErrorMessage('');
+    setFillingEnMeaning(true);
+    try {
+      const result = await window.api.fetchEnglishMeaning(targetWord);
+      if (result && String(result).trim()) {
+        setEditMeaningEn(String(result).trim());
+      } else {
+        setErrorMessage('No EN meaning found for this word.');
+      }
+    } catch {
+      setErrorMessage('Failed to fill EN meaning.');
+    } finally {
+      setFillingEnMeaning(false);
+    }
+  }
+
+  async function handleFillVieMeaning() {
+    if (fillingVieMeaning) return;
+
+    const targetWord = editWord.trim();
+    if (!targetWord) return;
+
+    setErrorMessage('');
+    setFillingVieMeaning(true);
+    try {
+      let sourceMeaning = editMeaningEn.trim() || editMeaning.trim();
+      if (!sourceMeaning) {
+        const fetched = await window.api.fetchEnglishMeaning(targetWord);
+        sourceMeaning = String(fetched || '').trim();
+        if (sourceMeaning) setEditMeaningEn(sourceMeaning);
+      }
+
+      const translated = await window.api.translateMeaningNoteVie({
+        word: targetWord,
+        englishMeaning: sourceMeaning,
+      });
+      const vie = String(translated || '').trim();
+      if (vie) {
+        setEditMeaningVi(vie);
+      } else {
+        setErrorMessage('No VIE meaning generated.');
+      }
+    } catch {
+      setErrorMessage('Failed to fill VIE meaning.');
+    } finally {
+      setFillingVieMeaning(false);
+    }
   }
 
   function handleKeyDown(e: React.KeyboardEvent) {
@@ -111,18 +172,68 @@ export default function EditWordModal({ word, meaning, pronunciation, pos, examp
 
           {/* Meaning */}
           <div>
-            <label className="block text-sm font-semibold text-slate-700 dark:text-slate-300 mb-2 flex items-center gap-2">
-              <svg className="w-4 h-4 text-purple-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253" />
-              </svg>
-              Meaning
-            </label>
+            <div className="mb-2 flex items-center justify-between gap-3">
+              <label className="text-sm font-semibold text-slate-700 dark:text-slate-300 flex items-center gap-2">
+                <svg className="w-4 h-4 text-purple-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253" />
+                </svg>
+                Meaning
+              </label>
+            </div>
             <textarea
               value={editMeaning}
               onChange={(e) => setEditMeaning(e.target.value)}
               className="input-field w-full"
               placeholder="Enter meaning..."
               rows={3}
+            />
+          </div>
+
+          <div>
+            <div className="mb-2 flex items-center justify-between gap-3">
+              <label className="text-sm font-semibold text-slate-700 dark:text-slate-300">
+                Meaning EN
+              </label>
+              <button
+                type="button"
+                onClick={handleFillEnMeaning}
+                disabled={!editWord.trim() || fillingEnMeaning}
+                className="btn-secondary !py-1 !px-2 text-xs disabled:opacity-50 disabled:cursor-not-allowed"
+                title="Fill English meaning from Bing"
+              >
+                {fillingEnMeaning ? 'Filling EN...' : 'Điền EN nghĩa'}
+              </button>
+            </div>
+            <textarea
+              value={editMeaningEn}
+              onChange={(e) => setEditMeaningEn(e.target.value)}
+              className="input-field w-full"
+              placeholder="Enter English meaning..."
+              rows={3}
+            />
+          </div>
+
+          <div>
+            <div className="mb-2 flex items-center justify-between gap-3">
+              <label className="text-sm font-semibold text-slate-700 dark:text-slate-300">
+                Meaning VI
+              </label>
+              <button
+                type="button"
+                onClick={handleFillVieMeaning}
+                disabled={!editWord.trim() || fillingVieMeaning}
+                className="btn-secondary !py-1 !px-2 text-xs disabled:opacity-50 disabled:cursor-not-allowed"
+                title="Fill Vietnamese meaning from English meaning"
+              >
+                {fillingVieMeaning ? 'Filling VIE...' : 'Điền VIE nghĩa'}
+              </button>
+            </div>
+            <textarea
+              value={editMeaningVi}
+              onChange={(e) => setEditMeaningVi(e.target.value)}
+              className="input-field w-full"
+              placeholder="Explain nuance/usage in Vietnamese..."
+              rows={2}
             />
           </div>
 

@@ -4,6 +4,7 @@ import ErrorBoundary from '../ErrorBoundary/ErrorBoundary'
 import { useNavigate, useLocation } from 'react-router-dom'
 import VocabTable from '../VocabTable/VocabTable'
 import { usePersistedState } from '../../hooks/usePersistedState'
+import { speakWord } from '../../utils/speech'
 
 export default function ManagerPdf() {
   const navigate = useNavigate()
@@ -89,18 +90,14 @@ export default function ManagerPdf() {
     return `/${core}/`
   }
 
-  async function handleEditRow(idx:number, word:string, meaning:string, pronunciation:string, pos:string, example:string) {
+  async function handleEditRow(idx:number, word:string, meaning:string, meaningEn:string, meaningVi:string, pronunciation:string, pos:string, example:string) {
     if (!selectedPdf || !selectedPdf.deckCsvPath) return
     try {
-      await window.api.editWord(selectedPdf.deckCsvPath, idx, { word, meaning, pronunciation: ensureIpaSlashes(pronunciation), pos, example })
+      await window.api.editWord(selectedPdf.deckCsvPath, idx, { word, meaning, meaningEn, meaningVi, pronunciation: ensureIpaSlashes(pronunciation), pos, example })
       await selectPdf(selectedPdf)
     } catch (err) {
       console.error('Edit failed', err)
     }
-  }
-
-  function speak(t:string){
-    try{ const ut = new SpeechSynthesisUtterance(t); window.speechSynthesis.speak(ut) }catch{}
   }
 
   return (
@@ -240,7 +237,7 @@ export default function ManagerPdf() {
                   rows={rows}
                   onDelete={handleDeleteRow}
                   onEdit={handleEditRow}
-                  onSpeak={speak}
+                  onSpeak={speakWord}
                   onRefresh={() => selectPdf(selectedPdf)}
                   currentFile={selectedPdf.deckCsvPath}
                   selected={vocabSelected}
