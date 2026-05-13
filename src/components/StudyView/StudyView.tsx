@@ -8,6 +8,8 @@ import { useLocation } from 'react-router-dom'
 import { usePersistedState } from '../../hooks/usePersistedState'
 import { VocabularyStore, useVocabularyStore } from '../../store/VocabularyStore'
 import type { VocabRecord } from '../../store/VocabularyStore'
+import { playSound } from '../../utils/sounds'
+import { preloadAudio, speakWord } from '../../utils/speech'
 
 function shuffle<T>(a:T[]){
   for(let i=a.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[a[i],a[j]]=[a[j],a[i]]}
@@ -17,12 +19,18 @@ function shuffle<T>(a:T[]){
 type Card = {
   word: string;
   meaning: string;
+  meaningEn?: string;
+  meaningVi?: string;
+  meaningNoteEn?: string;
+  meaningNoteVi?: string;
+  meaningNoteVie?: string;
   pronunciation?: string;
+  pos?: string;
   example?: string;
   source?: string;
 }
 
-type LearnMode = 'all' | 'random' | 'select' | 'range'
+type LearnMode = 'all' | 'random' | 'select' | 'range' | 'unlearned'
 type StudyMode = 'spelling' | 'match'
 type StudyTab = 'custom' | 'smart'
 
@@ -34,6 +42,10 @@ interface SRSCardData {
   key: string
   word: string
   meaning: string
+  meaningEn?: string
+  meaningVi?: string
+  meaningNoteVi?: string
+  meaningNoteVie?: string
   pronunciation?: string
   example?: string
   source?: string
@@ -134,6 +146,10 @@ function cardToSRSData(card: Card): SRSCardData {
     key,
     word: card.word,
     meaning: card.meaning,
+    meaningEn: card.meaningEn || card.meaningNoteEn || '',
+    meaningVi: card.meaningVi || card.meaningNoteVi || card.meaningNoteVie || '',
+    meaningNoteVi: card.meaningVi || card.meaningNoteVi || card.meaningNoteVie || '',
+    meaningNoteVie: card.meaningVi || card.meaningNoteVi || card.meaningNoteVie || '',
     pronunciation: card.pronunciation,
     example: card.example,
     source: card.source,
@@ -156,9 +172,9 @@ function getNewCardsCount(store: SRSStore, allCards: Card[]): number {
 
 type FileStudyConfig = {
   mode: LearnMode
-  randomCount: number
-  rangeStart: number
-  rangeEnd: number
+  randomCount: number | string
+  rangeStart: number | string
+  rangeEnd: number | string
   selectedMap: Record<number, boolean>
 }
 
@@ -171,16 +187,31 @@ type CardId = {
 type StudySessionV1 = {
   v: 1
   phase: 'idle' | 'mode-select' | 'studying' | 'review-result' | 'summary' | 'difficulty-select' | 'match-game' | 'match-summary' | 'srs-studying' | 'srs-review-result' | 'srs-summary'
+  studyMode: StudyMode
+  studyTab: StudyTab
   round?: number
+  srsRound?: number
   selectedFiles: string[]
   fileConfigs: Record<string, FileStudyConfig>
   index: number
+  srsIndex?: number
   revealLevel: number
   lastAnswerCorrect: boolean | null
   stats: { correct: number; incorrect: number; hard: number; easy: number }
+  srsStats?: { reviewed: number; correct: number; incorrect: number }
+  difficultySelectMode?: 'custom' | 'smart'
+  smartDifficultyFromCalendar?: boolean
   deck: CardId[]
   queue: CardId[]
   toReview: CardId[]
+  reviewedWords?: CardId[]
+  wrongInCurrentRoundKeys?: string[]
+  wrongCountByCardKey?: Record<string, number>
+  srsQueueIds?: string[]
+  srsToReviewIds?: string[]
+  srsReviewedIds?: string[]
+  srsWrongInCurrentRoundIds?: string[]
+  srsWrongCountById?: Record<string, number>
 }
 
 export default function Study(){
@@ -202,6 +233,9 @@ export default function Study(){
   const [revealLevel, setRevealLevel] = useState(0) // 0 = all underscores, 1+ = reveal that many chars
   const [input, setInput] = useState("")
   const [phase, setPhase] = useState<'idle'|'mode-select'|'studying'|'review-result'|'summary'|'difficulty-select'|'match-game'|'match-summary'|'srs-studying'|'srs-review-result'|'srs-summary'>('idle')
+  const [showMeaningByDefault, setShowMeaningByDefault] = usePersistedState<boolean>('study_showMeaningByDefault', false)
+  const [showViHint, setShowViHint] = useState(false)
+  const [showSrsViHint, setShowSrsViHint] = useState(false)
   const [studyMode, setStudyMode] = usePersistedState<StudyMode>('study_mode', 'spelling')
   const [studyTab, setStudyTab] = usePersistedState<StudyTab>('study_tab', 'custom')
   const [lastAnswerCorrect, setLastAnswerCorrect] = useState<boolean | null>(null)
@@ -211,9 +245,15 @@ export default function Study(){
   const [stats, setStats] = usePersistedState('study_stats', { correct: 0, incorrect: 0, hard: 0, easy: 0 })
   const inputRef = useRef<HTMLInputElement|null>(null)
   
+  // Prevent double-submit when UI is slow
+  const submittingRef = useRef(false)
+  const srsSubmittingRef = useRef(false)
+  
   // Track words that were wrong in current round (for next round review)
   const [wrongInCurrentRound, setWrongInCurrentRound] = useState<Set<string>>(new Set())
   const wrongInCurrentRoundRef = useRef<Set<string>>(new Set())
+  const [wrongCountByCardKey, setWrongCountByCardKey] = useState<Record<string, number>>({})
+  const wrongCountByCardKeyRef = useRef<Record<string, number>>({})
   
   // Track all reviewed words for difficulty selection at end
   const [reviewedWords, setReviewedWords] = useState<Card[]>([])
@@ -223,10 +263,115 @@ export default function Study(){
   useVocabularyStore()
   const [srsQueue, setSrsQueue] = useState<VocabRecord[]>([])
   const [srsIndex, setSrsIndex] = useState(0)
+  const [srsRound, setSrsRound] = useState(1)
   const [srsStats, setSrsStats] = useState({ reviewed: 0, correct: 0, incorrect: 0 })
   const [difficultySelectMode, setDifficultySelectMode] = useState<'custom' | 'smart'>('custom')
+  const [smartDifficultyFromCalendar, setSmartDifficultyFromCalendar] = useState(false)
   const [srsReviewedWords, setSrsReviewedWords] = useState<VocabRecord[]>([])
   const srsReviewedWordsRef = useRef<VocabRecord[]>([])
+
+  // Smart Review round-based learning (like Custom): wrong in this round -> reviewed in next round
+  const [srsToReview, setSrsToReview] = useState<VocabRecord[]>([])
+  const srsToReviewRef = useRef<VocabRecord[]>([])
+
+  const [smartSyncing, setSmartSyncing] = useState(false)
+
+  const exportSmartReview = useCallback(async () => {
+    try {
+      const raw = localStorage.getItem('vocab_store_v2') || '{}'
+      const savedPath = await window.api.exportSmartReview(raw)
+      if (savedPath) {
+        window.alert(`Đã xuất Smart Review ra file:\n${savedPath}`)
+      }
+    } catch (e: any) {
+      const msg = e && typeof e === 'object' && 'message' in e ? (e as any).message : String(e)
+      window.alert(`Export thất bại: ${msg}`)
+    }
+  }, [])
+
+  const syncSmartReviewMetadata = useCallback(async () => {
+    if (smartSyncing) return
+    const ok = window.confirm('Đồng bộ pos/example từ các file CSV nguồn vào Smart Review?')
+    if (!ok) return
+
+    setSmartSyncing(true)
+    try {
+      const records = VocabularyStore.getAll()
+      const sources = Array.from(new Set(records.map(r => String(r.source || '').trim()).filter(Boolean)))
+
+      // Load CSV rows per source and build a lookup: source -> (word||meaning) -> { pos, example, pronunciation }
+      const perSourceLookup = new Map<string, Map<string, { pos: string; example: string; pronunciation: string }>>()
+      const failedSources: string[] = []
+
+      const normalizeKey = (word: string, meaning: string) => {
+        const w = String(word || '').trim().toLowerCase()
+        const m = String(meaning || '').trim().toLowerCase()
+        return `${w}||${m}`
+      }
+
+      for (const src of sources) {
+        try {
+          const rows = await window.api.readCsv(src)
+          const map = new Map<string, { pos: string; example: string; pronunciation: string }>()
+          for (const row of rows || []) {
+            const w = String((row as any)?.word || '').trim()
+            const m = String((row as any)?.meaning || '').trim()
+            if (!w || !m) continue
+            map.set(normalizeKey(w, m), {
+              pos: String((row as any)?.pos || '').trim(),
+              example: String((row as any)?.example || '').trim(),
+              pronunciation: String((row as any)?.pronunciation || '').trim(),
+            })
+          }
+          perSourceLookup.set(src, map)
+        } catch {
+          failedSources.push(src)
+        }
+      }
+
+      let updated = 0
+      let scanned = 0
+      for (const r of records) {
+        scanned += 1
+        const src = String(r.source || '').trim()
+        if (!src) continue
+        const map = perSourceLookup.get(src)
+        if (!map) continue
+
+        const hit = map.get(normalizeKey(r.word, r.meaning))
+        if (!hit) continue
+
+        const nextPos = String(r.pos || '').trim() ? String(r.pos || '').trim() : hit.pos
+        const nextExample = String(r.example || '').trim() ? String(r.example || '').trim() : hit.example
+        const nextPron = String(r.pronunciation || '').trim() ? String(r.pronunciation || '').trim() : hit.pronunciation
+
+        const changed = nextPos !== String(r.pos || '').trim() || nextExample !== String(r.example || '').trim() || nextPron !== String(r.pronunciation || '').trim()
+        if (!changed) continue
+
+        VocabularyStore.upsert({
+          word: r.word,
+          meaning: r.meaning,
+          source: src,
+          pos: nextPos,
+          example: nextExample,
+          pronunciation: nextPron,
+        })
+        updated += 1
+      }
+
+      const failedNote = failedSources.length ? `\n(Nguồn đọc CSV lỗi: ${failedSources.length})` : ''
+      window.alert(`Đồng bộ xong: cập nhật ${updated} từ (quét ${scanned} từ).${failedNote}`)
+    } catch (e: any) {
+      const msg = e && typeof e === 'object' && 'message' in e ? (e as any).message : String(e)
+      window.alert(`Đồng bộ thất bại: ${msg}`)
+    } finally {
+      setSmartSyncing(false)
+    }
+  }, [smartSyncing])
+  const [srsWrongInCurrentRound, setSrsWrongInCurrentRound] = useState<Set<string>>(new Set())
+  const srsWrongInCurrentRoundRef = useRef<Set<string>>(new Set())
+  const [srsWrongCountById, setSrsWrongCountById] = useState<Record<string, number>>({})
+  const srsWrongCountByIdRef = useRef<Record<string, number>>({})
 
   // Match game state
   const [matchCards, setMatchCards] = useState<Card[]>([])
@@ -248,6 +393,9 @@ export default function Study(){
   const [fileCardsLoading, setFileCardsLoading] = useState<Record<string, boolean>>({})
   const [uiError, setUiError] = useState<string>('')
   const [confirmQuitOpen, setConfirmQuitOpen] = useState(false)
+  
+  // Auto mode: when OFF, pressing Enter auto-advances (correct = pass, wrong = retry)
+  const [autoModeEnabled, setAutoModeEnabled] = usePersistedState<boolean>('study_autoMode', false)
   const [smartCalendarView, setSmartCalendarView] = usePersistedState<'month' | '14days'>('smart_calendar_view', 'month')
 
   const [session, setSession] = usePersistedState<StudySessionV1 | null>('study_session_v1', null)
@@ -259,17 +407,25 @@ export default function Study(){
 
   const isNonRestorablePhase = (p: StudySessionV1['phase']) =>
     p === 'match-game' ||
-    p === 'match-summary' ||
-    p === 'srs-studying' ||
-    p === 'srs-review-result' ||
-    p === 'srs-summary' ||
-    p === 'difficulty-select'
+    p === 'match-summary'
 
   const makeCardKey = (source: string | undefined, word: string, meaning: string) => {
     const s = String(source || '').trim()
     const w = String(word || '').trim().toLowerCase()
     const m = String(meaning || '').trim().toLowerCase()
     return `${s}||${w}||${m}`
+  }
+
+  const dedupeCardsByKey = (cards: Card[]): Card[] => {
+    const seen = new Set<string>()
+    const out: Card[] = []
+    for (const c of cards || []) {
+      const k = makeCardKey(c?.source, String(c?.word || ''), String(c?.meaning || ''))
+      if (!k || seen.has(k)) continue
+      seen.add(k)
+      out.push(c)
+    }
+    return out
   }
 
   const toCardId = (c: Card): CardId => ({
@@ -281,16 +437,31 @@ export default function Study(){
   const buildSessionSnapshot = (): StudySessionV1 => ({
     v: 1,
     phase,
+    studyMode,
+    studyTab,
     round: Number(round) || 1,
+    srsRound: Number(srsRound) || 1,
     selectedFiles: Array.isArray(selectedFiles) ? selectedFiles : [],
     fileConfigs: fileConfigs || {},
     index: Number(index) || 0,
+    srsIndex: Number(srsIndex) || 0,
     revealLevel: Number(revealLevel) || 0,
     lastAnswerCorrect: lastAnswerCorrect ?? null,
     stats,
+    srsStats,
+    difficultySelectMode,
+    smartDifficultyFromCalendar,
     deck: (deck || []).map(toCardId),
     queue: (queue || []).map(toCardId),
     toReview: (toReview || []).map(toCardId),
+    reviewedWords: (reviewedWords || []).map(toCardId),
+    wrongInCurrentRoundKeys: Array.from(wrongInCurrentRound || []),
+    wrongCountByCardKey: { ...(wrongCountByCardKey || {}) },
+    srsQueueIds: (srsQueue || []).map((x) => String(x?.id || '')).filter(Boolean),
+    srsToReviewIds: (srsToReview || []).map((x) => String(x?.id || '')).filter(Boolean),
+    srsReviewedIds: (srsReviewedWords || []).map((x) => String(x?.id || '')).filter(Boolean),
+    srsWrongInCurrentRoundIds: Array.from(srsWrongInCurrentRound || []).map((x) => String(x || '')).filter(Boolean),
+    srsWrongCountById: { ...(srsWrongCountById || {}) },
   })
 
   useEffect(() => {
@@ -302,8 +473,43 @@ export default function Study(){
   }, [wrongInCurrentRound])
 
   useEffect(() => {
+    wrongCountByCardKeyRef.current = wrongCountByCardKey
+  }, [wrongCountByCardKey])
+
+  useEffect(() => {
     reviewedWordsRef.current = reviewedWords
   }, [reviewedWords])
+
+  // Preload pronunciation audio for current/next card to make Speak feel instant.
+  useEffect(() => {
+    try {
+      const w0 = queue?.[index]?.word
+      const w1 = queue?.[index + 1]?.word
+      if (w0) preloadAudio(String(w0))
+      if (w1) preloadAudio(String(w1))
+    } catch (e) {}
+  }, [queue, index])
+
+  useEffect(() => {
+    try {
+      const w0 = srsQueue?.[srsIndex]?.word
+      const w1 = srsQueue?.[srsIndex + 1]?.word
+      if (w0) preloadAudio(String(w0))
+      if (w1) preloadAudio(String(w1))
+    } catch (e) {}
+  }, [srsQueue, srsIndex])
+
+  useEffect(() => {
+    srsToReviewRef.current = srsToReview
+  }, [srsToReview])
+
+  useEffect(() => {
+    srsWrongInCurrentRoundRef.current = srsWrongInCurrentRound
+  }, [srsWrongInCurrentRound])
+
+  useEffect(() => {
+    srsWrongCountByIdRef.current = srsWrongCountById
+  }, [srsWrongCountById])
 
   // Restore an in-progress session on initial mount
   useEffect(() => {
@@ -331,9 +537,18 @@ export default function Study(){
         setSelectedFiles(session.selectedFiles || [])
         setFileConfigs(session.fileConfigs || {})
         if (session.stats) setStats(session.stats)
+        if (session.studyMode) setStudyMode(session.studyMode)
+        if (session.studyTab) setStudyTab(session.studyTab)
+        setDifficultySelectMode(session.difficultySelectMode || 'custom')
+        setSmartDifficultyFromCalendar(Boolean(session.smartDifficultyFromCalendar))
 
         // Rebuild cards by reading sources and matching (source + word + meaning)
-        const allIds: CardId[] = [...(session.deck || []), ...(session.queue || []), ...(session.toReview || [])]
+        const allIds: CardId[] = [
+          ...(session.deck || []),
+          ...(session.queue || []),
+          ...(session.toReview || []),
+          ...(session.reviewedWords || []),
+        ]
         const sources = Array.from(new Set(allIds.map((x) => String(x?.source || '')).filter(Boolean)))
 
         const cardMap = new Map<string, Card>()
@@ -353,6 +568,8 @@ export default function Study(){
               cardMap.get(makeCardKey(src, w, m)) || {
                 word: w,
                 meaning: m,
+                meaningNoteEn: '',
+                meaningNoteVi: '',
                 pronunciation: '',
                 example: '',
                 source: src,
@@ -363,17 +580,54 @@ export default function Study(){
         const restoredDeck = rebuild(session.deck || [])
         const restoredQueue = rebuild(session.queue || [])
         const restoredToReview = rebuild(session.toReview || [])
+        const restoredReviewedWords = rebuild(session.reviewedWords || [])
 
         setDeck(restoredDeck)
         setQueue(restoredQueue)
         setToReview(restoredToReview)
         toReviewRef.current = restoredToReview
+        setReviewedWords(restoredReviewedWords)
+        reviewedWordsRef.current = restoredReviewedWords
+        const restoredWrongSet = new Set((session.wrongInCurrentRoundKeys || []).map((x) => String(x || '')))
+        setWrongInCurrentRound(restoredWrongSet)
+        wrongInCurrentRoundRef.current = restoredWrongSet
+        const restoredWrongCounts = session.wrongCountByCardKey || {}
+        setWrongCountByCardKey(restoredWrongCounts)
+        wrongCountByCardKeyRef.current = restoredWrongCounts
 
         setRound(Number(session.round) || 1)
 
         const maxIdx = Math.max(0, restoredQueue.length - 1)
         const idx = Math.max(0, Math.min(Number(session.index) || 0, maxIdx))
         setIndex(idx)
+
+        // Restore Smart Review state from VocabularyStore records.
+        const vocabById = new Map(VocabularyStore.getAll().map((r) => [String(r.id), r] as const))
+        const restoreVocabByIds = (ids: string[] | undefined) =>
+          (ids || []).map((id) => vocabById.get(String(id || ''))).filter(Boolean) as VocabRecord[]
+
+        const restoredSrsQueue = restoreVocabByIds(session.srsQueueIds)
+        const restoredSrsToReview = restoreVocabByIds(session.srsToReviewIds)
+        const restoredSrsReviewed = restoreVocabByIds(session.srsReviewedIds)
+
+        setSrsQueue(restoredSrsQueue)
+        setSrsToReview(restoredSrsToReview)
+        srsToReviewRef.current = restoredSrsToReview
+        setSrsReviewedWords(restoredSrsReviewed)
+        srsReviewedWordsRef.current = restoredSrsReviewed
+        const restoredSrsWrongSet = new Set((session.srsWrongInCurrentRoundIds || []).map((x) => String(x || '')))
+        setSrsWrongInCurrentRound(restoredSrsWrongSet)
+        srsWrongInCurrentRoundRef.current = restoredSrsWrongSet
+        const restoredSrsWrongCounts = session.srsWrongCountById || {}
+        setSrsWrongCountById(restoredSrsWrongCounts)
+        srsWrongCountByIdRef.current = restoredSrsWrongCounts
+
+        setSrsRound(Number(session.srsRound) || 1)
+        setSrsStats(session.srsStats || { reviewed: 0, correct: 0, incorrect: 0 })
+        const maxSrsIdx = Math.max(0, restoredSrsQueue.length - 1)
+        const safeSrsIdx = Math.max(0, Math.min(Number(session.srsIndex) || 0, maxSrsIdx))
+        setSrsIndex(safeSrsIdx)
+
         setRevealLevel(Number(session.revealLevel) || 0)
         setLastAnswerCorrect(session.lastAnswerCorrect ?? null)
 
@@ -424,7 +678,7 @@ export default function Study(){
 
     return () => window.clearTimeout(t)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [phase, round, selectedFiles, fileConfigs, index, revealLevel, lastAnswerCorrect, stats, queue, deck, toReview])
+    }, [phase, studyMode, studyTab, round, srsRound, selectedFiles, fileConfigs, index, srsIndex, revealLevel, lastAnswerCorrect, stats, srsStats, queue, deck, toReview, reviewedWords, wrongInCurrentRound, wrongCountByCardKey, difficultySelectMode, smartDifficultyFromCalendar, srsQueue, srsToReview, srsReviewedWords, srsWrongInCurrentRound, srsWrongCountById])
 
   // Persist current input with debounce (so it restores mid-typing without rewriting the whole session).
   useEffect(() => {
@@ -443,9 +697,9 @@ export default function Study(){
 
   const defaultFileConfig = (): FileStudyConfig => ({
     mode: 'all',
-    randomCount: 20,
-    rangeStart: 1,
-    rangeEnd: 10,
+    randomCount: '',
+    rangeStart: '',
+    rangeEnd: '',
     selectedMap: {},
   })
 
@@ -488,10 +742,22 @@ export default function Study(){
 
     const mask = word.replace(/\S/g, '_')
 
-    // Prefer whole-word matching for simple A-Z words to avoid masking substrings.
+    // For simple A-Z words, also match word variants (liked, likes, liking for "like")
     if (/^[A-Za-z]+$/.test(word)) {
-      const re = new RegExp(`\\b${escapeRegex(word)}\\b`, 'gi')
-      return example.replace(re, mask)
+      // First try exact whole-word match
+      const exactRe = new RegExp(`\\b${escapeRegex(word)}\\b`, 'gi')
+      if (exactRe.test(example)) {
+        return example.replace(exactRe, mask)
+      }
+      
+      // Try matching word variants: word followed by common suffixes
+      // Match: word + optional suffix (e.g., "like" matches "liked", "likes", "liking", "likely")
+      const variantRe = new RegExp(`\\b(${escapeRegex(word)})(\\w*)\\b`, 'gi')
+      return example.replace(variantRe, (match, base, suffix) => {
+        // Create mask for base word, keep suffix visible
+        const baseMask = base.replace(/\S/g, '_')
+        return baseMask + suffix
+      })
     }
 
     // Fallback: exact substring matching (case-insensitive).
@@ -508,7 +774,13 @@ export default function Study(){
         out.push({
           word: String(r.word),
           meaning: String(r.meaning),
+          meaningEn: String((r as any).meaningEn || (r as any).meaningNoteEn || ''),
+          meaningVi: String((r as any).meaningVi || (r as any).meaningNoteVi || (r as any).meaningNoteVie || ''),
+          meaningNoteEn: String((r as any).meaningEn || (r as any).meaningNoteEn || ''),
+          meaningNoteVi: String((r as any).meaningVi || (r as any).meaningNoteVi || (r as any).meaningNoteVie || ''),
+          meaningNoteVie: String((r as any).meaningVi || (r as any).meaningNoteVi || (r as any).meaningNoteVie || ''),
           pronunciation: ipaCore(r.pronunciation || ''),
+          pos: String((r as any).pos || ''),
           example: String(r.example || ''),
           source: filePath,
         })
@@ -520,19 +792,48 @@ export default function Study(){
     }
   }
 
+  useEffect(() => {
+    setShowViHint(showMeaningByDefault)
+  }, [queue, index, showMeaningByDefault])
+
+  useEffect(() => {
+    setShowSrsViHint(showMeaningByDefault)
+  }, [srsQueue, srsIndex, showMeaningByDefault])
+
   function applyLearnModeForFile(allCards: Card[], cfg: FileStudyConfig): Card[] {
     const mode = cfg?.mode || 'all'
     if (mode === 'all') return allCards
 
+    if (mode === 'unlearned') {
+      // Filter words that haven't been added to SRS yet (state = 'new' or not in VocabularyStore)
+      return allCards.filter(card => {
+        const vocab = VocabularyStore.getAll().find(
+          v => v.word.toLowerCase() === card.word.toLowerCase() && 
+               v.meaning.toLowerCase() === card.meaning.toLowerCase()
+        )
+        // Include if not in store OR state is 'new' (never reviewed)
+        return !vocab || vocab.state === 'new'
+      })
+    }
+
     if (mode === 'random') {
-      const count = Math.max(1, Math.min(Number(cfg.randomCount) || 1, allCards.length))
+      const rawCount = Number(cfg.randomCount)
+      const safeCount = Number.isFinite(rawCount) ? Math.floor(rawCount) : 0
+      const count = Math.min(Math.max(0, safeCount), allCards.length)
+      if (count <= 0) return []
       const shuffled = shuffle([...allCards])
       return shuffled.slice(0, count)
     }
 
     if (mode === 'range') {
-      const start = Math.max(0, (Number(cfg.rangeStart) || 1) - 1)
-      const end = Math.min(allCards.length, Number(cfg.rangeEnd) || allCards.length)
+      const rawStart = Number(cfg.rangeStart)
+      const rawEnd = Number(cfg.rangeEnd)
+      const startIndex = Number.isFinite(rawStart) ? Math.floor(rawStart) - 1 : 0
+      const endIndex = Number.isFinite(rawEnd) ? Math.floor(rawEnd) : allCards.length
+
+      const start = Math.max(0, Math.min(startIndex, allCards.length))
+      const end = Math.max(0, Math.min(endIndex, allCards.length))
+      if (end <= start) return []
       return allCards.slice(start, end)
     }
 
@@ -549,7 +850,76 @@ export default function Study(){
 
     setUiError('')
 
-    // Validate select mode: must pick at least 1 word per select-file
+    // Validate configs before starting
+    for (const f of files) {
+      const cfg = configs?.[f]
+      const cards = fileCardsByPath[f] || []
+      const totalCards = cards.length
+
+      // Validate select mode: must pick at least 1 word
+      if (cfg?.mode === 'select') {
+        const hasAny = Object.values(cfg.selectedMap || {}).some(Boolean)
+        if (!hasAny) {
+          setUiError(`Bạn đang chọn chế độ "tự chọn" nhưng chưa chọn từ nào cho file: ${f}`)
+          return
+        }
+      }
+
+      // Validate random mode
+      if (cfg?.mode === 'random') {
+        const val = cfg.randomCount
+        if (val === '' || val === null || val === undefined) {
+          setUiError(`Chế độ "Random": Vui lòng nhập số lượng từ cho file: ${f}`)
+          return
+        }
+        const num = Number(val)
+        if (!Number.isFinite(num) || num < 1) {
+          setUiError(`Chế độ "Random": Số lượng từ phải là số nguyên dương cho file: ${f}`)
+          return
+        }
+        if (num > totalCards) {
+          setUiError(`Chế độ "Random": Số lượng (${num}) vượt quá tổng số từ (${totalCards}) cho file: ${f}`)
+          return
+        }
+      }
+
+      // Validate range mode
+      if (cfg?.mode === 'range') {
+        const startVal = cfg.rangeStart
+        const endVal = cfg.rangeEnd
+
+        if (startVal === '' || startVal === null || startVal === undefined) {
+          setUiError(`Chế độ "Range": Vui lòng nhập vị trí bắt đầu cho file: ${f}`)
+          return
+        }
+        if (endVal === '' || endVal === null || endVal === undefined) {
+          setUiError(`Chế độ "Range": Vui lòng nhập vị trí kết thúc cho file: ${f}`)
+          return
+        }
+
+        const startNum = Number(startVal)
+        const endNum = Number(endVal)
+
+        if (!Number.isFinite(startNum) || startNum < 1) {
+          setUiError(`Chế độ "Range": Vị trí bắt đầu phải là số nguyên dương cho file: ${f}`)
+          return
+        }
+        if (!Number.isFinite(endNum) || endNum < 1) {
+          setUiError(`Chế độ "Range": Vị trí kết thúc phải là số nguyên dương cho file: ${f}`)
+          return
+        }
+        if (startNum > endNum) {
+          setUiError(`Chế độ "Range": Vị trí bắt đầu (${startNum}) không được lớn hơn kết thúc (${endNum}) cho file: ${f}`)
+          return
+        }
+        if (endNum > totalCards) {
+          setUiError(`Chế độ "Range": Vị trí kết thúc (${endNum}) vượt quá tổng số từ (${totalCards}) cho file: ${f}`)
+          return
+        }
+      }
+    }
+
+    // Validate passed - proceed with session
     for (const f of files) {
       const cfg = configs?.[f]
       if (cfg?.mode === 'select') {
@@ -578,6 +948,9 @@ export default function Study(){
       startMatchGame(shuffled)
     } else {
       // Spelling mode (default)
+      // Reset reviewed words for this session (so difficulty rating matches this session only)
+      setReviewedWords([])
+      reviewedWordsRef.current = []
       setQueue(shuffled.slice())
       setIndex(0)
       setRound(1)
@@ -588,16 +961,40 @@ export default function Study(){
       setLastAnswerCorrect(null)
       setInput('')
       setStats({ correct: 0, incorrect: 0, hard: 0, easy: 0 })
+      setWrongCountByCardKey({})
+      wrongCountByCardKeyRef.current = {}
     }
   }
 
   function maskWordAllUnderscore(w:string, revealCount:number){
     if (!w) return ''
+    
+    // Split by spaces to handle phrases (multiple words)
+    const words = w.split(' ')
+    
+    if (words.length > 1) {
+      // It's a phrase - mask each word separately
+      let revealed = 0
+      const maskedWords = words.map(word => {
+        const chars = word.split('')
+        const masked = chars.map(ch => {
+          if (revealed < revealCount) {
+            revealed++
+            return ch
+          }
+          return '_'
+        }).join('')  // No space between chars in same word
+        return masked
+      })
+      return maskedWords.join('   ')  // Triple space between words for clarity
+    }
+    
+    // Single word - chars close together
     const chars = w.split('')
-    if (revealCount <= 0) return chars.map(()=> '_').join(' ')
+    if (revealCount <= 0) return chars.map(()=> '_').join('')
     const total = chars.length
     const reveal = Math.min(total, revealCount)
-    return chars.map((ch,i)=> i < reveal ? ch : '_').join(' ')
+    return chars.map((ch,i)=> i < reveal ? ch : '_').join('')
   }
 
   async function lookupIPA(word:string){
@@ -651,25 +1048,56 @@ export default function Study(){
   }
 
   // handle submit answer
-  async function submitAnswer(){
+  function submitAnswer(){
     if (phase !== 'studying') return
+    if (submittingRef.current) return  // Prevent double-submit
+    submittingRef.current = true
+    
     const card = queue[index]
-    if (!card) return
-    const normalized = (input||'').trim().toLowerCase()
-    const correct = (card.word||'').trim().toLowerCase()
+    if (!card) {
+      submittingRef.current = false
+      return
+    }
+    // Normalize: trim, lowercase, collapse multiple spaces, normalize unicode whitespace
+    const normalizeAnswer = (s: string) => 
+      (s || '').trim().toLowerCase()
+        .replace(/[\u00A0\u2000-\u200B\u202F\u205F\u3000]/g, ' ') // Convert special spaces to regular space
+        .replace(/\s+/g, ' ') // Collapse multiple spaces
+        .trim()
+    const normalized = normalizeAnswer(input)
+    const correct = normalizeAnswer(card.word)
     const isCorrect = normalized === correct
     setLastAnswerCorrect(isCorrect)
-    // if pronunciation missing, try lookup
+    
+    // IPA lookup in background - don't block UI
     if (!ipaCore(card.pronunciation || '')) {
-      const ipa = await lookupIPA(card.word)
-      if (ipa) card.pronunciation = ipaCore(ipa)
+      lookupIPA(card.word).then(ipa => {
+        if (ipa) card.pronunciation = ipaCore(ipa)
+      }).catch(() => {})
     }
+    
+    // ✅ Track ALL reviewed words for difficulty selection (not just wrong ones)
+    const cardKey = makeCardKey(card.source, card.word, card.meaning)
+    const alreadyTracked = reviewedWordsRef.current.some(
+      c => makeCardKey(c.source, c.word, c.meaning) === cardKey
+    )
+    if (!alreadyTracked) {
+      const next = [...reviewedWordsRef.current, card]
+      reviewedWordsRef.current = next
+      setReviewedWords(next)
+    }
+    
     if (isCorrect) {
       setStats((s) => ({ ...s, correct: s.correct + 1 }))
+      playSound('correct')
     } else {
       setStats((s) => ({ ...s, incorrect: s.incorrect + 1 }))
+      playSound('incorrect')
+      setWrongCountByCardKey((prev) => ({
+        ...(prev || {}),
+        [cardKey]: Number(prev?.[cardKey] || 0) + 1,
+      }))
       // ✅ NEW: Mark as wrong in current round (will be reviewed next round)
-      const cardKey = makeCardKey(card.source, card.word, card.meaning)
       setWrongInCurrentRound(prev => {
         const next = new Set(prev)
         next.add(cardKey)
@@ -677,6 +1105,9 @@ export default function Study(){
       })
     }
     setPhase('review-result')
+    
+    // Reset submitting flag after state update
+    setTimeout(() => { submittingRef.current = false }, 50)
   }
 
   // ==================== NEW ROUND-BASED LEARNING ====================
@@ -698,16 +1129,6 @@ export default function Study(){
     if (!card) return
     
     const cardKey = makeCardKey(card.source, card.word, card.meaning)
-    
-    // ✅ Track reviewed words for difficulty selection at end
-    const alreadyTracked = reviewedWordsRef.current.some(
-      c => makeCardKey(c.source, c.word, c.meaning) === cardKey
-    )
-    if (!alreadyTracked) {
-      const next = [...reviewedWordsRef.current, card]
-      reviewedWordsRef.current = next
-      setReviewedWords(next)
-    }
     
     // ✅ If wrong in current round, add to next round's review list
     if (wrongInCurrentRoundRef.current.has(cardKey)) {
@@ -762,8 +1183,19 @@ export default function Study(){
 
     // ✅ Done: Go to difficulty selection phase instead of summary
     setIndex(0)
+
+    // Make sure the rating list matches the session deck (all cards in this session),
+    // even if reviewedWords tracking missed some cards across rounds.
+    // NOTE: Do NOT dedupe here; if the session shows 76 cards, user must be able to rate 76.
+    const sessionAll = Array.isArray(deck) ? [...deck] : []
+    if (sessionAll.length > 0) {
+      setReviewedWords(sessionAll)
+      reviewedWordsRef.current = sessionAll
+    }
+
     setDifficultySelectMode('custom')
     setPhase('difficulty-select')
+    playSound('success')
   }
 
   function quitStudy(){
@@ -785,8 +1217,13 @@ export default function Study(){
     // Reset round-based learning state
     setWrongInCurrentRound(new Set())
     wrongInCurrentRoundRef.current = new Set()
+    setWrongCountByCardKey({})
+    wrongCountByCardKeyRef.current = {}
     setReviewedWords([])
     reviewedWordsRef.current = []
+    // Reset submitting flags
+    submittingRef.current = false
+    srsSubmittingRef.current = false
     // Reset match game state
     if (matchTimerRef.current) {
       window.clearInterval(matchTimerRef.current)
@@ -806,9 +1243,16 @@ export default function Study(){
     // Reset SRS state
     setSrsQueue([])
     setSrsIndex(0)
+    setSrsRound(1)
     setSrsStats({ reviewed: 0, correct: 0, incorrect: 0 })
     setSrsReviewedWords([])
     srsReviewedWordsRef.current = []
+    setSrsToReview([])
+    srsToReviewRef.current = []
+    setSrsWrongInCurrentRound(new Set())
+    srsWrongInCurrentRoundRef.current = new Set()
+    setSrsWrongCountById({})
+    srsWrongCountByIdRef.current = {}
     setDifficultySelectMode('custom')
   }
 
@@ -913,6 +1357,7 @@ export default function Study(){
     if (isCorrect) {
       setMatchCorrect(c => c + 1)
       setLastMatchResult('correct')
+      playSound('correct')
       // Mark as matched
       setMatchWords(prev => prev.map(w => w.id === wordId ? { ...w, matched: true } : w))
       setMatchMeanings(prev => prev.map(m => m.id === meaningId ? { ...m, matched: true } : m))
@@ -931,6 +1376,7 @@ export default function Study(){
             }
             // Vocabulary is persisted via DifficultySelector after Custom Study.
             setPhase('match-summary')
+            playSound('success')
           } else {
             setMatchRound(nextRound)
             loadMatchRound(matchCards, nextRound)
@@ -940,6 +1386,7 @@ export default function Study(){
     } else {
       setMatchIncorrect(c => c + 1)
       setLastMatchResult('incorrect')
+      playSound('incorrect')
     }
     
     setSelectedWord(null)
@@ -968,6 +1415,136 @@ export default function Study(){
 
   // Calendar and schedule actions are handled by ReviewCalendar via VocabularyStore
 
+  // Start a Smart Review session from a selected calendar day, optionally limited to N words.
+  function startSmartDifficultySelectByDate(dateStr: string, limit?: number) {
+    const v = String(dateStr || '').trim()
+    const m = v.match(/^(\d{4})-(\d{2})-(\d{2})$/)
+    if (!m) {
+      setUiError('Ngày không hợp lệ để học trước.')
+      return
+    }
+
+    const y = Number(m[1])
+    const mo = Number(m[2])
+    const d = Number(m[3])
+    const start = new Date(y, mo - 1, d)
+    start.setHours(0, 0, 0, 0)
+    const startMs = start.getTime()
+    const endMs = startMs + 24 * 60 * 60 * 1000
+
+    const wordsOfDay = VocabularyStore.getAll().filter((r) => {
+      const nr = Number(r.nextReviewDate || 0)
+      return r.state !== 'new' && nr >= startMs && nr < endMs
+    })
+
+    if (wordsOfDay.length === 0) {
+      setUiError('Không có từ nào trong ngày này để học trước.')
+      return
+    }
+
+    const rawLimit = Number(limit)
+    const safeLimit = Number.isFinite(rawLimit)
+      ? Math.max(1, Math.min(wordsOfDay.length, Math.floor(rawLimit)))
+      : wordsOfDay.length
+    const selectedWords = shuffle([...wordsOfDay]).slice(0, safeLimit)
+
+    setUiError('')
+    setDifficultySelectMode('smart')
+    setSmartDifficultyFromCalendar(false)
+    setSrsQueue(selectedWords)
+    setSrsIndex(0)
+    setSrsRound(1)
+    setSrsStats({ reviewed: 0, correct: 0, incorrect: 0 })
+    setSrsReviewedWords([])
+    srsReviewedWordsRef.current = []
+    setSrsToReview([])
+    srsToReviewRef.current = []
+    setSrsWrongInCurrentRound(new Set())
+    srsWrongInCurrentRoundRef.current = new Set()
+    setSrsWrongCountById({})
+    srsWrongCountByIdRef.current = {}
+    setInput('')
+    setRevealLevel(0)
+    setLastAnswerCorrect(null)
+    setPhase('srs-studying')
+  }
+
+  // Helper to get today's start timestamp
+  const getTodayStart = () => {
+    const d0 = new Date()
+    d0.setHours(0, 0, 0, 0)
+    return d0.getTime()
+  }
+
+  // Calculate overdue and today cards for display
+  const srsCardBreakdown = (() => {
+    const dueCards = VocabularyStore.getDueCards()
+    const todayStart = getTodayStart()
+    const tomorrowStart = todayStart + 24 * 60 * 60 * 1000
+    
+    const overdueCards = dueCards.filter(c => (c.nextReviewDate || 0) < todayStart)
+    const todayCards = dueCards.filter(c => {
+      const nr = c.nextReviewDate || 0
+      return nr >= todayStart && nr < tomorrowStart
+    })
+    
+    return { overdueCards, todayCards, allDue: dueCards }
+  })()
+
+  // Start SRS session with all due cards (overdue + today)
+  async function startSRSSessionAll() {
+    const dueCards = srsCardBreakdown.allDue
+    
+    if (dueCards.length === 0) {
+      setUiError('Không có từ nào cần ôn!')
+      return
+    }
+
+    setSrsQueue(shuffle([...dueCards]))
+    setSrsIndex(0)
+    setSrsRound(1)
+    setSrsStats({ reviewed: 0, correct: 0, incorrect: 0 })
+    setSrsReviewedWords([])
+    srsReviewedWordsRef.current = []
+    setSrsToReview([])
+    srsToReviewRef.current = []
+    setSrsWrongInCurrentRound(new Set())
+    srsWrongInCurrentRoundRef.current = new Set()
+    setSrsWrongCountById({})
+    srsWrongCountByIdRef.current = {}
+    setInput('')
+    setRevealLevel(0)
+    setLastAnswerCorrect(null)
+    setPhase('srs-studying')
+  }
+
+  // Start SRS session with only today's cards (exclude overdue)
+  async function startSRSSessionTodayOnly() {
+    const todayCards = srsCardBreakdown.todayCards
+    
+    if (todayCards.length === 0) {
+      setUiError('Không có từ nào đến hạn hôm nay!')
+      return
+    }
+
+    setSrsQueue(shuffle([...todayCards]))
+    setSrsIndex(0)
+    setSrsRound(1)
+    setSrsStats({ reviewed: 0, correct: 0, incorrect: 0 })
+    setSrsReviewedWords([])
+    srsReviewedWordsRef.current = []
+    setSrsToReview([])
+    srsToReviewRef.current = []
+    setSrsWrongInCurrentRound(new Set())
+    srsWrongInCurrentRoundRef.current = new Set()
+    setSrsWrongCountById({})
+    srsWrongCountByIdRef.current = {}
+    setInput('')
+    setRevealLevel(0)
+    setLastAnswerCorrect(null)
+    setPhase('srs-studying')
+  }
+
   // Start SRS session - CHỈ ôn các từ đã học qua Custom Study
   async function startSRSSession() {
     const dueCards = VocabularyStore.getDueCards()
@@ -983,9 +1560,16 @@ export default function Study(){
 
     setSrsQueue(shuffle([...dueCards]))
     setSrsIndex(0)
+    setSrsRound(1)
     setSrsStats({ reviewed: 0, correct: 0, incorrect: 0 })
     setSrsReviewedWords([])
     srsReviewedWordsRef.current = []
+    setSrsToReview([])
+    srsToReviewRef.current = []
+    setSrsWrongInCurrentRound(new Set())
+    srsWrongInCurrentRoundRef.current = new Set()
+    setSrsWrongCountById({})
+    srsWrongCountByIdRef.current = {}
     setInput('')
     setRevealLevel(0)
     setLastAnswerCorrect(null)
@@ -995,31 +1579,68 @@ export default function Study(){
   // Custom Study feeds Smart Review via DifficultySelector (VocabularyStore).
 
   // Handle SRS answer submission
-  async function submitSRSAnswer() {
+  function submitSRSAnswer() {
     if (phase !== 'srs-studying') return
-    const card = srsQueue[srsIndex]
-    if (!card) return
+    if (srsSubmittingRef.current) return  // Prevent double-submit
+    srsSubmittingRef.current = true
     
-    const normalized = (input || '').trim().toLowerCase()
-    const correct = (card.word || '').trim().toLowerCase()
+    const card = srsQueue[srsIndex]
+    if (!card) {
+      srsSubmittingRef.current = false
+      return
+    }
+    
+    // Normalize: trim, lowercase, collapse multiple spaces, normalize unicode whitespace
+    const normalizeAnswer = (s: string) => 
+      (s || '').trim().toLowerCase()
+        .replace(/[\u00A0\u2000-\u200B\u202F\u205F\u3000]/g, ' ') // Convert special spaces to regular space
+        .replace(/\s+/g, ' ') // Collapse multiple spaces
+        .trim()
+    const normalized = normalizeAnswer(input)
+    const correct = normalizeAnswer(card.word)
     const isCorrect = normalized === correct
     
     setLastAnswerCorrect(isCorrect)
     
-    // Lookup IPA if missing
+    // Play sound based on result
+    if (isCorrect) {
+      playSound('correct')
+    } else {
+      playSound('incorrect')
+      const idKey = String(card.id || '')
+      setSrsWrongCountById((prev) => ({
+        ...(prev || {}),
+        [idKey]: Number(prev?.[idKey] || 0) + 1,
+      }))
+      // Mark wrong in current round so it must appear again next round (even if user retries later)
+      const k = String(card.id)
+      setSrsWrongInCurrentRound(prev => {
+        const next = new Set(prev)
+        next.add(k)
+        return next
+      })
+    }
+    
+    // IPA lookup in background - don't block UI
     if (!ipaCore(card.pronunciation || '')) {
-      const ipa = await lookupIPA(card.word)
-      if (ipa) {
-        VocabularyStore.upsert({
-          word: card.word,
-          meaning: card.meaning,
-          pronunciation: ipaCore(ipa),
-          source: card.source,
-        })
-      }
+      lookupIPA(card.word).then(ipa => {
+        if (ipa) {
+          VocabularyStore.upsert({
+            word: card.word,
+            meaning: card.meaning,
+            meaningNoteVi: (card as any).meaningNoteVi,
+            meaningNoteVie: (card as any).meaningNoteVie || (card as any).meaningNoteVi,
+            pronunciation: ipaCore(ipa),
+            source: card.source,
+          })
+        }
+      }).catch(() => {})
     }
 
     setPhase('srs-review-result')
+    
+    // Reset submitting flag after state update
+    setTimeout(() => { srsSubmittingRef.current = false }, 50)
   }
 
   // Smart Review: per-card only 2 choices: Làm lại / Cho qua.
@@ -1057,6 +1678,18 @@ export default function Study(){
       setSrsReviewedWords(next)
     }
 
+    // Round-based behavior: wrong in this round -> queue for next round
+    const k = String(card.id)
+    if (srsWrongInCurrentRoundRef.current.has(k)) {
+      const prev = srsToReviewRef.current || []
+      const exists = prev.some((c) => c.id === card.id)
+      if (!exists) {
+        const next = [...prev, card]
+        srsToReviewRef.current = next
+        setSrsToReview(next)
+      }
+    }
+
     advanceAfterSRSResult()
   }
 
@@ -1071,10 +1704,25 @@ export default function Study(){
       setPhase('srs-studying')
       return
     }
+
+    // End of round -> next round is the accumulated review list
+    const reviewCards = srsToReviewRef.current || []
+    if (reviewCards.length > 0) {
+      setSrsQueue(shuffle([...reviewCards]))
+      setSrsToReview([])
+      srsToReviewRef.current = []
+      setSrsWrongInCurrentRound(new Set())
+      srsWrongInCurrentRoundRef.current = new Set()
+      setSrsIndex(0)
+      setSrsRound((r) => (Number(r) || 1) + 1)
+      setPhase('srs-studying')
+      return
+    }
     
     // Session complete
     setDifficultySelectMode('smart')
     setPhase('difficulty-select')
+    playSound('success')
   }
 
   // Format next review time
@@ -1097,9 +1745,39 @@ export default function Study(){
 
   // Keyboard handling: only keep a global listener for result shortcuts (1/2/3/4).
   // Enter submit is handled on the input itself to avoid global listeners reacting to typing.
+  // When autoModeEnabled is OFF, Enter key auto-advances: correct=pass, wrong=retry
   useEffect(() => {
     if (phase !== 'review-result' && phase !== 'srs-review-result') return
     const onKey = (e: KeyboardEvent) => {
+      // Auto mode OFF: Enter key triggers automatic action
+      if (!autoModeEnabled && e.key === 'Enter') {
+        e.preventDefault()
+        e.stopPropagation()
+        if (e.repeat) return
+        
+        const active = document.activeElement
+        if (
+          active instanceof HTMLElement &&
+          (active.tagName === 'INPUT' ||
+            active.tagName === 'TEXTAREA' ||
+            active.isContentEditable)
+        ) {
+          active.blur()
+        }
+        
+        if (phase === 'srs-review-result') {
+          // Smart Review: correct = pass, wrong = retry
+          if (lastAnswerCorrect) handleSRSPass()
+          else handleSRSRetry()
+        } else {
+          // Custom Study: correct = pass, wrong = retry
+          if (lastAnswerCorrect) handlePass()
+          else handleRetry()
+        }
+        return
+      }
+      
+      // Manual mode: number keys 1/2
       const validKeys = phase === 'srs-review-result' 
         ? ['1', '2'] 
         : ['1', '2', '3']
@@ -1130,8 +1808,7 @@ export default function Study(){
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [phase])
+  }, [phase, autoModeEnabled, lastAnswerCorrect])
 
   // Keep typing responsive: focus the input when starting/advancing in studying phase.
   useEffect(() => {
@@ -1405,61 +2082,83 @@ export default function Study(){
                       {checked && (
                         <div className="mt-4 pl-8">
                           <div className="text-sm font-semibold text-slate-700 dark:text-slate-300 mb-2">Choose Learning Mode (per file)</div>
-                          <div className="grid grid-cols-2 gap-2">
+                          <div className="flex flex-col gap-2">
+                            {/* Top row: All and Random */}
+                            <div className="grid grid-cols-2 gap-2">
+                              <button
+                                type="button"
+                                onClick={() => updateFileConfig(f.path, { mode: 'all' })}
+                                className={`p-3 rounded-lg border-2 transition-all ${
+                                  cfg.mode === 'all'
+                                    ? 'border-violet-500 bg-white dark:bg-slate-700 font-semibold text-violet-700 dark:text-violet-300'
+                                    : 'border-slate-200 dark:border-slate-600 hover:border-slate-300 dark:hover:border-slate-500 bg-white dark:bg-slate-800'
+                                }`}
+                              >
+                                📚 All
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => updateFileConfig(f.path, { mode: 'random' })}
+                                className={`p-3 rounded-lg border-2 transition-all ${
+                                  cfg.mode === 'random'
+                                    ? 'border-violet-500 bg-white dark:bg-slate-700 font-semibold text-violet-700 dark:text-violet-300'
+                                    : 'border-slate-200 dark:border-slate-600 hover:border-slate-300 dark:hover:border-slate-500 bg-white dark:bg-slate-800'
+                                }`}
+                              >
+                                🎲 Random
+                              </button>
+                            </div>
+                            
+                            {/* Center: Unlearned - highlighted */}
                             <button
                               type="button"
-                              onClick={() => updateFileConfig(f.path, { mode: 'all' })}
+                              onClick={() => updateFileConfig(f.path, { mode: 'unlearned' })}
                               className={`p-3 rounded-lg border-2 transition-all ${
-                                cfg.mode === 'all'
-                                  ? 'border-violet-500 bg-white dark:bg-slate-700 font-semibold text-violet-700 dark:text-violet-300'
-                                  : 'border-slate-200 dark:border-slate-600 hover:border-slate-300 dark:hover:border-slate-500 bg-white dark:bg-slate-800'
+                                cfg.mode === 'unlearned'
+                                  ? 'border-emerald-500 bg-emerald-50 dark:bg-emerald-900/30 font-semibold text-emerald-700 dark:text-emerald-300'
+                                  : 'border-emerald-200 dark:border-emerald-800 hover:border-emerald-400 dark:hover:border-emerald-600 bg-emerald-50/50 dark:bg-emerald-900/20'
                               }`}
                             >
-                              1. All
+                              ✨ Unlearned Only
+                              <span className="block text-xs font-normal opacity-75">Từ chưa học / chưa ôn tập</span>
                             </button>
-                            <button
-                              type="button"
-                              onClick={() => updateFileConfig(f.path, { mode: 'random' })}
-                              className={`p-3 rounded-lg border-2 transition-all ${
-                                cfg.mode === 'random'
-                                  ? 'border-violet-500 bg-white dark:bg-slate-700 font-semibold text-violet-700 dark:text-violet-300'
-                                  : 'border-slate-200 dark:border-slate-600 hover:border-slate-300 dark:hover:border-slate-500 bg-white dark:bg-slate-800'
-                              }`}
-                            >
-                              2. Random
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => updateFileConfig(f.path, { mode: 'select' })}
-                              className={`p-3 rounded-lg border-2 transition-all ${
-                                cfg.mode === 'select'
-                                  ? 'border-violet-500 bg-white dark:bg-slate-700 font-semibold text-violet-700 dark:text-violet-300'
-                                  : 'border-slate-200 dark:border-slate-600 hover:border-slate-300 dark:hover:border-slate-500 bg-white dark:bg-slate-800'
-                              }`}
-                            >
-                              3. Select
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => updateFileConfig(f.path, { mode: 'range' })}
-                              className={`p-3 rounded-lg border-2 transition-all ${
-                                cfg.mode === 'range'
-                                  ? 'border-violet-500 bg-white dark:bg-slate-700 font-semibold text-violet-700 dark:text-violet-300'
-                                  : 'border-slate-200 dark:border-slate-600 hover:border-slate-300 dark:hover:border-slate-500 bg-white dark:bg-slate-800'
-                              }`}
-                            >
-                              4. Range
-                            </button>
+                            
+                            {/* Bottom row: Select and Range */}
+                            <div className="grid grid-cols-2 gap-2">
+                              <button
+                                type="button"
+                                onClick={() => updateFileConfig(f.path, { mode: 'select' })}
+                                className={`p-3 rounded-lg border-2 transition-all ${
+                                  cfg.mode === 'select'
+                                    ? 'border-violet-500 bg-white dark:bg-slate-700 font-semibold text-violet-700 dark:text-violet-300'
+                                    : 'border-slate-200 dark:border-slate-600 hover:border-slate-300 dark:hover:border-slate-500 bg-white dark:bg-slate-800'
+                                }`}
+                              >
+                                ☑️ Select
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => updateFileConfig(f.path, { mode: 'range' })}
+                                className={`p-3 rounded-lg border-2 transition-all ${
+                                  cfg.mode === 'range'
+                                    ? 'border-violet-500 bg-white dark:bg-slate-700 font-semibold text-violet-700 dark:text-violet-300'
+                                    : 'border-slate-200 dark:border-slate-600 hover:border-slate-300 dark:hover:border-slate-500 bg-white dark:bg-slate-800'
+                                }`}
+                              >
+                                📏 Range
+                              </button>
+                            </div>
                           </div>
 
                           {cfg.mode === 'random' && (
                             <div className="mt-3 p-3 bg-white dark:bg-slate-800 rounded-lg border border-slate-200 dark:border-slate-600">
                               <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2">Random Count:</label>
                               <input
-                                type="number"
-                                min={1}
+                                type="text"
+                                inputMode="numeric"
                                 value={cfg.randomCount}
-                                onChange={(e) => updateFileConfig(f.path, { randomCount: Math.max(1, parseInt(e.target.value) || 1) })}
+                                onChange={(e) => updateFileConfig(f.path, { randomCount: e.target.value })}
+                                placeholder="Nhập số lượng..."
                                 className="input-field"
                               />
                             </div>
@@ -1469,18 +2168,20 @@ export default function Study(){
                             <div className="mt-3 p-3 bg-white dark:bg-slate-800 rounded-lg border border-slate-200 dark:border-slate-600 space-y-2">
                               <label className="block text-sm font-medium text-slate-700 dark:text-slate-300">Range From:</label>
                               <input
-                                type="number"
-                                min={1}
+                                type="text"
+                                inputMode="numeric"
                                 value={cfg.rangeStart}
-                                onChange={(e) => updateFileConfig(f.path, { rangeStart: Math.max(1, parseInt(e.target.value) || 1) })}
+                                onChange={(e) => updateFileConfig(f.path, { rangeStart: e.target.value })}
+                                placeholder="Từ vị trí..."
                                 className="input-field"
                               />
                               <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mt-2">Range To:</label>
                               <input
-                                type="number"
-                                min={1}
+                                type="text"
+                                inputMode="numeric"
                                 value={cfg.rangeEnd}
-                                onChange={(e) => updateFileConfig(f.path, { rangeEnd: Math.max(1, parseInt(e.target.value) || 1) })}
+                                onChange={(e) => updateFileConfig(f.path, { rangeEnd: e.target.value })}
+                                placeholder="Đến vị trí..."
                                 className="input-field"
                               />
                               <div className="text-xs text-slate-500 dark:text-slate-400">Max: {cards.length}</div>
@@ -1495,7 +2196,7 @@ export default function Study(){
                               ) : cards.length === 0 ? (
                                 <div className="text-sm text-slate-500 dark:text-slate-400">No words found in this file.</div>
                               ) : (
-                                <div className="max-h-56 overflow-y-auto">
+                                <div className="max-h-[18rem] overflow-y-auto pr-1">
                                   <table className="w-full text-left text-sm">
                                     <thead className="bg-slate-100 dark:bg-slate-700 border-b border-slate-200 dark:border-slate-600">
                                       <tr>
@@ -1620,13 +2321,30 @@ export default function Study(){
           {/* Smart Review Tab */}
           {studyTab === 'smart' && (
             <div className="card animate-scale-in">
-              <div className="card-header text-2xl">
+              <div className="card-header text-2xl flex items-center gap-3">
                 <div className="w-10 h-10 bg-gradient-to-br from-emerald-500 to-teal-600 rounded-xl flex items-center justify-center shadow-lg shadow-emerald-500/30">
                   <svg className="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
                   </svg>
                 </div>
-                Smart Review (Spaced Repetition)
+                <span>Smart Review (Spaced Repetition)</span>
+
+                <button
+                  type="button"
+                  onClick={exportSmartReview}
+                  className="ml-auto btn-secondary px-4 py-2 text-sm"
+                >
+                  Xuất dữ liệu
+                </button>
+
+                <button
+                  type="button"
+                  onClick={syncSmartReviewMetadata}
+                  disabled={smartSyncing}
+                  className="btn-secondary px-4 py-2 text-sm disabled:opacity-60"
+                >
+                  {smartSyncing ? 'Đang đồng bộ…' : 'Đồng bộ'}
+                </button>
               </div>
 
               {/* SRS Info */}
@@ -1707,6 +2425,7 @@ export default function Study(){
 
                   <ReviewCalendar
                     view={smartCalendarView}
+                    onStartReview={startSmartDifficultySelectByDate}
                   />
                 </div>
               )}
@@ -1751,16 +2470,37 @@ export default function Study(){
                   </button>
                 </div>
               ) : (
-                <button
-                  onClick={startSRSSession}
-                  className="w-full py-4 text-xl flex items-center justify-center gap-3 shadow-xl hover:shadow-2xl rounded-xl font-semibold transition-all bg-gradient-to-r from-emerald-500 to-teal-600 text-white hover:from-emerald-600 hover:to-teal-700"
-                >
-                  <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                  </svg>
-                  Bắt đầu ôn tập ({srsStatsComputed.due} từ)
-                </button>
+                <div className="flex flex-col gap-3">
+                  {/* Button 1: All due (overdue + today) */}
+                  <button
+                    onClick={startSRSSessionAll}
+                    className="w-full py-4 text-lg flex items-center justify-center gap-3 shadow-xl hover:shadow-2xl rounded-xl font-semibold transition-all bg-gradient-to-r from-emerald-500 to-teal-600 text-white hover:from-emerald-600 hover:to-teal-700"
+                  >
+                    <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                    </svg>
+                    Ôn tất cả ({srsCardBreakdown.allDue.length} từ)
+                    {srsCardBreakdown.overdueCards.length > 0 && (
+                      <span className="ml-1 px-2 py-0.5 bg-red-500/20 text-red-100 text-sm rounded-full">
+                        {srsCardBreakdown.overdueCards.length} quá hạn
+                      </span>
+                    )}
+                  </button>
+                  
+                  {/* Button 2: Today only - only show if there are today cards */}
+                  {srsCardBreakdown.todayCards.length > 0 && (
+                    <button
+                      onClick={startSRSSessionTodayOnly}
+                      className="w-full py-3 text-base flex items-center justify-center gap-2 shadow-lg hover:shadow-xl rounded-xl font-medium transition-all bg-gradient-to-r from-blue-500 to-indigo-600 text-white hover:from-blue-600 hover:to-indigo-700"
+                    >
+                      <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                      </svg>
+                      Chỉ ôn hôm nay ({srsCardBreakdown.todayCards.length} từ)
+                    </button>
+                  )}
+                </div>
               )}
             </div>
           )}
@@ -1827,6 +2567,36 @@ export default function Study(){
                 </div>
               </div>
             </div>
+
+            {/* Auto Mode Toggle */}
+            <div className="mt-4 pt-4 border-t border-slate-200 dark:border-slate-700 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <span className="text-sm font-medium text-slate-600 dark:text-slate-400">Chế độ chọn thủ công</span>
+                <div className="relative group">
+                  <svg className="w-4 h-4 text-slate-400 cursor-help" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                  </svg>
+                  <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 px-3 py-2 bg-slate-800 text-white text-xs rounded-lg opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none whitespace-nowrap z-50">
+                    <div className="font-semibold mb-1">Bật: Hiện 2 nút Làm lại / Cho qua</div>
+                    <div>Tắt: Enter tự động (đúng→qua, sai→làm lại)</div>
+                  </div>
+                </div>
+              </div>
+              <button
+                onClick={() => setAutoModeEnabled(!autoModeEnabled)}
+                className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                  autoModeEnabled 
+                    ? 'bg-violet-600' 
+                    : 'bg-slate-300 dark:bg-slate-600'
+                }`}
+              >
+                <span
+                  className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform shadow-md ${
+                    autoModeEnabled ? 'translate-x-6' : 'translate-x-1'
+                  }`}
+                />
+              </button>
+            </div>
           </div>
 
           {/* Study Card - Enhanced with better design */}
@@ -1843,17 +2613,68 @@ export default function Study(){
                 <svg className="w-5 h-5 text-purple-600 dark:text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 5h12M9 3v2m1.048 9.5A18.022 18.022 0 016.412 9m6.088 9h7M11 21l5-10 5 10M12.751 5C11.783 10.77 8.07 15.61 3 18.129" />
                 </svg>
-                <span className="text-sm font-bold text-purple-700 dark:text-purple-300 uppercase tracking-wide">Meaning</span>
+                <span className="text-sm font-bold text-purple-700 dark:text-purple-300 uppercase tracking-wide">Meanings</span>
               </div>
-              <div
-                className={
-                  phase === 'review-result'
-                    ? 'text-lg font-semibold text-slate-900 dark:text-slate-100 leading-relaxed mb-2'
-                    : 'text-2xl font-semibold text-slate-900 dark:text-slate-100 leading-relaxed mb-4'
-                }
-              >
-                {queue[index].meaning}
+
+              <div className="mb-3 flex flex-wrap items-center gap-2">
+                <button
+                  onClick={() => setShowViHint((prev) => !prev)}
+                  className="px-3 py-1.5 rounded-lg border border-sky-300 dark:border-sky-700 text-sky-700 dark:text-sky-300 hover:bg-sky-50 dark:hover:bg-sky-900/30 text-sm font-semibold"
+                >
+                  {showViHint ? 'Ẩn Nghĩa' : 'Nghĩa'}
+                </button>
+                <button
+                  onClick={() => setShowMeaningByDefault((prev) => !prev)}
+                  className="px-3 py-1.5 rounded-lg border border-violet-300 dark:border-violet-700 text-violet-700 dark:text-violet-300 hover:bg-violet-50 dark:hover:bg-violet-900/30 text-sm font-semibold"
+                >
+                  {showMeaningByDefault ? 'Mặc định: Hiện' : 'Mặc định: Ẩn'}
+                </button>
               </div>
+
+              <div className={phase === 'review-result' ? 'space-y-2.5 mb-2' : 'space-y-3 mb-4'}>
+                {showViHint && String((queue as any)?.[index]?.meaning || '').trim() && (
+                  <div className={phase === 'review-result' ? 'p-2.5 rounded-xl bg-sky-50/80 dark:bg-sky-900/30 border border-sky-200 dark:border-sky-800' : 'p-3 rounded-xl bg-sky-50/80 dark:bg-sky-900/30 border border-sky-200 dark:border-sky-800'}>
+                    <div className="inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-bold uppercase tracking-wide bg-sky-100 text-sky-700 dark:bg-sky-900/60 dark:text-sky-200 mb-1.5">Nghĩa của tôi</div>
+                    <div className={phase === 'review-result' ? 'text-sm text-slate-700 dark:text-slate-200 leading-relaxed' : 'text-base text-slate-700 dark:text-slate-200 leading-relaxed'}>
+                      {String((queue as any)[index].meaning || '')}
+                    </div>
+                  </div>
+                )}
+
+                <div className={phase === 'review-result' ? 'p-2.5 rounded-xl bg-violet-50/80 dark:bg-violet-900/30 border border-violet-200 dark:border-violet-800' : 'p-3 rounded-xl bg-violet-50/80 dark:bg-violet-900/30 border border-violet-200 dark:border-violet-800'}>
+                  <div className="inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-bold uppercase tracking-wide bg-violet-100 text-violet-700 dark:bg-violet-900/50 dark:text-violet-200 mb-1.5">EN meaning</div>
+                  <div
+                    className={
+                      phase === 'review-result'
+                        ? 'text-base font-semibold text-slate-900 dark:text-slate-100 leading-relaxed'
+                        : 'text-xl font-semibold text-slate-900 dark:text-slate-100 leading-relaxed'
+                    }
+                  >
+                    {String((queue as any)?.[index]?.meaningEn || (queue as any)?.[index]?.meaningNoteEn || '').trim() || 'Chưa có EN meaning cho từ này'}
+                  </div>
+                </div>
+
+                {String((queue as any)?.[index]?.meaningVi || (queue as any)?.[index]?.meaningNoteVie || (queue as any)?.[index]?.meaningNoteVi || '').trim() && (
+                  <div className={phase === 'review-result' ? 'p-2.5 rounded-xl bg-emerald-50/80 dark:bg-emerald-900/30 border border-emerald-200 dark:border-emerald-800' : 'p-3 rounded-xl bg-emerald-50/80 dark:bg-emerald-900/30 border border-emerald-200 dark:border-emerald-800'}>
+                    <div className="inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-bold uppercase tracking-wide bg-emerald-100 text-emerald-700 dark:bg-emerald-900/60 dark:text-emerald-200 mb-1.5">VIE meaning</div>
+                    <div className={phase === 'review-result' ? 'text-sm text-slate-700 dark:text-slate-200 leading-relaxed' : 'text-base text-slate-700 dark:text-slate-200 leading-relaxed'}>
+                      {String((queue as any)[index].meaningVi || (queue as any)[index].meaningNoteVie || (queue as any)[index].meaningNoteVi || '')}
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {String((queue as any)?.[index]?.pos || '').trim() && (
+                <div
+                  className={
+                    phase === 'review-result'
+                      ? 'text-sm text-slate-600 dark:text-slate-400 font-medium mb-2'
+                      : 'text-base text-slate-600 dark:text-slate-400 font-medium mb-4'
+                  }
+                >
+                  {String((queue as any)[index].pos)}
+                </div>
+              )}
 
               <div className={phase === 'review-result' ? 'p-3 bg-gradient-to-br from-violet-50/50 to-purple-50/50 dark:from-violet-900/30 dark:to-purple-900/30 rounded-2xl border border-violet-100 dark:border-violet-800' : 'p-4 bg-gradient-to-br from-violet-50/50 to-purple-50/50 dark:from-violet-900/30 dark:to-purple-900/30 rounded-2xl border border-violet-100 dark:border-violet-800'}>
                 <div className={phase === 'review-result' ? 'flex items-center gap-2 mb-2' : 'flex items-center gap-2 mb-3'}>
@@ -1886,14 +2707,7 @@ export default function Study(){
                 {/* Controls - Enhanced */}
                 <div className="flex flex-wrap gap-3 justify-center">
                   <button
-                    onClick={() => {
-                      try {
-                        const ut = new SpeechSynthesisUtterance(queue[index].word)
-                        window.speechSynthesis.speak(ut)
-                      } catch (err) {
-                        console.error('Speech error', err)
-                      }
-                    }}
+                    onClick={() => speakWord(queue[index].word)}
                     className="btn-icon !w-auto px-4 py-2.5 flex items-center gap-2"
                     title="Speak word"
                   >
@@ -1932,6 +2746,7 @@ export default function Study(){
                     onKeyDown={(e) => {
                       if (e.key === 'Enter') {
                         e.preventDefault()
+                        e.stopPropagation()
                         void submitAnswer()
                       }
                     }}
@@ -1978,11 +2793,28 @@ export default function Study(){
                     }`}>
                       {queue[index].word}
                     </div>
+                    {String((queue as any)?.[index]?.pos || '').trim() && (
+                      <div className="text-sm text-slate-600 dark:text-slate-400 font-medium">
+                        {String((queue as any)[index].pos)}
+                      </div>
+                    )}
                     {ipaCore(queue[index].pronunciation || '') && (
                       <div className="text-sm text-slate-600 dark:text-slate-400 font-medium">
                         /{ipaCore(queue[index].pronunciation || '')}/
                       </div>
                     )}
+                    <div className="mt-3">
+                      <button
+                        onClick={() => speakWord(queue[index].word)}
+                        className="btn-icon !w-auto px-4 py-2 flex items-center gap-2"
+                        title="Speak word"
+                      >
+                        <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
+                          <path fillRule="evenodd" d="M9.383 3.076A1 1 0 0110 4v12a1 1 0 01-1.707.707L4.586 13H2a1 1 0 01-1-1V8a1 1 0 011-1h2.586l3.707-3.707a1 1 0 011.09-.217zM14.657 2.929a1 1 0 011.414 0A9.972 9.972 0 0119 10a9.972 9.972 0 01-2.929 7.071 1 1 0 01-1.414-1.414A7.971 7.971 0 0017 10c0-2.21-.894-4.208-2.343-5.657a1 1 0 010-1.414zm-2.829 2.828a1 1 0 011.415 0A5.983 5.983 0 0115 10a5.984 5.984 0 01-1.757 4.243 1 1 0 01-1.415-1.415A3.984 3.984 0 0013 10a3.983 3.983 0 00-1.172-2.828 1 1 0 010-1.415z" clipRule="evenodd" />
+                        </svg>
+                        Speak
+                      </button>
+                    </div>
                   </div>
                 </div>
 
@@ -1996,9 +2828,48 @@ export default function Study(){
                   </div>
                 </div>
 
-                {/* Action Buttons - 2 choices: Làm lại / Cho qua */}
-                <div>
-                  <div className="text-center mb-4">
+                {/* Action Buttons - 2 choices: Làm lại / Cho qua (only show when autoModeEnabled) */}
+                {autoModeEnabled ? (
+                  <div>
+                    <div className="text-center mb-4">
+                      {!lastAnswerCorrect && (
+                        <div className="inline-flex items-center gap-2 px-3 py-1.5 bg-amber-100 dark:bg-amber-900/40 text-amber-800 dark:text-amber-300 rounded-xl mb-3">
+                          <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
+                            <path fillRule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clipRule="evenodd" />
+                          </svg>
+                          <span className="text-sm font-semibold">Từ này sẽ được ôn lại lượt sau</span>
+                        </div>
+                      )}
+                      <p className="text-sm font-semibold text-slate-700 dark:text-slate-300">Bạn muốn làm gì?</p>
+                      <p className="text-xs text-slate-500 dark:text-slate-400">Nhấn phím 1 hoặc 2</p>
+                    </div>
+                    <div className="grid grid-cols-2 gap-4">
+                      <button
+                        onClick={handleRetry}
+                        className="group relative p-4 bg-gradient-to-br from-amber-100 to-orange-200 dark:from-amber-900/50 dark:to-orange-900/50 hover:from-amber-200 hover:to-orange-300 dark:hover:from-amber-800/50 dark:hover:to-orange-800/50 rounded-2xl border-2 border-amber-400 dark:border-amber-600 hover:border-amber-500 dark:hover:border-amber-500 transition-all active:scale-95 shadow-lg hover:shadow-xl shadow-amber-500/20"
+                      >
+                        <div className="text-3xl mb-2">🔄</div>
+                        <div className="font-bold text-base text-amber-800 dark:text-amber-300">Làm lại</div>
+                        <div className="text-xs text-slate-600 dark:text-slate-400 mt-1">Thử lại ngay</div>
+                        <div className="absolute top-2 right-2 w-7 h-7 bg-amber-600 text-white rounded-lg flex items-center justify-center font-bold text-sm shadow-md">
+                          1
+                        </div>
+                      </button>
+                      <button
+                        onClick={handlePass}
+                        className="group relative p-4 bg-gradient-to-br from-emerald-100 to-teal-200 dark:from-emerald-900/50 dark:to-teal-900/50 hover:from-emerald-200 hover:to-teal-300 dark:hover:from-emerald-800/50 dark:hover:to-teal-800/50 rounded-2xl border-2 border-emerald-400 dark:border-emerald-600 hover:border-emerald-500 dark:hover:border-emerald-500 transition-all active:scale-95 shadow-lg hover:shadow-xl shadow-emerald-500/20"
+                      >
+                        <div className="text-3xl mb-2">➡️</div>
+                        <div className="font-bold text-base text-emerald-800 dark:text-emerald-300">Cho qua</div>
+                        <div className="text-xs text-slate-600 dark:text-slate-400 mt-1">Tiếp tục từ mới</div>
+                        <div className="absolute top-2 right-2 w-7 h-7 bg-emerald-600 text-white rounded-lg flex items-center justify-center font-bold text-sm shadow-md">
+                          2
+                        </div>
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="text-center py-4">
                     {!lastAnswerCorrect && (
                       <div className="inline-flex items-center gap-2 px-3 py-1.5 bg-amber-100 dark:bg-amber-900/40 text-amber-800 dark:text-amber-300 rounded-xl mb-3">
                         <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
@@ -2007,34 +2878,14 @@ export default function Study(){
                         <span className="text-sm font-semibold">Từ này sẽ được ôn lại lượt sau</span>
                       </div>
                     )}
-                    <p className="text-sm font-semibold text-slate-700 dark:text-slate-300">Bạn muốn làm gì?</p>
-                    <p className="text-xs text-slate-500 dark:text-slate-400">Nhấn phím 1 hoặc 2</p>
+                    <p className="text-sm font-semibold text-slate-700 dark:text-slate-300 mb-2">
+                      Nhấn <span className="px-2 py-1 bg-slate-200 dark:bg-slate-700 rounded font-bold">Enter</span> để {lastAnswerCorrect ? 'tiếp tục' : 'làm lại'}
+                    </p>
+                    <p className="text-xs text-slate-500 dark:text-slate-400">
+                      {lastAnswerCorrect ? '✅ Đúng → Chuyển sang từ tiếp' : '❌ Sai → Thử lại từ này'}
+                    </p>
                   </div>
-                  <div className="grid grid-cols-2 gap-4">
-                    <button
-                      onClick={handleRetry}
-                      className="group relative p-4 bg-gradient-to-br from-amber-100 to-orange-200 dark:from-amber-900/50 dark:to-orange-900/50 hover:from-amber-200 hover:to-orange-300 dark:hover:from-amber-800/50 dark:hover:to-orange-800/50 rounded-2xl border-2 border-amber-400 dark:border-amber-600 hover:border-amber-500 dark:hover:border-amber-500 transition-all active:scale-95 shadow-lg hover:shadow-xl shadow-amber-500/20"
-                    >
-                      <div className="text-3xl mb-2">🔄</div>
-                      <div className="font-bold text-base text-amber-800 dark:text-amber-300">Làm lại</div>
-                      <div className="text-xs text-slate-600 dark:text-slate-400 mt-1">Thử lại ngay</div>
-                      <div className="absolute top-2 right-2 w-7 h-7 bg-amber-600 text-white rounded-lg flex items-center justify-center font-bold text-sm shadow-md">
-                        1
-                      </div>
-                    </button>
-                    <button
-                      onClick={handlePass}
-                      className="group relative p-4 bg-gradient-to-br from-emerald-100 to-teal-200 dark:from-emerald-900/50 dark:to-teal-900/50 hover:from-emerald-200 hover:to-teal-300 dark:hover:from-emerald-800/50 dark:hover:to-teal-800/50 rounded-2xl border-2 border-emerald-400 dark:border-emerald-600 hover:border-emerald-500 dark:hover:border-emerald-500 transition-all active:scale-95 shadow-lg hover:shadow-xl shadow-emerald-500/20"
-                    >
-                      <div className="text-3xl mb-2">➡️</div>
-                      <div className="font-bold text-base text-emerald-800 dark:text-emerald-300">Cho qua</div>
-                      <div className="text-xs text-slate-600 dark:text-slate-400 mt-1">Tiếp tục từ mới</div>
-                      <div className="absolute top-2 right-2 w-7 h-7 bg-emerald-600 text-white rounded-lg flex items-center justify-center font-bold text-sm shadow-md">
-                        2
-                      </div>
-                    </button>
-                  </div>
-                </div>
+                )}
               </div>
             )}
 
@@ -2047,26 +2898,69 @@ export default function Study(){
         <div className="max-w-5xl mx-auto animate-fade-in">
           <DifficultySelector
             mode={difficultySelectMode}
-            words={(difficultySelectMode === 'custom' ? reviewedWords : srsReviewedWords).map((card: any) => ({
-              id: difficultySelectMode === 'custom' ? makeCardKey(card.source, card.word, card.meaning) : card.id,
+            words={(difficultySelectMode === 'custom' ? reviewedWords : srsReviewedWords).map((card: any, idx: number) => ({
+              // Custom mode doesn't have a stable record id yet; use a per-session unique id so nothing collapses.
+              id: difficultySelectMode === 'custom' ? `session_${idx}` : card.id,
               word: card.word,
               meaning: card.meaning,
+              meaningEn: card.meaningEn || card.meaningNoteEn,
+              meaningVi: card.meaningVi || card.meaningNoteVi || card.meaningNoteVie,
+              meaningNoteEn: card.meaningEn || card.meaningNoteEn,
+              meaningNoteVi: card.meaningVi || card.meaningNoteVi || card.meaningNoteVie,
               pronunciation: card.pronunciation,
+              pos: card.pos,
+              example: card.example,
               source: card.source,
+              wrongCount:
+                difficultySelectMode === 'custom'
+                  ? Number(wrongCountByCardKey[makeCardKey(card.source, card.word, card.meaning)] || 0)
+                  : Number(srsWrongCountById[String(card.id || '')] || 0),
             }))}
             onComplete={() => {
               // DifficultySelector already saved to VocabularyStore
+              if (difficultySelectMode === 'smart' && smartDifficultyFromCalendar) {
+                setSmartDifficultyFromCalendar(false)
+                setPhase('idle')
+                return
+              }
               setPhase(difficultySelectMode === 'smart' ? 'srs-summary' : 'summary')
             }}
             onSkip={() => {
               // For Smart mode: treat this session as non-existent (no scheduling saved).
               // Restart Smart Review so the user can continue learning more.
               if (difficultySelectMode === 'smart') {
+                if (smartDifficultyFromCalendar) {
+                  setSmartDifficultyFromCalendar(false)
+                  setPhase('idle')
+                  return
+                }
                 void startSRSSession()
                 return
               }
 
-              // Custom mode: just skip rating and show summary.
+              // Custom mode: if user skips rating, still add reviewed words to Smart Review
+              // with all metadata and schedule them for today (unrated_custom).
+              try {
+                for (const w of reviewedWordsRef.current || []) {
+                  if (!w?.word || !w?.meaning) continue
+                  const record = VocabularyStore.upsert({
+                    word: w.word,
+                    meaning: w.meaning,
+                    meaningEn: (w as any).meaningEn || (w as any).meaningNoteEn,
+                    meaningVi: (w as any).meaningVi || (w as any).meaningNoteVi || (w as any).meaningNoteVie,
+                    meaningNoteEn: (w as any).meaningEn || (w as any).meaningNoteEn,
+                    meaningNoteVi: (w as any).meaningVi || (w as any).meaningNoteVi || (w as any).meaningNoteVie,
+                    meaningNoteVie: (w as any).meaningVi || (w as any).meaningNoteVi || (w as any).meaningNoteVie,
+                    pronunciation: (w as any).pronunciation,
+                    pos: (w as any).pos,
+                    example: (w as any).example,
+                    source: (w as any).source,
+                  })
+                  VocabularyStore.scheduleForToday(record.id, 'unrated_custom')
+                }
+              } catch {}
+
+              // Then show summary.
               setPhase('summary')
             }}
           />
@@ -2359,6 +3253,11 @@ export default function Study(){
                   <div className="px-3 py-1 bg-gradient-to-r from-emerald-500 to-teal-500 text-white rounded-full text-sm font-bold">
                     ⚡ Smart Review
                   </div>
+                  {srsRound > 1 && (
+                    <div className="px-3 py-1 bg-slate-900/10 dark:bg-slate-900/40 text-slate-700 dark:text-slate-200 rounded-full text-sm font-bold border border-slate-200 dark:border-slate-700">
+                      Lượt {srsRound}
+                    </div>
+                  )}
                 </div>
                 <div className="flex items-center gap-3">
                   <div className="text-3xl font-bold bg-gradient-to-r from-emerald-600 to-teal-600 bg-clip-text text-transparent">{srsIndex + 1}</div>
@@ -2405,6 +3304,36 @@ export default function Study(){
                 </div>
               </div>
             </div>
+
+            {/* Auto Mode Toggle */}
+            <div className="mt-4 pt-4 border-t border-slate-200 dark:border-slate-700 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <span className="text-sm font-medium text-slate-600 dark:text-slate-400">Chế độ chọn thủ công</span>
+                <div className="relative group">
+                  <svg className="w-4 h-4 text-slate-400 cursor-help" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                  </svg>
+                  <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 px-3 py-2 bg-slate-800 text-white text-xs rounded-lg opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none whitespace-nowrap z-50">
+                    <div className="font-semibold mb-1">Bật: Hiện 2 nút Làm lại / Cho qua</div>
+                    <div>Tắt: Enter tự động (đúng→qua, sai→làm lại)</div>
+                  </div>
+                </div>
+              </div>
+              <button
+                onClick={() => setAutoModeEnabled(!autoModeEnabled)}
+                className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                  autoModeEnabled 
+                    ? 'bg-emerald-600' 
+                    : 'bg-slate-300 dark:bg-slate-600'
+                }`}
+              >
+                <span
+                  className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform shadow-md ${
+                    autoModeEnabled ? 'translate-x-6' : 'translate-x-1'
+                  }`}
+                />
+              </button>
+            </div>
           </div>
 
           {/* Study Card */}
@@ -2415,11 +3344,62 @@ export default function Study(){
                 <svg className="w-5 h-5 text-emerald-600 dark:text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 5h12M9 3v2m1.048 9.5A18.022 18.022 0 016.412 9m6.088 9h7M11 21l5-10 5 10M12.751 5C11.783 10.77 8.07 15.61 3 18.129" />
                 </svg>
-                <span className="text-sm font-bold text-emerald-700 dark:text-emerald-300 uppercase tracking-wide">Meaning</span>
+                <span className="text-sm font-bold text-emerald-700 dark:text-emerald-300 uppercase tracking-wide">Meanings</span>
               </div>
-              <div className={phase === 'srs-review-result' ? 'text-lg font-semibold text-slate-900 dark:text-slate-100 leading-relaxed mb-2' : 'text-2xl font-semibold text-slate-900 dark:text-slate-100 leading-relaxed mb-4'}>
-                {srsQueue[srsIndex]?.meaning}
+
+              <div className="mb-3 flex flex-wrap items-center gap-2">
+                <button
+                  onClick={() => setShowSrsViHint((prev) => !prev)}
+                  className="px-3 py-1.5 rounded-lg border border-sky-300 dark:border-sky-700 text-sky-700 dark:text-sky-300 hover:bg-sky-50 dark:hover:bg-sky-900/30 text-sm font-semibold"
+                >
+                  {showSrsViHint ? 'Ẩn Nghĩa' : 'Nghĩa'}
+                </button>
+                <button
+                  onClick={() => setShowMeaningByDefault((prev) => !prev)}
+                  className="px-3 py-1.5 rounded-lg border border-violet-300 dark:border-violet-700 text-violet-700 dark:text-violet-300 hover:bg-violet-50 dark:hover:bg-violet-900/30 text-sm font-semibold"
+                >
+                  {showMeaningByDefault ? 'Mặc định: Hiện' : 'Mặc định: Ẩn'}
+                </button>
               </div>
+
+              <div className={phase === 'srs-review-result' ? 'space-y-2.5 mb-2' : 'space-y-3 mb-4'}>
+                {showSrsViHint && String((srsQueue as any)?.[srsIndex]?.meaning || '').trim() && (
+                  <div className={phase === 'srs-review-result' ? 'p-2.5 rounded-xl bg-sky-50/80 dark:bg-sky-900/30 border border-sky-200 dark:border-sky-800' : 'p-3 rounded-xl bg-sky-50/80 dark:bg-sky-900/30 border border-sky-200 dark:border-sky-800'}>
+                    <div className="inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-bold uppercase tracking-wide bg-sky-100 text-sky-700 dark:bg-sky-900/60 dark:text-sky-200 mb-1.5">Nghĩa của tôi</div>
+                    <div className={phase === 'srs-review-result' ? 'text-sm text-slate-700 dark:text-slate-200 leading-relaxed' : 'text-base text-slate-700 dark:text-slate-200 leading-relaxed'}>
+                      {String((srsQueue as any)[srsIndex].meaning || '')}
+                    </div>
+                  </div>
+                )}
+
+                <div className={phase === 'srs-review-result' ? 'p-2.5 rounded-xl bg-emerald-50/80 dark:bg-emerald-900/30 border border-emerald-200 dark:border-emerald-800' : 'p-3 rounded-xl bg-emerald-50/80 dark:bg-emerald-900/30 border border-emerald-200 dark:border-emerald-800'}>
+                  <div className="inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-bold uppercase tracking-wide bg-emerald-100 text-emerald-700 dark:bg-emerald-900/60 dark:text-emerald-200 mb-1.5">EN meaning</div>
+                  <div className={phase === 'srs-review-result' ? 'text-base font-semibold text-slate-900 dark:text-slate-100 leading-relaxed' : 'text-xl font-semibold text-slate-900 dark:text-slate-100 leading-relaxed'}>
+                    {String((srsQueue as any)?.[srsIndex]?.meaningEn || (srsQueue as any)?.[srsIndex]?.meaningNoteEn || '').trim() || 'Chưa có EN meaning cho từ này'}
+                  </div>
+                </div>
+
+                {String((srsQueue as any)?.[srsIndex]?.meaningVi || (srsQueue as any)?.[srsIndex]?.meaningNoteVie || (srsQueue as any)?.[srsIndex]?.meaningNoteVi || '').trim() && (
+                  <div className={phase === 'srs-review-result' ? 'p-2.5 rounded-xl bg-teal-50/80 dark:bg-teal-900/30 border border-teal-200 dark:border-teal-800' : 'p-3 rounded-xl bg-teal-50/80 dark:bg-teal-900/30 border border-teal-200 dark:border-teal-800'}>
+                    <div className="inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-bold uppercase tracking-wide bg-teal-100 text-teal-700 dark:bg-teal-900/60 dark:text-teal-200 mb-1.5">VIE meaning</div>
+                    <div className={phase === 'srs-review-result' ? 'text-sm text-slate-700 dark:text-slate-200 leading-relaxed' : 'text-base text-slate-700 dark:text-slate-200 leading-relaxed'}>
+                      {String((srsQueue as any)[srsIndex].meaningVi || (srsQueue as any)[srsIndex].meaningNoteVie || (srsQueue as any)[srsIndex].meaningNoteVi || '')}
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {String((srsQueue as any)?.[srsIndex]?.pos || '').trim() && (
+                <div
+                  className={
+                    phase === 'srs-review-result'
+                      ? 'text-sm text-slate-600 dark:text-slate-400 font-medium mb-2'
+                      : 'text-base text-slate-600 dark:text-slate-400 font-medium mb-4'
+                  }
+                >
+                  {String((srsQueue as any)[srsIndex].pos)}
+                </div>
+              )}
 
               {srsQueue[srsIndex]?.example && (
                 <div className={phase === 'srs-review-result' ? 'p-3 bg-gradient-to-br from-emerald-50/50 to-teal-50/50 dark:from-emerald-900/30 dark:to-teal-900/30 rounded-2xl border border-emerald-100 dark:border-emerald-800' : 'p-4 bg-gradient-to-br from-emerald-50/50 to-teal-50/50 dark:from-emerald-900/30 dark:to-teal-900/30 rounded-2xl border border-emerald-100 dark:border-emerald-800'}>
@@ -2452,14 +3432,7 @@ export default function Study(){
                 {/* Controls */}
                 <div className="flex flex-wrap gap-3 justify-center">
                   <button
-                    onClick={() => {
-                      try {
-                        const ut = new SpeechSynthesisUtterance(srsQueue[srsIndex]?.word)
-                        window.speechSynthesis.speak(ut)
-                      } catch (err) {
-                        console.error('Speech error', err)
-                      }
-                    }}
+                    onClick={() => speakWord(srsQueue[srsIndex]?.word || '')}
                     className="btn-icon !w-auto px-4 py-2.5 flex items-center gap-2"
                     title="Speak word"
                   >
@@ -2500,6 +3473,7 @@ export default function Study(){
                     onKeyDown={(e) => {
                       if (e.key === 'Enter') {
                         e.preventDefault()
+                        e.stopPropagation()
                         submitSRSAnswer()
                       }
                     }}
@@ -2545,48 +3519,84 @@ export default function Study(){
                   <div className="text-center py-3 bg-white/50 dark:bg-slate-800/50 rounded-xl">
                     <div className="text-sm text-slate-500 dark:text-slate-400 mb-1">Correct Answer</div>
                     <div className="text-3xl font-bold text-slate-900 dark:text-white">{srsQueue[srsIndex]?.word}</div>
+                    {String((srsQueue as any)?.[srsIndex]?.pos || '').trim() && (
+                      <div className="text-sm text-slate-600 dark:text-slate-400 font-medium mt-1">
+                        {String((srsQueue as any)[srsIndex].pos)}
+                      </div>
+                    )}
                     {srsQueue[srsIndex]?.pronunciation && (
                       <div className="text-lg text-slate-600 dark:text-slate-400 mt-1">/{srsQueue[srsIndex]?.pronunciation}/</div>
                     )}
+                    <div className="mt-3 flex justify-center">
+                      <button
+                        onClick={() => speakWord(srsQueue[srsIndex]?.word || '')}
+                        className="btn-icon !w-auto px-4 py-2 flex items-center gap-2"
+                        title="Speak word"
+                      >
+                        <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
+                          <path fillRule="evenodd" d="M9.383 3.076A1 1 0 0110 4v12a1 1 0 01-1.707.707L4.586 13H2a1 1 0 01-1-1V8a1 1 0 011-1h2.586l3.707-3.707a1 1 0 011.09-.217zM14.657 2.929a1 1 0 011.414 0A9.972 9.972 0 0119 10a9.972 9.972 0 01-2.929 7.071 1 1 0 01-1.414-1.414A7.971 7.971 0 0017 10c0-2.21-.894-4.208-2.343-5.657a1 1 0 010-1.414zm-2.829 2.828a1 1 0 011.415 0A5.983 5.983 0 0115 10a5.984 5.984 0 01-1.757 4.243 1 1 0 01-1.415-1.415A3.984 3.984 0 0013 10a3.983 3.983 0 00-1.172-2.828 1 1 0 010-1.415z" clipRule="evenodd" />
+                        </svg>
+                        Speak
+                      </button>
+                    </div>
                   </div>
                 </div>
 
-                {/* Action Buttons - 2 choices: Làm lại / Cho qua */}
-                <div className="pt-4">
-                  {!lastAnswerCorrect && (
-                    <div className="text-center mb-3">
-                      <div className="inline-flex items-center gap-2 px-3 py-1.5 bg-amber-100 dark:bg-amber-900/40 text-amber-800 dark:text-amber-300 rounded-xl">
+                {/* Action Buttons - 2 choices: Làm lại / Cho qua (only show when autoModeEnabled) */}
+                {autoModeEnabled ? (
+                  <div className="pt-4">
+                    {!lastAnswerCorrect && (
+                      <div className="text-center mb-3">
+                        <div className="inline-flex items-center gap-2 px-3 py-1.5 bg-amber-100 dark:bg-amber-900/40 text-amber-800 dark:text-amber-300 rounded-xl">
+                          <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
+                            <path fillRule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clipRule="evenodd" />
+                          </svg>
+                          <span className="text-sm font-semibold">Bạn có thể làm lại ngay hoặc cho qua</span>
+                        </div>
+                      </div>
+                    )}
+                    <div className="text-center text-sm font-semibold text-slate-600 dark:text-slate-400 mb-3">
+                      Nhấn phím 1 hoặc 2
+                    </div>
+                    <div className="grid grid-cols-2 gap-4">
+                      <button
+                        onClick={handleSRSRetry}
+                        className="group relative p-4 bg-gradient-to-br from-amber-100 to-orange-200 dark:from-amber-900/50 dark:to-orange-900/50 hover:from-amber-200 hover:to-orange-300 dark:hover:from-amber-800/50 dark:hover:to-orange-800/50 rounded-2xl border-2 border-amber-400 dark:border-amber-600 hover:border-amber-500 dark:hover:border-amber-500 transition-all active:scale-95 shadow-lg hover:shadow-xl shadow-amber-500/20"
+                      >
+                        <div className="text-3xl mb-2">🔄</div>
+                        <div className="font-bold text-base text-amber-800 dark:text-amber-300">Làm lại</div>
+                        <div className="text-xs text-slate-600 dark:text-slate-400 mt-1">Thử lại ngay</div>
+                        <div className="absolute top-2 right-2 w-7 h-7 bg-amber-600 text-white rounded-lg flex items-center justify-center font-bold text-sm shadow-md">1</div>
+                      </button>
+                      <button
+                        onClick={handleSRSPass}
+                        className="group relative p-4 bg-gradient-to-br from-emerald-100 to-teal-200 dark:from-emerald-900/50 dark:to-teal-900/50 hover:from-emerald-200 hover:to-teal-300 dark:hover:from-emerald-800/50 dark:hover:to-teal-800/50 rounded-2xl border-2 border-emerald-400 dark:border-emerald-600 hover:border-emerald-500 dark:hover:border-emerald-500 transition-all active:scale-95 shadow-lg hover:shadow-xl shadow-emerald-500/20"
+                      >
+                        <div className="text-3xl mb-2">➡️</div>
+                        <div className="font-bold text-base text-emerald-800 dark:text-emerald-300">Cho qua</div>
+                        <div className="text-xs text-slate-600 dark:text-slate-400 mt-1">Tới từ tiếp theo</div>
+                        <div className="absolute top-2 right-2 w-7 h-7 bg-emerald-600 text-white rounded-lg flex items-center justify-center font-bold text-sm shadow-md">2</div>
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="text-center py-4">
+                    {!lastAnswerCorrect && (
+                      <div className="inline-flex items-center gap-2 px-3 py-1.5 bg-amber-100 dark:bg-amber-900/40 text-amber-800 dark:text-amber-300 rounded-xl mb-3">
                         <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
                           <path fillRule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clipRule="evenodd" />
                         </svg>
-                        <span className="text-sm font-semibold">Bạn có thể làm lại ngay hoặc cho qua</span>
+                        <span className="text-sm font-semibold">Từ này sẽ được ôn lại lượt sau</span>
                       </div>
-                    </div>
-                  )}
-                  <div className="text-center text-sm font-semibold text-slate-600 dark:text-slate-400 mb-3">
-                    Nhấn phím 1 hoặc 2
+                    )}
+                    <p className="text-sm font-semibold text-slate-700 dark:text-slate-300 mb-2">
+                      Nhấn <span className="px-2 py-1 bg-slate-200 dark:bg-slate-700 rounded font-bold">Enter</span> để {lastAnswerCorrect ? 'tiếp tục' : 'làm lại'}
+                    </p>
+                    <p className="text-xs text-slate-500 dark:text-slate-400">
+                      {lastAnswerCorrect ? '✅ Đúng → Chuyển sang từ tiếp' : '❌ Sai → Thử lại từ này'}
+                    </p>
                   </div>
-                  <div className="grid grid-cols-2 gap-4">
-                    <button
-                      onClick={handleSRSRetry}
-                      className="group relative p-4 bg-gradient-to-br from-amber-100 to-orange-200 dark:from-amber-900/50 dark:to-orange-900/50 hover:from-amber-200 hover:to-orange-300 dark:hover:from-amber-800/50 dark:hover:to-orange-800/50 rounded-2xl border-2 border-amber-400 dark:border-amber-600 hover:border-amber-500 dark:hover:border-amber-500 transition-all active:scale-95 shadow-lg hover:shadow-xl shadow-amber-500/20"
-                    >
-                      <div className="text-3xl mb-2">🔄</div>
-                      <div className="font-bold text-base text-amber-800 dark:text-amber-300">Làm lại</div>
-                      <div className="text-xs text-slate-600 dark:text-slate-400 mt-1">Thử lại ngay</div>
-                      <div className="absolute top-2 right-2 w-7 h-7 bg-amber-600 text-white rounded-lg flex items-center justify-center font-bold text-sm shadow-md">1</div>
-                    </button>
-                    <button
-                      onClick={handleSRSPass}
-                      className="group relative p-4 bg-gradient-to-br from-emerald-100 to-teal-200 dark:from-emerald-900/50 dark:to-teal-900/50 hover:from-emerald-200 hover:to-teal-300 dark:hover:from-emerald-800/50 dark:hover:to-teal-800/50 rounded-2xl border-2 border-emerald-400 dark:border-emerald-600 hover:border-emerald-500 dark:hover:border-emerald-500 transition-all active:scale-95 shadow-lg hover:shadow-xl shadow-emerald-500/20"
-                    >
-                      <div className="text-3xl mb-2">➡️</div>
-                      <div className="font-bold text-base text-emerald-800 dark:text-emerald-300">Cho qua</div>
-                      <div className="text-xs text-slate-600 dark:text-slate-400 mt-1">Tới từ tiếp theo</div>
-                      <div className="absolute top-2 right-2 w-7 h-7 bg-emerald-600 text-white rounded-lg flex items-center justify-center font-bold text-sm shadow-md">2</div>
-                    </button>
-                  </div>
-                </div>
+                )}
               </div>
             )}
           </div>

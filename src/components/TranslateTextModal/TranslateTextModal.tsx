@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react'
+import { playSound } from '../../utils/sounds'
 
 interface Props {
   text: string
@@ -72,6 +73,7 @@ export default function TranslateTextModal({ text, from = 'en', to = 'vi', onClo
     return paragraphs.join('\n\n').trim()
   }, [text])
   const [translated, setTranslated] = useState('')
+  const [explanation, setExplanation] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
 
@@ -81,15 +83,24 @@ export default function TranslateTextModal({ text, from = 'en', to = 'vi', onClo
       try {
         setError('')
         setTranslated('')
+        setExplanation('')
         if (!cleanText) return
-        if (!(window as any)?.api?.translatePlain) {
+        if (!(window as any)?.api?.translateExplain && !(window as any)?.api?.translatePlain) {
           setError('Translate API not available. Hãy restart app (Electron) để reload preload.js, rồi thử lại.')
           return
         }
         setLoading(true)
-        const resp: string = await (window as any).api.translatePlain({ text: cleanText, from, to })
-        if (cancelled) return
-        setTranslated(String(resp || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n'))
+        if ((window as any)?.api?.translateExplain) {
+          const resp: { translation: string; explanation: string } = await (window as any).api.translateExplain({ text: cleanText, from, to })
+          if (cancelled) return
+          setTranslated(String(resp?.translation || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n'))
+          setExplanation(String(resp?.explanation || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n'))
+        } else {
+          const resp: string = await (window as any).api.translatePlain({ text: cleanText, from, to })
+          if (cancelled) return
+          setTranslated(String(resp || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n'))
+        }
+        playSound('complete')
       } catch (e) {
         if (cancelled) return
         setError('Failed to translate')
@@ -161,7 +172,16 @@ export default function TranslateTextModal({ text, from = 'en', to = 'vi', onClo
 
           <div>
             <div className="flex items-center justify-between mb-2">
-              <div className="text-sm font-semibold text-slate-700 dark:text-slate-300">Translation</div>
+              <div className="flex items-center gap-2">
+                <span className="text-sm font-semibold text-slate-700 dark:text-slate-300">Translation</span>
+                {!loading && translated && (
+                  <div className="w-5 h-5 bg-green-500 rounded-full flex items-center justify-center animate-scale-in">
+                    <svg className="w-3 h-3 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" />
+                    </svg>
+                  </div>
+                )}
+              </div>
               <button
                 onClick={() => copyText(translated)}
                 className="text-xs text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200"
@@ -172,7 +192,29 @@ export default function TranslateTextModal({ text, from = 'en', to = 'vi', onClo
               </button>
             </div>
             <div className="p-3 bg-violet-50 dark:bg-violet-900/30 rounded-lg border border-violet-200 dark:border-violet-800 text-sm text-slate-900 dark:text-slate-100 whitespace-pre-wrap min-h-[4rem]">
-              {loading ? 'Translating…' : (translated || '')}
+              {loading ? (
+                <div className="flex items-center gap-2 text-violet-600 dark:text-violet-400">
+                  <div className="w-4 h-4 border-2 border-violet-500 border-t-transparent rounded-full animate-spin" />
+                  <span>Translating…</span>
+                </div>
+              ) : (translated || '')}
+            </div>
+          </div>
+
+          <div>
+            <div className="flex items-center justify-between mb-2">
+              <div className="text-sm font-semibold text-slate-700 dark:text-slate-300">Explanation</div>
+              <button
+                onClick={() => copyText(explanation)}
+                className="text-xs text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200"
+                type="button"
+                disabled={!explanation}
+              >
+                Copy
+              </button>
+            </div>
+            <div className="p-3 bg-emerald-50 dark:bg-emerald-900/20 rounded-lg border border-emerald-200 dark:border-emerald-800 text-sm text-slate-900 dark:text-slate-100 whitespace-pre-wrap min-h-[3.5rem]">
+              {loading ? '' : (explanation || '')}
             </div>
           </div>
         </div>

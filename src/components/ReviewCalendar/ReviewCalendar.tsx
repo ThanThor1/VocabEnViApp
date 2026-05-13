@@ -10,7 +10,7 @@ interface ReviewCalendarProps {
   items?: ReviewCalendarItem[]
   onReschedule?: (id: string, newDate: number) => void
   onRemove?: (id: string) => void
-  onStartReview?: (date: string) => void
+  onStartReview?: (date: string, limit?: number) => void
   onClose?: () => void
 }
 
@@ -56,6 +56,7 @@ export default function ReviewCalendar({ view = 'month', items, onReschedule, on
   const [dragState, setDragState] = useState<DragState>({ wordId: null, fromDate: null })
   const [expandedDay, setExpandedDay] = useState<string | null>(null)
   const [confirmDelete, setConfirmDelete] = useState<{ wordId: string; word: string } | null>(null)
+  const [preLearnCount, setPreLearnCount] = useState<string>('')
 
   const todayStart = useMemo(() => {
     const t = new Date(nowMs)
@@ -242,6 +243,23 @@ export default function ReviewCalendar({ view = 'month', items, onReschedule, on
     doRemove(wordId)
     setConfirmDelete(null)
   }
+
+  const expandedDayWords = expandedDay
+    ? (view === 'month' ? calendarGrid : twoWeekGrid).find(d => d.dateStr === expandedDay)?.words || []
+    : []
+
+  useEffect(() => {
+    if (!expandedDay) {
+      setPreLearnCount('')
+      return
+    }
+    const total = expandedDayWords.length
+    if (total <= 0) {
+      setPreLearnCount('')
+      return
+    }
+    setPreLearnCount(String(Math.min(10, total)))
+  }, [expandedDay, expandedDayWords.length])
 
   // Format month name
   const monthName = currentMonth.toLocaleDateString('vi-VN', { month: 'long', year: 'numeric' })
@@ -450,7 +468,7 @@ export default function ReviewCalendar({ view = 'month', items, onReschedule, on
       {/* Expanded Day Modal */}
       {expandedDay && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-          <div className="bg-white dark:bg-slate-800 rounded-2xl shadow-2xl w-full max-w-lg max-h-[80vh] overflow-hidden animate-scale-in">
+          <div className="bg-white dark:bg-slate-800 rounded-2xl shadow-2xl w-full max-w-lg max-h-[80vh] overflow-hidden animate-scale-in flex flex-col">
             <div className="p-4 border-b border-slate-200 dark:border-slate-700 flex items-center justify-between">
               <div>
                 <h3 className="text-lg font-bold text-slate-800 dark:text-white">
@@ -461,7 +479,7 @@ export default function ReviewCalendar({ view = 'month', items, onReschedule, on
                   })}
                 </h3>
                 <p className="text-sm text-slate-500 dark:text-slate-400">
-                  {(view === 'month' ? calendarGrid : twoWeekGrid).find(d => d.dateStr === expandedDay)?.words.length || 0} từ cần ôn
+                  {expandedDayWords.length || 0} từ cần ôn
                 </p>
               </div>
               <button 
@@ -474,9 +492,9 @@ export default function ReviewCalendar({ view = 'month', items, onReschedule, on
               </button>
             </div>
             
-            <div className="p-4 overflow-y-auto max-h-[60vh]">
+            <div className="p-4 overflow-y-auto flex-1 min-h-0">
               <div className="space-y-2">
-                {(view === 'month' ? calendarGrid : twoWeekGrid).find(d => d.dateStr === expandedDay)?.words.map(word => (
+                {expandedDayWords.map(word => (
                   <div 
                     key={word.id}
                     draggable
@@ -526,14 +544,37 @@ export default function ReviewCalendar({ view = 'month', items, onReschedule, on
             
             {onStartReview && (
               <div className="p-4 border-t border-slate-200 dark:border-slate-700">
+                <div className="mb-3">
+                  <label className="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1">
+                    Học trước bao nhiêu từ của ngày này?
+                  </label>
+                  <input
+                    type="number"
+                    min={1}
+                    max={Math.max(1, expandedDayWords.length)}
+                    value={preLearnCount}
+                    onChange={(e) => setPreLearnCount(e.target.value)}
+                    className="w-full px-3 py-2 rounded-xl border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-slate-800 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-violet-500"
+                    placeholder="Nhập số lượng từ"
+                  />
+                  <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                    Tối đa {expandedDayWords.length} từ trong ngày đã chọn.
+                  </p>
+                </div>
                 <button
                   onClick={() => {
-                    onStartReview(expandedDay)
+                    const total = expandedDayWords.length
+                    const parsed = Number(preLearnCount)
+                    const safeLimit = Number.isFinite(parsed)
+                      ? Math.max(1, Math.min(total, Math.floor(parsed)))
+                      : total
+                    onStartReview(expandedDay, safeLimit)
                     setExpandedDay(null)
                   }}
+                  disabled={expandedDayWords.length === 0}
                   className="w-full py-3 bg-gradient-to-r from-violet-500 to-purple-600 text-white font-semibold rounded-xl hover:shadow-lg transition-all"
                 >
-                  Bắt đầu ôn tập
+                  Học trước từ ngày này
                 </button>
               </div>
             )}
