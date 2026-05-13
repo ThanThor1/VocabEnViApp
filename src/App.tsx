@@ -7,8 +7,10 @@ import {
   ManagerPdfView,
   ManagerView,
   PdfReaderView,
+  SRSManagerView,
   StudyView,
 } from './components'
+import TypingGameView from './components/TypingGameView'
 import { BackgroundTasksProvider } from './contexts/BackgroundTasksContext'
 
 import './App.css'
@@ -184,6 +186,28 @@ function AppSidebar({ collapsed, setCollapsed }: { collapsed: boolean; setCollap
           }
         />
 
+        <NavLink
+          to="/typing-game"
+          collapsed={collapsed}
+          label="Typing Game"
+          icon={
+            <svg className="w-[18px] h-[18px]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z" />
+            </svg>
+          }
+        />
+
+        <NavLink
+          to="/srs-manager"
+          collapsed={collapsed}
+          label="Smart Review"
+          icon={
+            <svg className="w-[18px] h-[18px]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
+            </svg>
+          }
+        />
+
         {!collapsed && (
           <div className="px-2 py-2 mt-4 text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-wider">
             Documents
@@ -289,6 +313,14 @@ export default function App() {
       ? HashRouter
       : BrowserRouter
 
+  const [apiKeyInvalidNotice, setApiKeyInvalidNotice] = useState<null | {
+    id: string
+    name?: string
+    masked: string
+    reason?: string
+    ts: number
+  }>(null)
+
   // Theme state
   const [theme, setTheme] = useState<Theme>(() => {
     try {
@@ -337,6 +369,27 @@ export default function App() {
     }
   }, [])
 
+  useEffect(() => {
+    const api = window.api
+    if (!api?.onGoogleAiStudioKeyInvalid) return
+    const handler = (data: { id: string; name?: string; masked: string; reason?: string }) => {
+      if (!data?.id || !data?.masked) return
+      setApiKeyInvalidNotice({
+        id: data.id,
+        name: data.name,
+        masked: data.masked,
+        reason: data.reason,
+        ts: Date.now(),
+      })
+    }
+    api.onGoogleAiStudioKeyInvalid(handler)
+    return () => {
+      try {
+        api.offGoogleAiStudioKeyInvalid?.(handler)
+      } catch {}
+    }
+  }, [])
+
   return (
     <ThemeContext.Provider value={{ theme, toggleTheme }}>
       <SidebarContext.Provider value={{ collapsed: sidebarCollapsed, setCollapsed: setSidebarCollapsed }}>
@@ -348,11 +401,48 @@ export default function App() {
                 <AppSidebar collapsed={sidebarCollapsed} setCollapsed={setSidebarCollapsed} />
 
                 <main className="flex-1 overflow-hidden flex flex-col">
+                  {apiKeyInvalidNotice && (
+                    <div className="px-4 py-3 bg-rose-50/80 dark:bg-rose-950/30 border-b border-rose-200/60 dark:border-rose-900/40">
+                      <div className="flex items-start gap-3">
+                        <div className="w-8 h-8 flex items-center justify-center rounded-lg bg-rose-500 text-white flex-shrink-0">
+                          <svg className="w-[18px] h-[18px]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                              strokeWidth={2}
+                              d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
+                            />
+                          </svg>
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <div className="text-sm font-semibold text-rose-900 dark:text-rose-100">
+                            Google AI Studio API key is invalid
+                          </div>
+                          <div className="text-xs text-rose-800/90 dark:text-rose-200/90 break-words">
+                            <span className="font-semibold">
+                              {apiKeyInvalidNotice.name ? `${apiKeyInvalidNotice.name} (${apiKeyInvalidNotice.masked})` : apiKeyInvalidNotice.masked}
+                            </span>{' '}
+                            was disabled automatically.
+                            {apiKeyInvalidNotice.reason ? ` Reason: ${apiKeyInvalidNotice.reason}` : ''}
+                          </div>
+                        </div>
+                        <button
+                          className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-white/80 hover:bg-white text-rose-900 border border-rose-200/80 dark:bg-slate-900/40 dark:hover:bg-slate-900/70 dark:text-rose-100 dark:border-rose-900/40 flex-shrink-0"
+                          onClick={() => setApiKeyInvalidNotice(null)}
+                          title="Dismiss"
+                        >
+                          Dismiss
+                        </button>
+                      </div>
+                    </div>
+                  )}
                   <ErrorBoundary>
                     <Routes>
                       <Route path="/manager" element={<ManagerView />} />
                       <Route path="/manager-pdf" element={<ManagerPdfView />} />
                       <Route path="/study" element={<StudyView />} />
+                      <Route path="/typing-game" element={<TypingGameView />} />
+                      <Route path="/srs-manager" element={<SRSManagerView />} />
                       <Route path="/pdf" element={<PdfReaderView />} />
                       <Route path="/api-key" element={<ApiKeyView />} />
                       <Route path="/" element={<ManagerView />} />

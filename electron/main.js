@@ -2,6 +2,7 @@ const { app, BrowserWindow, ipcMain, dialog } = require('electron')
 const path = require('path')
 const http = require('http')
 const https = require('https')
+const { spawn } = require('child_process')
 const fs = require('fs').promises
 const fsSync = require('fs')
 const Papa = require('papaparse')
@@ -13,16 +14,27 @@ const crypto = require('crypto')
 // Set stable, writable paths as early as possible and reduce noisy GPU cache errors.
 try {
   const STABLE_APP_NAME = app.isPackaged ? 'FunnyApp' : 'FunnyApp-dev'
-  const stableUserData = path.join(app.getPath('appData'), STABLE_APP_NAME)
-  app.setPath('userData', stableUserData)
+  const baseUserData = path.join(app.getPath('appData'), STABLE_APP_NAME)
+  // Keep userData stable so local app data (vocabulary, settings) is persistent.
+  try { fsSync.mkdirSync(baseUserData, { recursive: true }) } catch {}
+  app.setPath('userData', baseUserData)
   const cacheBase = path.join(app.getPath('temp'), `${STABLE_APP_NAME}-cache`)
   const cacheDir = app.isPackaged ? cacheBase : `${cacheBase}-${process.pid}`
+  try { fsSync.mkdirSync(cacheDir, { recursive: true }) } catch {}
   app.setPath('cache', cacheDir)
   // Explicitly tell Chromium where to put its disk cache.
   try { app.commandLine.appendSwitch('disk-cache-dir', cacheDir) } catch {}
+  if (!app.isPackaged) {
+    // Dev-only: avoid noisy cache write failures for Vite module URLs.
+    app.commandLine.appendSwitch('disable-http-cache')
+  }
   // Reduce noisy GPU cache errors without disabling GPU rendering entirely.
   app.commandLine.appendSwitch('disable-gpu-shader-disk-cache')
   app.commandLine.appendSwitch('disable-gpu-program-cache')
+  // Fix SharedImageManager errors (Skia representation from non-existent mailbox)
+  app.commandLine.appendSwitch('disable-features', 'UseSkiaRenderer')
+  app.commandLine.appendSwitch('disable-accelerated-2d-canvas')
+  app.commandLine.appendSwitch('disable-gpu-compositing')
 } catch (e) {
 }
 
@@ -120,6 +132,246 @@ async function setUserEnvVar(key, value) {
 
 function getUserGoogleAiStudioKeysPath() {
   return path.join(app.getPath('userData'), 'google-ai-studio-keys.json')
+}
+
+function getUserGoogleAiStudioQuotaPath() {
+  return path.join(app.getPath('userData'), 'google-ai-studio-quota.json')
+}
+
+function keyIdForQuota(apiKey) {
+  const k = String(apiKey || '').trim()
+  if (!k) return ''
+  return crypto.createHash('sha256').update(k).digest('hex').slice(0, 24)
+}
+
+function getLocalDayKey(d = new Date()) {
+  const y = d.getFullYear()
+  const m = String(d.getMonth() + 1).padStart(2, '0')
+  const day = String(d.getDate()).padStart(2, '0')
+  return `${y}-${m}-${day}`
+}
+
+function endOfLocalDayMs(d = new Date()) {
+  const eod = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1, 0, 0, 0, 0)
+  return eod.getTime()
+}
+
+function safeJsonParse(s) {
+  try {
+    return JSON.parse(String(s || ''))
+  } catch {
+    return null
+  }
+}
+
+// --- Google AI Studio quota tracking (persistent) ---
+// Tracks *requests* (not tokens). Enforces:
+// - RPM: per minute window, per key+model
+// - RPD: per local-day, per key+model
+// If RPD is unknown, you can set it via env:
+//   GOOGLE_AI_STUDIO_QUOTA_LIMITS_JSON='{"models":{"gemini-2.5-flash-lite-preview":{"rpm":10,"rpd":200}}}'
+// Quota state is stored under userData/google-ai-studio-quota.json so app restart keeps state.
+const GOOGLE_AI_QUOTA_VERSION = 1
+let googleAiQuotaState = null
+let googleAiQuotaFlushTimer = null
+
+function getDefaultGoogleAiQuotaLimits() {
+  return {
+    models: {
+      // Defaults based on AI Studio free-tier limits (requests, not tokens).
+      // NOTE: If your account tier differs, override via GOOGLE_AI_STUDIO_QUOTA_LIMITS_JSON.
+      'gemini-2.5-flash-lite-preview': { rpm: 10, rpd: 20 },
+      'gemini-2.5-flash-preview-05-20': { rpm: 5, rpd: 20 },
+      'gemini-3.0-flash-preview': { rpm: 5, rpd: 20 },
+      // Not used in our text generation flow, but included for completeness.
+      'gemini-2.5-flash-tts': { rpm: 3, rpd: 10 },
+      'gemma-3-27b-it': { rpm: null, rpd: null }
+    }
+  }
+}
+
+function readQuotaLimitsFromEnv() {
+  const raw = String(process.env.GOOGLE_AI_STUDIO_QUOTA_LIMITS_JSON || '').trim()
+  if (!raw) return null
+  const obj = safeJsonParse(raw)
+  if (!obj || typeof obj !== 'object') return null
+  if (!obj.models || typeof obj.models !== 'object') return null
+  return obj
+}
+
+async function loadGoogleAiQuotaState() {
+  if (googleAiQuotaState) return googleAiQuotaState
+  const p = getUserGoogleAiStudioQuotaPath()
+  let existing = null
+  try {
+    if (fsSync.existsSync(p)) {
+      const txt = fsSync.readFileSync(p, 'utf8')
+      existing = safeJsonParse(txt)
+    }
+  } catch {
+    existing = null
+  }
+
+  const defaults = getDefaultGoogleAiQuotaLimits()
+  const fromEnv = readQuotaLimitsFromEnv()
+
+  googleAiQuotaState = {
+    version: GOOGLE_AI_QUOTA_VERSION,
+    dayKey: getLocalDayKey(),
+    limits: {
+      models: {
+        ...(defaults.models || {}),
+        ...((existing && existing.limits && existing.limits.models) ? existing.limits.models : {}),
+        ...((fromEnv && fromEnv.models) ? fromEnv.models : {})
+      }
+    },
+    perKey: (existing && existing.perKey && typeof existing.perKey === 'object') ? existing.perKey : {}
+  }
+
+  return googleAiQuotaState
+}
+
+function scheduleGoogleAiQuotaFlush() {
+  if (googleAiQuotaFlushTimer) return
+  googleAiQuotaFlushTimer = setTimeout(() => {
+    googleAiQuotaFlushTimer = null
+    try {
+      flushGoogleAiQuotaStateSync()
+    } catch {}
+  }, 250)
+}
+
+function flushGoogleAiQuotaStateSync() {
+  if (!googleAiQuotaState) return
+  try {
+    const p = getUserGoogleAiStudioQuotaPath()
+    fsSync.writeFileSync(p, JSON.stringify(googleAiQuotaState, null, 2), 'utf8')
+  } catch (e) {
+    // ignore
+  }
+}
+
+function coerceLimitNumber(n) {
+  const v = Number(n)
+  if (!Number.isFinite(v)) return null
+  const i = Math.floor(v)
+  if (i <= 0) return null
+  return i
+}
+
+function getModelQuotaLimits(model) {
+  const m = String(model || '').trim()
+  if (!googleAiQuotaState) {
+    const defaults = getDefaultGoogleAiQuotaLimits()
+    return defaults.models[m] || { rpm: null, rpd: null }
+  }
+  const entry = googleAiQuotaState.limits && googleAiQuotaState.limits.models ? googleAiQuotaState.limits.models[m] : null
+  return {
+    rpm: entry ? coerceLimitNumber(entry.rpm) : null,
+    rpd: entry ? coerceLimitNumber(entry.rpd) : null
+  }
+}
+
+function ensureQuotaEntryForKeyModel(state, keyStr, model, nowMs) {
+  const keyId = keyIdForQuota(keyStr)
+  if (!keyId) return null
+  if (!state.perKey[keyId]) state.perKey[keyId] = { models: {} }
+  if (!state.perKey[keyId].models) state.perKey[keyId].models = {}
+  if (!state.perKey[keyId].models[model]) {
+    state.perKey[keyId].models[model] = {
+      minuteKey: Math.floor(nowMs / 60000),
+      rpmUsed: 0,
+      dayKey: state.dayKey,
+      rpdUsed: 0,
+      blockedUntilMs: 0,
+      blockedDayKey: ''
+    }
+  }
+  return state.perKey[keyId].models[model]
+}
+
+function normalizeQuotaEntryForNow(state, entry, nowMs) {
+  const curDay = getLocalDayKey(new Date(nowMs))
+  if (state.dayKey !== curDay) {
+    state.dayKey = curDay
+  }
+  if (entry.dayKey !== state.dayKey) {
+    entry.dayKey = state.dayKey
+    entry.rpdUsed = 0
+    entry.blockedDayKey = ''
+    // Keep blockedUntilMs for minute-level blocks (it will expire).
+    // If a prior day-level block set blockedUntilMs, it should already be in the past.
+    if (entry.blockedUntilMs && entry.blockedUntilMs < nowMs) entry.blockedUntilMs = 0
+  }
+  const curMinute = Math.floor(nowMs / 60000)
+  if (entry.minuteKey !== curMinute) {
+    entry.minuteKey = curMinute
+    entry.rpmUsed = 0
+  }
+}
+
+function quotaIsBlocked(entry, state) {
+  if (!entry) return false
+  const nowMs = Date.now()
+  if (entry.blockedUntilMs && nowMs < entry.blockedUntilMs) return true
+  if (entry.blockedDayKey && entry.blockedDayKey === state.dayKey) return true
+  return false
+}
+
+function quotaCanStart({ key, model }) {
+  if (!googleAiQuotaState) return true
+  const state = googleAiQuotaState
+  const nowMs = Date.now()
+  const m = String(model || '').trim()
+  const entry = ensureQuotaEntryForKeyModel(state, key, m, nowMs)
+  if (!entry) return true
+  normalizeQuotaEntryForNow(state, entry, nowMs)
+  if (quotaIsBlocked(entry, state)) return false
+  const lim = getModelQuotaLimits(m)
+  if (lim.rpm && entry.rpmUsed >= lim.rpm) return false
+  if (lim.rpd && entry.rpdUsed >= lim.rpd) return false
+  return true
+}
+
+function quotaReserveRequest({ key, model }) {
+  if (!googleAiQuotaState) return { ok: true }
+  const state = googleAiQuotaState
+  const nowMs = Date.now()
+  const m = String(model || '').trim()
+  const entry = ensureQuotaEntryForKeyModel(state, key, m, nowMs)
+  if (!entry) return { ok: true }
+  normalizeQuotaEntryForNow(state, entry, nowMs)
+  if (quotaIsBlocked(entry, state)) return { ok: false, reason: 'blocked' }
+  const lim = getModelQuotaLimits(m)
+  if (lim.rpm && entry.rpmUsed >= lim.rpm) return { ok: false, reason: 'rpm' }
+  if (lim.rpd && entry.rpdUsed >= lim.rpd) return { ok: false, reason: 'rpd' }
+  entry.rpmUsed += 1
+  entry.rpdUsed += 1
+  scheduleGoogleAiQuotaFlush()
+  return { ok: true }
+}
+
+function quotaMarkModelKeyExhausted({ key, model, kind }) {
+  if (!googleAiQuotaState) return
+  const state = googleAiQuotaState
+  const nowMs = Date.now()
+  const m = String(model || '').trim()
+  const entry = ensureQuotaEntryForKeyModel(state, key, m, nowMs)
+  if (!entry) return
+  normalizeQuotaEntryForNow(state, entry, nowMs)
+  // RPM: block briefly (until next minute boundary)
+  if (kind === 'rpm') {
+    const nextMinuteMs = (Math.floor(nowMs / 60000) + 1) * 60000
+    entry.blockedUntilMs = Math.max(entry.blockedUntilMs || 0, nextMinuteMs)
+  } else if (kind === 'rpd') {
+    // Daily quota exhausted: block for rest of local day
+    entry.blockedDayKey = state.dayKey
+    entry.blockedUntilMs = Math.max(entry.blockedUntilMs || 0, endOfLocalDayMs(new Date(nowMs)))
+  } else if (kind === 'model') {
+    // Model unavailable / not found: block for a while to avoid spamming
+    entry.blockedUntilMs = Math.max(entry.blockedUntilMs || 0, nowMs + 30 * 60 * 1000)
+  }
+  scheduleGoogleAiQuotaFlush()
 }
 
 function maskApiKey(key) {
@@ -386,13 +638,23 @@ function getNextApiKey(keys) {
   return key
 }
 
+// Model priority list - try free-tier models first, then fallback to paid/larger models
+const GOOGLE_AI_MODEL_PRIORITY = [
+  'gemini-2.5-flash-lite-preview',    // Gemini 2.5 Flash Lite (free tier, 10 RPM)
+  'gemini-2.5-flash-preview-05-20',   // Gemini 2.5 Flash (free tier, 5 RPM)
+  'gemini-3.0-flash-preview',         // Gemini 3 Flash (free tier, 5 RPM)
+  'gemma-3-27b-it',                   // Fallback: Gemma 3 27B
+]
+
+const GOOGLE_AI_FALLBACK_MODEL = 'gemma-3-27b-it'
+
 async function getGoogleAiStudioConfig(payload) {
   // First try multi-key rotation
   const keys = await getActiveApiKeys()
   if (keys && keys.length > 0) {
     const keyItem = getNextApiKey(keys)
     if (keyItem) {
-      const model = process.env.GOOGLE_AI_STUDIO_MODEL || 'gemma-3-27b-it'
+      const model = process.env.GOOGLE_AI_STUDIO_MODEL || GOOGLE_AI_MODEL_PRIORITY[0]
       const endpoint = process.env.GOOGLE_AI_STUDIO_ENDPOINT || 'https://generativelanguage.googleapis.com/v1beta'
       return { key: keyItem.key, model, endpoint }
     }
@@ -400,13 +662,21 @@ async function getGoogleAiStudioConfig(payload) {
   
   // Fallback to env var
   const key = process.env.GOOGLE_AI_STUDIO_API_KEY || process.env.GOOGLE_API_KEY
-  const model = process.env.GOOGLE_AI_STUDIO_MODEL || 'gemma-3-27b-it'
+  const model = process.env.GOOGLE_AI_STUDIO_MODEL || GOOGLE_AI_MODEL_PRIORITY[0]
   const endpoint = process.env.GOOGLE_AI_STUDIO_ENDPOINT || 'https://generativelanguage.googleapis.com/v1beta'
   if (!key) throw new Error('Missing GOOGLE_AI_STUDIO_API_KEY')
   return { key, model, endpoint }
 }
 
-async function googleAiStudioGenerateContent({ key, endpoint, model, prompt, signal }) {
+async function getAllGoogleAiStudioKeys() {
+  const keys = await getActiveApiKeys()
+  if (keys && keys.length > 0) return keys.map((k) => k.key).filter(Boolean)
+  const envKey = process.env.GOOGLE_AI_STUDIO_API_KEY || process.env.GOOGLE_API_KEY
+  return envKey ? [envKey] : []
+}
+
+// Single model generation
+async function googleAiStudioGenerateContentSingle({ key, endpoint, model, prompt, signal }) {
   if (typeof fetch !== 'function') throw new Error('Global fetch is not available in Electron main process')
 
   const base = String(endpoint || '').replace(/\/+$/, '')
@@ -419,8 +689,19 @@ async function googleAiStudioGenerateContent({ key, endpoint, model, prompt, sig
   // Queue + per-key limited parallelism, plus retry/backoff for transient rate limits.
   // The key is used to limit concurrency per-key, so multiple keys can run in parallel.
   return await runGoogleAiTaskWithKey(key, async () => {
+    // Ensure quota state is loaded (persisted across restarts)
+    await loadGoogleAiQuotaState()
     const cached2 = googleAiCacheGet(cacheKey)
     if (cached2 != null) return cached2
+
+    // Proactive quota gating: if local quota says no, fail fast so caller can choose another key/model.
+    const reservation = quotaReserveRequest({ key, model })
+    if (!reservation.ok) {
+      const e = new Error(`LocalQuotaExceeded: ${reservation.reason}`)
+      e.name = 'LocalQuotaError'
+      e.quotaReason = reservation.reason
+      throw e
+    }
 
     const body = JSON.stringify({
       contents: [{ role: 'user', parts: [{ text: promptText }] }],
@@ -484,7 +765,19 @@ async function googleAiStudioGenerateContent({ key, endpoint, model, prompt, sig
       } catch (e) {}
 
       if (!isRetryable || attempt === maxRetries) {
-        throw new Error(`Google AI Studio generateContent failed: ${status} ${t}`)
+        if (isLikelyInvalidApiKeyError(status, t)) {
+          const e = new Error(`Invalid Google AI Studio API key: ${maskApiKey(key)}`)
+          e.name = 'InvalidApiKeyError'
+          e.status = status
+          e.bodyText = t
+          e.apiKey = key
+          throw e
+        }
+
+        const e = new Error(`Google AI Studio generateContent failed: ${status} ${t}`)
+        e.status = status
+        e.bodyText = t
+        throw e
       }
 
       if (retryDelayMs && retryDelayMs > 0) {
@@ -499,6 +792,227 @@ async function googleAiStudioGenerateContent({ key, endpoint, model, prompt, sig
     // should be unreachable
     throw new Error('Google AI Studio generateContent failed after retries')
   })
+}
+
+function classifyGoogleAiError(err) {
+  const status = Number(err && err.status ? err.status : NaN)
+  const msg = String(err && err.message ? err.message : err || '')
+  const lower = msg.toLowerCase()
+  // local quota gate
+  if (err && err.name === 'LocalQuotaError') {
+    const r = String(err.quotaReason || '').toLowerCase()
+    if (r === 'rpd') return { type: 'rpd' }
+    if (r === 'rpm') return { type: 'rpm' }
+    if (r === 'blocked') return { type: 'blocked' }
+    return { type: 'quota' }
+  }
+
+  // Treat these as quota/rate related
+  const isRate =
+    status === 429 ||
+    lower.includes('429') ||
+    lower.includes('too many requests') ||
+    lower.includes('rate limit') ||
+    lower.includes('rate_limit') ||
+    lower.includes('ratelimit')
+
+  const isDaily =
+    lower.includes('daily limit') ||
+    lower.includes('per day') ||
+    lower.includes('requests per') ||
+    lower.includes('rpd')
+
+  const isQuota = lower.includes('quota') || lower.includes('resource_exhausted') || lower.includes('resourceexhausted') || lower.includes('exceeded')
+  const isModelMissing = (lower.includes('model') && lower.includes('not found')) || (lower.includes('model') && lower.includes('not available'))
+  const isServer = status === 503 || lower.includes('503')
+  const isPermission =
+    (status === 401 || status === 403) &&
+    (
+      lower.includes('permission_denied') ||
+      lower.includes('denied access') ||
+      lower.includes('project has been denied access') ||
+      lower.includes('forbidden') ||
+      lower.includes('access denied')
+    )
+
+  if (isModelMissing) return { type: 'model' }
+  if (isPermission) return { type: 'permission' }
+  if (isDaily) return { type: 'rpd' }
+  if (isRate) return { type: 'rpm' }
+  if (isQuota) return { type: 'quota' }
+  if (isServer) return { type: 'server' }
+  return { type: 'other' }
+}
+
+function rotateKeysFromIndex(keys, startIndex) {
+  if (!Array.isArray(keys) || keys.length === 0) return []
+  const s = Math.max(0, Math.floor(startIndex || 0)) % keys.length
+  return keys.slice(s).concat(keys.slice(0, s))
+}
+
+function isLikelyInvalidApiKeyError(status, bodyText) {
+  const st = Number(status)
+  const t = String(bodyText || '')
+  const lower = t.toLowerCase()
+  if (!(st === 400 || st === 401 || st === 403)) return false
+  return (
+    lower.includes('api key not valid') ||
+    lower.includes('invalid api key') ||
+    lower.includes('invalid api-key') ||
+    lower.includes('api_key_invalid') ||
+    (lower.includes('permission_denied') && lower.includes('api key')) ||
+    (lower.includes('invalid_argument') && lower.includes('api key')) ||
+    lower.includes('key is invalid') ||
+    lower.includes('unauthorized') ||
+    lower.includes('forbidden')
+  )
+}
+
+async function disableActiveGoogleAiStudioKeyByValue(keyValue, reason) {
+  const keyStr = String(keyValue || '').trim()
+  if (!keyStr) return null
+  try {
+    const store = await ensureGoogleAiStudioKeysStore()
+    const found = store.items.find((x) => String(x && x.key ? x.key : '').trim() === keyStr)
+    if (!found) return null
+
+    try {
+      await toggleActiveGoogleAiStudioKeyId(found.id, false)
+    } catch {
+      // ignore
+    }
+
+    // Clear cache so rotation picks up changes quickly
+    activeKeysCache = null
+
+    const payload = {
+      id: found.id,
+      name: found.name,
+      masked: maskApiKey(found.key),
+      reason: String(reason || 'invalid')
+    }
+
+    try {
+      for (const win of BrowserWindow.getAllWindows()) {
+        try {
+          win.webContents.send('google-ai-studio:key-invalid', payload)
+        } catch {}
+      }
+    } catch {}
+
+    return payload
+  } catch {
+    return null
+  }
+}
+
+async function googleAiStudioGenerateContentPrimaryThenFallback({ endpoint, prompt, signal, requestedModel }) {
+  await loadGoogleAiQuotaState()
+  const keys = await getAllGoogleAiStudioKeys()
+  if (!keys || keys.length === 0) throw new Error('Missing GOOGLE_AI_STUDIO_API_KEY')
+
+  // Models to use per-key: requestedModel (if not 27B) + priority list excluding 27B, then 27B last.
+  const primaryModels = []
+  const rm = String(requestedModel || '').trim()
+  if (rm && rm !== GOOGLE_AI_FALLBACK_MODEL) primaryModels.push(rm)
+  for (const m of GOOGLE_AI_MODEL_PRIORITY) {
+    if (m === GOOGLE_AI_FALLBACK_MODEL) continue
+    if (!primaryModels.includes(m)) primaryModels.push(m)
+  }
+  const modelsPerKey = [...primaryModels, GOOGLE_AI_FALLBACK_MODEL]
+
+  // Rotate keys for fairness (keeps multi-key parallelism; per-key concurrency queue still applies).
+  const keyOrder = rotateKeysFromIndex(keys, activeKeyIndex)
+  activeKeyIndex = (activeKeyIndex + 1) % keys.length
+
+  let lastErr = null
+  // Per-key fallback: for each key, try models from top->down, with 27B as the last option.
+  // This matches your requirement: only drop to 27B when THAT KEY has exhausted the models above.
+  for (let keyAttempt = 0; keyAttempt < keyOrder.length; keyAttempt++) {
+    const key = keyOrder[keyAttempt]
+    const keyNumber = ((activeKeyIndex + keyAttempt - 1 + keys.length) % keys.length) + 1
+    const keyMasked = maskApiKey(key)
+    for (const model of modelsPerKey) {
+      // Proactive local quota check
+      if (!quotaCanStart({ key, model })) continue
+      try {
+        const out = await googleAiStudioGenerateContentSingle({ key, endpoint, model, prompt, signal })
+        return out
+      } catch (err) {
+        lastErr = err
+        try {
+          err.apiKeyIndex = keyNumber
+          err.apiKeyMasked = keyMasked
+        } catch {}
+
+        // Invalid API key: disable it and move on to next key.
+        if (err && err.name === 'InvalidApiKeyError') {
+          try {
+            await disableActiveGoogleAiStudioKeyByValue(err.apiKey || key, 'invalid')
+          } catch {}
+          // Do not try other models for this key.
+          break
+        }
+
+        const cls = classifyGoogleAiError(err)
+
+        if (cls.type === 'permission') {
+          // Key/project-level access denied (401/403): skip this key and try next key.
+          // Mark current model briefly unavailable for this key to reduce immediate retries.
+          quotaMarkModelKeyExhausted({ key, model, kind: 'model' })
+          break
+        }
+
+        if (cls.type === 'rpm') quotaMarkModelKeyExhausted({ key, model, kind: 'rpm' })
+        else if (cls.type === 'rpd') quotaMarkModelKeyExhausted({ key, model, kind: 'rpd' })
+        else if (cls.type === 'model') quotaMarkModelKeyExhausted({ key, model, kind: 'model' })
+        else if (cls.type === 'quota') {
+          // Unknown quota shape; be conservative and block until next minute.
+          quotaMarkModelKeyExhausted({ key, model, kind: 'rpm' })
+        }
+
+        const shouldContinue =
+          cls.type === 'rpm' ||
+          cls.type === 'rpd' ||
+          cls.type === 'quota' ||
+          cls.type === 'server' ||
+          cls.type === 'model' ||
+          cls.type === 'blocked'
+
+        if (!shouldContinue) {
+          // Non-quota errors should surface immediately (prompt issues, invalid request, etc.)
+          const e = new Error(`${err && err.message ? err.message : String(err || 'Google AI Studio error')} [API key #${keyNumber}: ${keyMasked}]`)
+          e.name = err && err.name ? err.name : 'GoogleAiError'
+          e.status = err && err.status ? err.status : undefined
+          e.bodyText = err && err.bodyText ? err.bodyText : undefined
+          e.apiKeyIndex = keyNumber
+          e.apiKeyMasked = keyMasked
+          throw e
+        }
+        // continue to next model for same key
+      }
+    }
+    // continue to next key
+  }
+
+  if (lastErr && lastErr.apiKeyIndex) {
+    const e = new Error(`${lastErr && lastErr.message ? lastErr.message : 'All keys/models exhausted'} [Last API key #${lastErr.apiKeyIndex}: ${lastErr.apiKeyMasked || ''}]`)
+    e.name = lastErr && lastErr.name ? lastErr.name : 'GoogleAiError'
+    e.status = lastErr && lastErr.status ? lastErr.status : undefined
+    e.bodyText = lastErr && lastErr.bodyText ? lastErr.bodyText : undefined
+    e.apiKeyIndex = lastErr.apiKeyIndex
+    e.apiKeyMasked = lastErr.apiKeyMasked
+    throw e
+  }
+
+  throw (lastErr || new Error('All keys/models exhausted'))
+}
+
+// Main entry point
+async function googleAiStudioGenerateContent({ key, endpoint, model, prompt, signal }) {
+  // `key` is kept for backward compatibility, but selection is now across ALL active keys.
+  // `model` is treated as a requested preference; 27B is only used after exhausting all primary models across all keys.
+  return googleAiStudioGenerateContentPrimaryThenFallback({ endpoint, prompt, signal, requestedModel: model })
 }
 
 function stripCodeFences(s) {
@@ -555,12 +1069,191 @@ async function gemmaSuggestIpa({ key, endpoint, model, word, dialect, signal }) 
   return sanitizeIpaOutput(raw)
 }
 
+async function gemmaGetWordFamily({ key, endpoint, model, word, signal }) {
+  const wRaw = String(word || '').trim()
+  if (!wRaw) return { word: '', family: [] }
+  const w = wRaw
+
+  const isLikelyInflectedVerbForm = (s) => {
+    const t = String(s || '').trim().toLowerCase()
+    if (!t || t.length < 4) return false
+    if (t.includes(' ')) return false
+    // Extra safety: if Gemini returns inflected surface forms, drop them.
+    // (User requirement) If POS is Verb and ends with -ing/-ed => drop.
+    if (t.endsWith('ing') && t.length >= 5) return true
+    if (t.endsWith('ed') && t.length >= 4) return true
+    return false
+  }
+
+  const isInflectionRelation = (rel) => {
+    const r = String(rel || '').toLowerCase()
+    return (
+      r.includes('past') ||
+      r.includes('present') ||
+      r.includes('participle') ||
+      r.includes('gerund') ||
+      r.includes('3rd') ||
+      r.includes('third person') ||
+      r.includes('plural') ||
+      r.includes('inflection')
+    )
+  }
+
+  const normalizeFamilyWord = (wordOut, posOut) => {
+    let s = String(wordOut || '').trim()
+    s = s.replace(/^"+|"+$/g, '').replace(/\s+/g, ' ').trim()
+    const pos = normalizeGemmaPos(posOut || '') || ''
+    if (pos === 'Verb') {
+      // If model outputs "to X", keep the lemma only.
+      s = s.replace(/^to\s+/i, '').trim()
+    }
+    return s
+  }
+
+  const allowedPos = [
+    'Noun',
+    'Verb',
+    'Adjective',
+    'Adverb',
+    'Pronoun',
+    'Preposition',
+    'Conjunction',
+    'Determiner',
+    'Interjection',
+    'Phrase',
+    'Other'
+  ]
+
+  const prompt =
+    `You are an English morphology expert.\n` +
+    `Task: Given an English headword, list its common word-family members (DERIVATIONAL lemmas learners should study).\n` +
+    `Headword: "${w}"\n` +
+    `\n` +
+    `Output MUST be valid JSON only (no markdown, no commentary).\n` +
+    `Schema:\n` +
+    `{\n` +
+    `  "word": string,\n` +
+    `  "family": [\n` +
+    `    { "word": string, "pos": one of ${JSON.stringify(allowedPos)}, "relation": string }\n` +
+    `  ]\n` +
+    `}\n` +
+    `Rules:\n` +
+    `- Include 0 to 8 items.\n` +
+    `- Exclude the headword itself.\n` +
+    `- Prefer the most common forms learners should study.\n` +
+    `- IMPORTANT: Do NOT include inflected forms (NO past tense, NO -ing, NO 3rd person -s, NO plural nouns).\n` +
+    `- If a family member is a VERB: output the BASE FORM/LEMMA only (e.g., "address", not "addresses", "addressed", "addressing").\n` +
+    `- If a family member is a NOUN: output the SINGULAR form only (e.g., "address", not "addresses").\n` +
+    `- relation should be short (e.g., "noun form", "verb form", "adjective form", "adverb form").\n`
+
+  const raw = await googleAiStudioGenerateContent({ key, endpoint, model, prompt, signal })
+  const obj = safeJsonParseObject(raw)
+  const list = Array.isArray(obj && obj.family) ? obj.family : []
+
+  const baseKey = String(w).toLowerCase()
+  const out = []
+  const seen = new Set()
+
+  for (const item of list) {
+    const ww = String(item && item.word ? item.word : '').trim()
+    if (!ww) continue
+    const pos = normalizeGemmaPos(item && item.pos ? item.pos : '') || ''
+    const relationRaw = String(item && item.relation ? item.relation : '').trim().slice(0, 64)
+    if (isInflectionRelation(relationRaw)) continue
+
+    const normalizedWord = normalizeFamilyWord(ww, pos)
+    if (!normalizedWord) continue
+    if (pos === 'Verb' && isLikelyInflectedVerbForm(normalizedWord)) continue
+    const keyWord = normalizedWord.toLowerCase()
+    if (keyWord === baseKey) continue
+    if (seen.has(keyWord)) continue
+    seen.add(keyWord)
+
+    out.push({ word: normalizedWord, pos, relation: relationRaw })
+    if (out.length >= 8) break
+  }
+
+  return { word: w, family: out }
+}
+
+async function gemmaGetSynonyms({ key, endpoint, model, word, signal }) {
+  const wRaw = String(word || '').trim()
+  if (!wRaw) return { word: '', synonyms: [] }
+  const w = wRaw
+
+  const allowedPos = [
+    'Noun',
+    'Verb',
+    'Adjective',
+    'Adverb',
+    'Pronoun',
+    'Preposition',
+    'Conjunction',
+    'Determiner',
+    'Interjection',
+    'Phrase',
+    'Other'
+  ]
+
+  const prompt =
+    `You are an English vocabulary teacher.\n` +
+    `Task: Given an English headword, list its 5 closest synonyms (words with the most similar meaning).\n` +
+    `Headword: "${w}"\n` +
+    `\n` +
+    `Output MUST be valid JSON only (no markdown, no commentary).\n` +
+    `Schema:\n` +
+    `{\n` +
+    `  "word": string,\n` +
+    `  "synonyms": [\n` +
+    `    { "word": string, "pos": one of ${JSON.stringify(allowedPos)}, "relation": string }\n` +
+    `  ]\n` +
+    `}\n` +
+    `Rules:\n` +
+    `- Include exactly 5 synonyms (or fewer only if not enough exist).\n` +
+    `- Rank by semantic closeness; put the most similar synonyms first.\n` +
+    `- Exclude the headword itself.\n` +
+    `- Prefer single words (avoid multi-word phrases unless truly common).\n` +
+    `- For verbs: ALWAYS use the infinitive/base form (e.g., "run" not "running", "ran", "runs").\n` +
+    `- For nouns: use singular form unless the word is typically plural.\n` +
+    `- relation should be short (e.g., "synonym").\n`
+
+  const raw = await googleAiStudioGenerateContent({ key, endpoint, model, prompt, signal })
+  const obj = safeJsonParseObject(raw)
+  const list = Array.isArray(obj && obj.synonyms) ? obj.synonyms : []
+
+  const baseKey = String(w).toLowerCase()
+  const out = []
+  const seen = new Set()
+
+  for (const item of list) {
+    const ww = String(item && item.word ? item.word : '').trim()
+    if (!ww) continue
+    const normalizedWord = ww
+      .replace(/^"+|"+$/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+    if (!normalizedWord) continue
+    const keyWord = normalizedWord.toLowerCase()
+    if (keyWord === baseKey) continue
+    if (seen.has(keyWord)) continue
+    seen.add(keyWord)
+
+    const pos = normalizeGemmaPos(item && item.pos ? item.pos : '') || ''
+    const relation = String(item && item.relation ? item.relation : 'synonym').trim().slice(0, 64) || 'synonym'
+    out.push({ word: normalizedWord, pos, relation })
+    if (out.length >= 5) break
+  }
+
+  return { word: w, synonyms: out }
+}
+
 async function gemmaEnrichWord({ key, endpoint, model, word, contextSentenceEn, from, to, dialect, signal }) {
   const w = String(word || '').trim()
   const ctx = String(contextSentenceEn || '').trim()
   if (!w) {
     return {
       meaningSuggested: '',
+      meaningNoteVi: '',
       candidates: [],
       posSuggested: '',
       ipa: '',
@@ -587,6 +1280,8 @@ async function gemmaEnrichWord({ key, endpoint, model, word, contextSentenceEn, 
   const src = String(from || 'en')
   const dst = String(to || 'vi')
 
+  const hasContext = !!ctx
+
   const prompt =
     `You are a bilingual English→Vietnamese dictionary assistant.\n` +
     `Given a selected term and an optional English context sentence, produce a compact word card: Vietnamese meanings + POS + IPA + one example sentence, and translate the context sentence to Vietnamese if provided.\n` +
@@ -598,6 +1293,7 @@ async function gemmaEnrichWord({ key, endpoint, model, word, contextSentenceEn, 
     `Schema:\n` +
     `{\n` +
     `  "meaningSuggested": string,\n` +
+    `  "meaningNoteVi": string,\n` +
     `  "posSuggested": one of ${JSON.stringify(allowedPos)},\n` +
     `  "ipa": string,\n` +
     `  "example": string,\n` +
@@ -608,10 +1304,15 @@ async function gemmaEnrichWord({ key, endpoint, model, word, contextSentenceEn, 
     `}\n` +
     `Rules:\n` +
     `- Provide 3 to 7 candidates if possible.\n` +
+    `- Candidates should represent DISTINCT senses. Do NOT list minor synonym variations as separate candidates; merge them.\n` +
     `- Each candidate.vi is a short Vietnamese gloss (not a full sentence).\n` +
     `- back: short English hints/synonyms (0-5 items).\n` +
-    `- meaningSuggested must exactly equal one of candidates[i].vi (best for the context).\n` +
+    (hasContext
+      ? `- meaningSuggested must exactly equal one of candidates[i].vi (best for the context).\n`
+      : `- If NO context sentence is provided: meaningSuggested should be a semicolon-separated list of 1 to 3 DISTINCT senses, and each sense must exactly equal one of candidates[i].vi.\n`) +
     `- posSuggested should match the POS of meaningSuggested.\n` +
+    `- meaningNoteVi: 1-2 concise Vietnamese sentences explaining the core sense/usage nuance of meaningSuggested.\n` +
+    `- meaningNoteVi MUST focus only on this term; do NOT compare or mention other terms.\n` +
     `- ipa: IPA for "${w}" in ${d}, wrapped in slashes like /həˈloʊ/. If the term is a multi-word expression, set ipa to empty string.\n` +
     `- example: ONE short English sentence (<= 25 words) using the term in the SAME meaning as meaningSuggested.\n` +
     `- contextSentenceVi: translate the context sentence from ${src} to ${dst} if context is provided, else empty string.\n`
@@ -620,17 +1321,41 @@ async function gemmaEnrichWord({ key, endpoint, model, word, contextSentenceEn, 
   const obj = safeJsonParseObject(raw) || {}
 
   const candidates = dedupeCandidates(obj.candidates)
-  let meaningSuggested = obj.meaningSuggested ? String(obj.meaningSuggested || '').trim() : ''
-  if (meaningSuggested) {
-    const found = candidates.find((c) => normalizeMeaningForMatch(c.vi) === normalizeMeaningForMatch(meaningSuggested))
-    meaningSuggested = found ? found.vi : ''
+  const meaningSuggestedRaw = obj.meaningSuggested ? String(obj.meaningSuggested || '').trim() : ''
+  let meaningSuggested = ''
+
+  if (meaningSuggestedRaw) {
+    const exact = candidates.find((c) => normalizeMeaningForMatch(c.vi) === normalizeMeaningForMatch(meaningSuggestedRaw))
+    if (exact) {
+      meaningSuggested = exact.vi
+    } else if (!hasContext) {
+      const parts = splitMeaningList(meaningSuggestedRaw)
+      const picked = []
+      for (const p of parts) {
+        const found = candidates.find((c) => normalizeMeaningForMatch(c.vi) === normalizeMeaningForMatch(p))
+        if (!found) continue
+        if (picked.some((x) => meaningsTooClose(x, found.vi))) continue
+        picked.push(found.vi)
+        if (picked.length >= 3) break
+      }
+      if (picked.length > 0) meaningSuggested = picked.join('; ')
+    }
   }
-  if (!meaningSuggested && candidates.length > 0) meaningSuggested = candidates[0].vi
+
+  if (!meaningSuggested && candidates.length > 0) {
+    if (!hasContext) {
+      const picked = selectDistinctMeaningsFromCandidates(candidates, 3)
+      meaningSuggested = picked.join('; ')
+    } else {
+      meaningSuggested = candidates[0].vi
+    }
+  }
 
   let posSuggested = normalizeGemmaPos(obj.posSuggested)
   if (!posSuggested) {
-    const byMeaning = meaningSuggested
-      ? candidates.find((c) => normalizeMeaningForMatch(c.vi) === normalizeMeaningForMatch(meaningSuggested))
+    const primaryMeaning = splitMeaningList(meaningSuggested)[0] || meaningSuggested
+    const byMeaning = primaryMeaning
+      ? candidates.find((c) => normalizeMeaningForMatch(c.vi) === normalizeMeaningForMatch(primaryMeaning))
       : null
     posSuggested = normalizeGemmaPos(byMeaning && byMeaning.pos ? byMeaning.pos : '')
   }
@@ -651,16 +1376,183 @@ async function gemmaEnrichWord({ key, endpoint, model, word, contextSentenceEn, 
   // Strip surrounding quotes.
   example = example.replace(/^"+|"+$/g, '').trim()
 
+  const meaningNoteVi = obj.meaningNoteVi ? String(obj.meaningNoteVi || '').trim() : ''
+
   const contextSentenceVi = obj.contextSentenceVi ? String(obj.contextSentenceVi || '').trim() : ''
 
   return {
     meaningSuggested: meaningSuggested || '',
+    meaningNoteVi: meaningNoteVi || '',
     candidates,
     posSuggested: posSuggested || '',
     ipa: ipa || '',
     example: example || '',
     contextSentenceVi: contextSentenceVi || ''
   }
+}
+
+async function gemmaEnrichWordsBulk({ key, endpoint, model, words, contextSentenceEn, from, to, dialect, signal }) {
+  const listRaw = Array.isArray(words) ? words : []
+  const list = listRaw
+    .map((x) => String(x || '').trim())
+    .filter(Boolean)
+    .slice(0, 3)
+
+  const ctx = String(contextSentenceEn || '').trim()
+  if (list.length === 0) return []
+
+  const allowedPos = [
+    'Noun',
+    'Verb',
+    'Adjective',
+    'Adverb',
+    'Pronoun',
+    'Preposition',
+    'Conjunction',
+    'Determiner',
+    'Interjection',
+    'Phrase',
+    'Other'
+  ]
+
+  const d = (dialect === 'UK' ? 'British English (UK)' : 'American English (US)')
+  const src = String(from || 'en')
+  const dst = String(to || 'vi')
+  const hasContext = !!ctx
+
+  const prompt =
+    `You are a bilingual English→Vietnamese dictionary assistant.\n` +
+    `Task: For each provided English term, produce a compact word card: Vietnamese meanings + POS + IPA + one example sentence, and translate the shared context sentence to Vietnamese if provided.\n` +
+    `\n` +
+    `Terms: ${JSON.stringify(list)}\n` +
+    (ctx ? `Context sentence (English): "${ctx}"\n` : '') +
+    `\n` +
+    `Output MUST be valid JSON only (no markdown, no commentary).\n` +
+    `Schema:\n` +
+    `{\n` +
+    `  "items": [\n` +
+    `    {\n` +
+    `      "word": string,\n` +
+    `      "meaningSuggested": string,\n` +
+    `      "meaningNoteVi": string,\n` +
+    `      "posSuggested": one of ${JSON.stringify(allowedPos)},\n` +
+    `      "ipa": string,\n` +
+    `      "example": string,\n` +
+    `      "contextSentenceVi": string,\n` +
+    `      "candidates": [ { "vi": string, "pos": one of ${JSON.stringify(allowedPos)}, "back": string[] } ]\n` +
+    `    }\n` +
+    `  ]\n` +
+    `}\n` +
+    `Rules (apply to EACH item):\n` +
+    `- Provide 3 to 7 candidates if possible.\n` +
+    `- Candidates should represent DISTINCT senses. Do NOT list minor synonym variations as separate candidates; merge them.\n` +
+    `- Each candidate.vi is a short Vietnamese gloss (not a full sentence).\n` +
+    `- back: short English hints/synonyms (0-5 items).\n` +
+    (hasContext
+      ? `- meaningSuggested must exactly equal one of candidates[i].vi (best for the context).\n`
+      : `- If NO context sentence is provided: meaningSuggested should be a semicolon-separated list of 1 to 3 DISTINCT senses, and each sense must exactly equal one of candidates[i].vi.\n`) +
+    `- posSuggested should match the POS of meaningSuggested.\n` +
+    `- meaningNoteVi: 1-2 concise Vietnamese sentences explaining the core sense/usage nuance of meaningSuggested.\n` +
+    `- meaningNoteVi MUST focus only on this term; do NOT compare or mention other terms.\n` +
+    `- ipa: IPA for the word in ${d}, wrapped in slashes like /həˈloʊ/. If the term is a multi-word expression, set ipa to empty string.\n` +
+    `- example: ONE short English sentence (<= 25 words) using the term in the SAME meaning as meaningSuggested.\n` +
+    `- contextSentenceVi: translate the shared context sentence from ${src} to ${dst} if context is provided, else empty string.\n`
+
+  const raw = await googleAiStudioGenerateContent({ key, endpoint, model, prompt, signal })
+  const obj = safeJsonParseObject(raw) || {}
+  const items = Array.isArray(obj && obj.items) ? obj.items : (Array.isArray(obj && obj.results) ? obj.results : [])
+
+  const byKey = new Map(list.map((w) => [String(w).toLowerCase(), w]))
+  const outByKey = new Map()
+
+  for (const item of items) {
+    const wRaw = String(item && item.word ? item.word : '').trim()
+    if (!wRaw) continue
+    const keyWord = wRaw.toLowerCase()
+    if (!byKey.has(keyWord)) continue
+
+    const candidates = dedupeCandidates(item && item.candidates ? item.candidates : [])
+    const meaningSuggestedRaw = item && item.meaningSuggested ? String(item.meaningSuggested || '').trim() : ''
+    let meaningSuggested = ''
+
+    if (meaningSuggestedRaw) {
+      const exact = candidates.find((c) => normalizeMeaningForMatch(c.vi) === normalizeMeaningForMatch(meaningSuggestedRaw))
+      if (exact) {
+        meaningSuggested = exact.vi
+      } else if (!hasContext) {
+        const parts = splitMeaningList(meaningSuggestedRaw)
+        const picked = []
+        for (const p of parts) {
+          const found = candidates.find((c) => normalizeMeaningForMatch(c.vi) === normalizeMeaningForMatch(p))
+          if (!found) continue
+          if (picked.some((x) => meaningsTooClose(x, found.vi))) continue
+          picked.push(found.vi)
+          if (picked.length >= 3) break
+        }
+        if (picked.length > 0) meaningSuggested = picked.join('; ')
+      }
+    }
+
+    if (!meaningSuggested && candidates.length > 0) {
+      if (!hasContext) {
+        const picked = selectDistinctMeaningsFromCandidates(candidates, 3)
+        meaningSuggested = picked.join('; ')
+      } else {
+        meaningSuggested = candidates[0].vi
+      }
+    }
+
+    let posSuggested = normalizeGemmaPos(item && item.posSuggested ? item.posSuggested : '')
+    if (!posSuggested) {
+      const primaryMeaning = splitMeaningList(meaningSuggested)[0] || meaningSuggested
+      const byMeaning = primaryMeaning
+        ? candidates.find((c) => normalizeMeaningForMatch(c.vi) === normalizeMeaningForMatch(primaryMeaning))
+        : null
+      posSuggested = normalizeGemmaPos(byMeaning && byMeaning.pos ? byMeaning.pos : '')
+    }
+
+    let ipa = ''
+    if (!/\s/.test(wRaw)) {
+      ipa = sanitizeIpaOutput(item && item.ipa ? item.ipa : '')
+    }
+
+    let example = item && item.example ? String(item.example || '').trim() : ''
+    if (example.includes('\n')) {
+      example = example
+        .split(/\r?\n/)
+        .map((x) => x.trim())
+        .filter(Boolean)[0] || ''
+    }
+    example = example.replace(/^"+|"+$/g, '').trim()
+
+    const contextSentenceVi = item && item.contextSentenceVi ? String(item.contextSentenceVi || '').trim() : ''
+    const meaningNoteVi = item && item.meaningNoteVi ? String(item.meaningNoteVi || '').trim() : ''
+
+    outByKey.set(keyWord, {
+      word: byKey.get(keyWord) || wRaw,
+      meaningSuggested: meaningSuggested || '',
+      meaningNoteVi: meaningNoteVi || '',
+      candidates,
+      posSuggested: posSuggested || '',
+      ipa: ipa || '',
+      example: example || '',
+      contextSentenceVi: contextSentenceVi || ''
+    })
+  }
+
+  return list.map((w) => {
+    const keyWord = String(w).toLowerCase()
+    return outByKey.get(keyWord) || {
+      word: w,
+      meaningSuggested: '',
+      meaningNoteVi: '',
+      candidates: [],
+      posSuggested: '',
+      ipa: '',
+      example: '',
+      contextSentenceVi: ''
+    }
+  })
 }
 
 function extractFirstJsonObject(s) {
@@ -750,7 +1642,7 @@ async function gemmaSuggestMeaningCandidates({ key, endpoint, model, word, conte
   const w = String(word || '').trim()
   const ctx = String(contextSentenceEn || '').trim()
   if (!w) {
-    return { candidates: [], meaningSuggested: '', contextSentenceVi: '' }
+    return { candidates: [], meaningSuggested: '', meaningNoteVi: '', contextSentenceVi: '' }
   }
 
   const allowedPos = [
@@ -779,31 +1671,99 @@ async function gemmaSuggestMeaningCandidates({ key, endpoint, model, word, conte
     `Schema:\n` +
     `{\n` +
     `  "meaningSuggested": string,\n` +
+    `  "meaningNoteVi": string,\n` +
     `  "candidates": [\n` +
     `    { "vi": string, "pos": one of ${JSON.stringify(allowedPos)}, "back": string[] }\n` +
     `  ]\n` +
     `}\n` +
     `Rules:\n` +
     `- Provide 3 to 7 candidates if possible.\n` +
+    `- Candidates should represent DISTINCT senses. Do NOT list minor synonym variations as separate candidates; merge them.\n` +
     `- Each candidate.vi should be a short Vietnamese gloss (not a full sentence).\n` +
     `- back: short English hints/synonyms (0-5 items).\n` +
-    `- meaningSuggested must exactly equal one of candidates[i].vi (best for the context).\n` +
+    `- meaningNoteVi: 1-2 concise Vietnamese sentences explaining the core sense/usage nuance of meaningSuggested.\n` +
+    `- meaningNoteVi MUST focus only on this term; do NOT compare or mention other terms.\n` +
+    (ctx
+      ? `- meaningSuggested must exactly equal one of candidates[i].vi (best for the context).\n`
+      : `- If NO context sentence is provided: meaningSuggested should be a semicolon-separated list of 1 to 3 DISTINCT senses, and each sense must exactly equal one of candidates[i].vi.\n`) +
     `- If the selected term is a multi-word expression, use pos="Phrase".\n`
 
   const raw = await googleAiStudioGenerateContent({ key, endpoint, model, prompt, signal })
   const obj = safeJsonParseObject(raw)
   const candidates = dedupeCandidates(obj && obj.candidates)
-  let meaningSuggested = obj && obj.meaningSuggested ? String(obj.meaningSuggested || '').trim() : ''
-  if (meaningSuggested) {
-    const found = candidates.find((c) => normalizeMeaningForMatch(c.vi) === normalizeMeaningForMatch(meaningSuggested))
-    if (found) meaningSuggested = found.vi
-    else meaningSuggested = ''
+  const hasContext = !!ctx
+  const meaningSuggestedRaw = obj && obj.meaningSuggested ? String(obj.meaningSuggested || '').trim() : ''
+  let meaningSuggested = ''
+
+  if (meaningSuggestedRaw) {
+    const exact = candidates.find((c) => normalizeMeaningForMatch(c.vi) === normalizeMeaningForMatch(meaningSuggestedRaw))
+    if (exact) {
+      meaningSuggested = exact.vi
+    } else if (!hasContext) {
+      const parts = splitMeaningList(meaningSuggestedRaw)
+      const picked = []
+      for (const p of parts) {
+        const found = candidates.find((c) => normalizeMeaningForMatch(c.vi) === normalizeMeaningForMatch(p))
+        if (!found) continue
+        if (picked.some((x) => meaningsTooClose(x, found.vi))) continue
+        picked.push(found.vi)
+        if (picked.length >= 3) break
+      }
+      if (picked.length > 0) meaningSuggested = picked.join('; ')
+    }
   }
 
-  // If model didn't follow the rule, pick the first candidate.
-  if (!meaningSuggested && candidates.length > 0) meaningSuggested = candidates[0].vi
+  if (!meaningSuggested && candidates.length > 0) {
+    if (!hasContext) {
+      const picked = selectDistinctMeaningsFromCandidates(candidates, 3)
+      meaningSuggested = picked.join('; ')
+    } else {
+      meaningSuggested = candidates[0].vi
+    }
+  }
 
-  return { candidates, meaningSuggested, contextSentenceVi: '' }
+  const meaningNoteVi = obj && obj.meaningNoteVi ? String(obj.meaningNoteVi || '').trim() : ''
+
+  return { candidates, meaningSuggested, meaningNoteVi, contextSentenceVi: '' }
+}
+
+async function gemmaGenerateMeaningNoteVi({ key, endpoint, model, word, meaningSuggested, contextSentenceEn, signal }) {
+  const w = String(word || '').trim()
+  const m = String(meaningSuggested || '').trim()
+  const ctx = String(contextSentenceEn || '').trim()
+  if (!w || !m) return ''
+
+  const prompt =
+    `You are a Vietnamese lexicography assistant.\n` +
+    `Write 1-2 concise Vietnamese sentences explaining the usage nuance of the target English term in the given meaning.\n` +
+    `Output ONLY plain Vietnamese text (no markdown, no bullets, no labels).\n` +
+    `Rules:\n` +
+    `- Focus only on the target term and this meaning.\n` +
+    `- Do NOT compare with or mention any other terms.\n` +
+    `- Keep it concise and practical for learners.\n` +
+    `\n` +
+    `Target term: "${w}"\n` +
+    `Chosen Vietnamese meaning: "${m}"\n` +
+    (ctx ? `Context sentence (English): "${ctx}"\n` : '')
+
+  const out = await googleAiStudioGenerateContent({ key, endpoint, model, prompt, signal })
+  return String(out || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .replace(/^\s*[-*\u2022]\s*/gm, '')
+    .replace(/\n+/g, ' ')
+    .trim()
+}
+
+function buildMeaningNoteViFallback(word, meaningSuggested, contextSentenceEn) {
+  const w = String(word || '').trim()
+  const m = String(meaningSuggested || '').trim()
+  const ctx = String(contextSentenceEn || '').trim()
+  if (!w || !m) return ''
+  if (ctx) {
+    return `Trong ngữ cảnh này, "${w}" được dùng với nghĩa "${m}". Hãy bám vào sắc thái này để hiểu và dùng từ đúng.`
+  }
+  return `"${w}" thường được hiểu là "${m}". Ghi nhớ nghĩa trọng tâm này để áp dụng chính xác khi gặp từ trong câu.`
 }
 
 async function googleTranslatePlain({ key, endpoint, model, from, to, text, signal }) {
@@ -822,6 +1782,522 @@ async function googleTranslatePlain({ key, endpoint, model, from, to, text, sign
 
   const out = await googleAiStudioGenerateContent({ key, endpoint, model, prompt, signal })
   return String(out || '').trim()
+}
+
+function normalizeLookupWord(word) {
+  return String(word || '')
+    .trim()
+    .replace(/^\s+|\s+$/g, '')
+    .replace(/^[^a-z0-9]+|[^a-z0-9]+$/gi, '')
+}
+
+function uniqueWords(words) {
+  const seen = new Set()
+  const result = []
+  for (const item of words) {
+    const clean = normalizeLookupWord(item)
+    const key = clean.toLowerCase()
+    if (!clean || seen.has(key)) continue
+    seen.add(key)
+    result.push(clean)
+  }
+  return result
+}
+
+function buildLookupCandidates(word) {
+  const cleanWord = normalizeLookupWord(word)
+  if (!cleanWord) return []
+
+  const lower = cleanWord.toLowerCase()
+  const candidates = [cleanWord, lower, lower.replace(/[’']s$/i, '')]
+
+  if (lower.endsWith('ies') && lower.length > 3) candidates.push(lower.slice(0, -3) + 'y')
+  if (lower.endsWith('ves') && lower.length > 3) {
+    candidates.push(lower.slice(0, -3) + 'f')
+    candidates.push(lower.slice(0, -3) + 'fe')
+  }
+  if (lower.endsWith('ing') && lower.length > 4) {
+    candidates.push(lower.slice(0, -3))
+    candidates.push(lower.slice(0, -3).replace(/([a-z])\1$/i, '$1'))
+  }
+  if (lower.endsWith('ed') && lower.length > 3) {
+    candidates.push(lower.slice(0, -2))
+    candidates.push(lower.slice(0, -1))
+  }
+  if (lower.endsWith('es') && lower.length > 3) candidates.push(lower.slice(0, -2))
+  if (lower.endsWith('s') && lower.length > 2) candidates.push(lower.slice(0, -1))
+
+  return uniqueWords(candidates)
+}
+
+function normalizeDefinition(definition) {
+  return String(definition || '')
+    .trim()
+    .replace(/\s+/g, ' ')
+}
+
+function stripHtml(input) {
+  return String(input || '').replace(/<[^>]+>/g, ' ')
+}
+
+function cleanDefinitionText(input) {
+  return normalizeDefinition(decodeHtmlEntities(stripHtml(input)))
+}
+
+function clipDefinition(text, maxLength = 320) {
+  const clean = normalizeDefinition(text)
+  if (!clean) return ''
+  if (clean.length <= maxLength) return clean
+
+  const sentence = clean.match(/^(.{1,260}?\.[\s"')\]]|.{1,260}?$)/)
+  const clipped = sentence ? sentence[1].replace(/[\s"')\]]+$/g, '') : clean.slice(0, maxLength - 3)
+  return clipped.length > maxLength ? `${clipped.slice(0, maxLength - 3)}...` : clipped
+}
+
+function normalizeBingDefinition(definition) {
+  const raw = String(definition || '').replace(/\r/g, '').trim()
+  if (!raw) return ''
+
+  const looksStructured = /\[[A-Z]+\]/.test(raw) || /\n\s*\d+\.\s+/.test(raw)
+  if (!looksStructured) return clipDefinition(raw)
+
+  const lines = raw
+    .split('\n')
+    .map((line) => line.trimEnd())
+    .filter((line) => !!line.trim())
+
+  if (lines.length === 0) return ''
+
+  const limited = lines.slice(0, 16)
+  return limited.join('\n').trim()
+}
+
+function pickDefinitionFromEntry(entry) {
+  const meanings = Array.isArray(entry?.meanings) ? entry.meanings : []
+  for (const meaning of meanings) {
+    const definitions = Array.isArray(meaning?.definitions) ? meaning.definitions : []
+    for (const item of definitions) {
+      const definition = normalizeDefinition(item?.definition)
+      if (definition) return definition
+    }
+  }
+  return ''
+}
+
+async function fetchDictionaryApiDefinition(word) {
+  const resp = await fetch(`https://api.dictionaryapi.dev/api/v2/entries/en/${encodeURIComponent(word)}`)
+  if (!resp.ok) return ''
+  const data = await resp.json()
+  if (!Array.isArray(data) || data.length === 0) return ''
+
+  for (const entry of data) {
+    const definition = pickDefinitionFromEntry(entry)
+    if (definition) return definition
+  }
+
+  return ''
+}
+
+function pickWiktionaryDefinition(item) {
+  const defs = Array.isArray(item?.definitions) ? item.definitions : []
+  let formOfCandidate = ''
+
+  for (const def of defs) {
+    const text = cleanDefinitionText(def?.definition)
+    if (!text) continue
+
+    if (!/\b(form of|inflection of|plural of|past tense of|participle of)\b/i.test(text)) {
+      return text
+    }
+    if (!formOfCandidate) formOfCandidate = text
+  }
+
+  return formOfCandidate
+}
+
+async function fetchWiktionaryDefinition(word) {
+  const resp = await fetch(`https://en.wiktionary.org/api/rest_v1/page/definition/${encodeURIComponent(word)}`)
+  if (!resp.ok) return ''
+
+  const data = await resp.json()
+  const enEntries = Array.isArray(data?.en) ? data.en : []
+  for (const entry of enEntries) {
+    const definition = pickWiktionaryDefinition(entry)
+    if (definition) return clipDefinition(definition)
+  }
+
+  return ''
+}
+
+async function fetchWikipediaSummaryDefinition(word) {
+  const resp = await fetch(`https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(word)}`)
+  if (!resp.ok) return ''
+
+  const data = await resp.json()
+  const extract = cleanDefinitionText(data?.extract)
+  if (!extract) return ''
+  if (/\bmay refer to\b/i.test(extract)) return ''
+
+  return clipDefinition(extract)
+}
+
+function escapeRegex(text) {
+  return String(text || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function decodeHtmlEntities(text) {
+  return String(text || '')
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCharCode(parseInt(n, 16)))
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+}
+
+
+const definitionCache = new Map()
+
+function resolveBingPythonScriptPath() {
+  const candidates = [
+    path.join(__dirname, '..', 'scripts', 'bing_definition.py'),
+    path.join(process.cwd(), 'scripts', 'bing_definition.py')
+  ]
+  for (const p of candidates) {
+    try {
+      if (p && fsSync.existsSync(p)) return p
+    } catch {
+      // ignore
+    }
+  }
+  return ''
+}
+
+async function runPythonOnce(command, args, timeoutMs = 15000) {
+  return await new Promise((resolve, reject) => {
+    let stdout = ''
+    let stderr = ''
+    let settled = false
+    let timer = null
+
+    let child
+    try {
+      child = spawn(command, args, {
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe']
+      })
+    } catch (e) {
+      reject(e)
+      return
+    }
+
+    const doneResolve = (value) => {
+      if (settled) return
+      settled = true
+      if (timer) clearTimeout(timer)
+      resolve(value)
+    }
+
+    const doneReject = (err) => {
+      if (settled) return
+      settled = true
+      if (timer) clearTimeout(timer)
+      reject(err)
+    }
+
+    if (child.stdout) {
+      child.stdout.on('data', (chunk) => {
+        stdout += String(chunk || '')
+      })
+    }
+
+    if (child.stderr) {
+      child.stderr.on('data', (chunk) => {
+        stderr += String(chunk || '')
+      })
+    }
+
+    child.on('error', doneReject)
+    child.on('close', (code) => {
+      if (code === 0) {
+        doneResolve(stdout)
+      } else {
+        doneReject(new Error(`python exited ${code}: ${String(stderr || '').trim()}`))
+      }
+    })
+
+    timer = setTimeout(() => {
+      try { child.kill() } catch {}
+      doneReject(new Error(`python timeout after ${timeoutMs}ms`))
+    }, timeoutMs)
+  })
+}
+
+async function fetchBingDefinitionViaPython(word) {
+  const scriptPath = resolveBingPythonScriptPath()
+  const w = String(word || '').trim()
+  if (!w) return ''
+  if (!scriptPath) {
+    console.warn('[bing-python] script not found; skip', { word: w })
+    return ''
+  }
+
+  const cmdCandidates = []
+  const explicitPython = String(process.env.PYTHON || '').trim()
+  if (explicitPython) {
+    cmdCandidates.push({ command: explicitPython, args: [scriptPath, w] })
+  }
+  cmdCandidates.push({ command: 'python', args: [scriptPath, w] })
+  cmdCandidates.push({ command: 'py', args: ['-3', scriptPath, w] })
+
+  let lastError = ''
+
+  for (const item of cmdCandidates) {
+    try {
+      const out = await runPythonOnce(item.command, item.args, 15000)
+      const obj = safeJsonParse(String(out || '').trim())
+      const definition = String((obj && obj.definition) || '').trim()
+      if (definition) return definition
+      if (obj && Object.prototype.hasOwnProperty.call(obj, 'definition')) return ''
+    } catch (e) {
+      lastError = e && e.message ? e.message : String(e)
+    }
+  }
+
+  if (lastError) {
+    console.warn('[bing-python] all python commands failed; fallback to non-bing sources', {
+      word: w,
+      error: lastError
+    })
+  }
+
+  return ''
+}
+
+function cleanHtmlText(text) {
+  return decodeHtmlEntities(String(text || '').replace(/<[^>]+>/g, ' '))
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function extractClassBlocks(html, className) {
+  const source = String(html || '')
+  if (!source || !className) return []
+  const cls = escapeRegex(className)
+  const regex = new RegExp(`<([a-z0-9-]+)[^>]*class=["'][^"']*\\b${cls}\\b[^"']*["'][^>]*>([\\s\\S]*?)<\\/\\1>`, 'gi')
+  const out = []
+  let match
+  while ((match = regex.exec(source))) {
+    out.push(match[2] || '')
+  }
+  return out
+}
+
+function extractFirstClassText(html, className) {
+  const blocks = extractClassBlocks(html, className)
+  if (blocks.length === 0) return ''
+  return cleanHtmlText(blocks[0])
+}
+
+function parseBingDefinitionText(html) {
+  const source = String(html || '')
+  if (!source) return ''
+
+  const rootMatch = source.match(/<dict-common-module[\s\S]*?<\/dict-common-module>/i)
+  const root = rootMatch ? rootMatch[0] : source
+  const groups = extractClassBlocks(root, 'common-module-group')
+  const lines = []
+
+  for (const group of groups) {
+    const pos = extractFirstClassText(group, 'common-definitions-pos-inner') || 'other'
+    const itemBlocks = extractClassBlocks(group, 'common-definition-content')
+    const defs = []
+
+    for (const item of itemBlocks) {
+      const mainDef = extractFirstClassText(item, 'common-module-maindef') || cleanHtmlText(item)
+      if (!mainDef) continue
+      defs.push(mainDef)
+      if (defs.length >= 3) break
+    }
+
+    if (defs.length === 0) continue
+    lines.push(`[${pos}]`)
+    defs.forEach((def, idx) => {
+      lines.push(`  ${idx + 1}. ${def}`)
+    })
+  }
+
+  return lines.join('\n').trim()
+}
+
+let bingLookupWindow = null
+let bingLookupQueue = Promise.resolve()
+
+function queueBingLookup(task) {
+  const run = () => Promise.resolve().then(task)
+  const next = bingLookupQueue.then(run, run)
+  bingLookupQueue = next.catch(() => {})
+  return next
+}
+
+function getBingLookupWindow() {
+  if (bingLookupWindow && !bingLookupWindow.isDestroyed()) return bingLookupWindow
+  bingLookupWindow = new BrowserWindow({
+    show: false,
+    width: 1200,
+    height: 900,
+    webPreferences: {
+      sandbox: false,
+      contextIsolation: true,
+    },
+  })
+  bingLookupWindow.on('closed', () => {
+    bingLookupWindow = null
+  })
+  return bingLookupWindow
+}
+
+async function waitForBingDictCard(win, timeoutMs = 12000) {
+  const startedAt = Date.now()
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      const exists = await win.webContents.executeJavaScript(
+        "Boolean(document.querySelector('dict-common-module'))",
+        true
+      )
+      if (exists) return true
+    } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 250))
+  }
+  return false
+}
+
+async function extractBingDefinitionFromRenderedDom(win) {
+  return await win.webContents.executeJavaScript(
+    `(() => {
+      const card = document.querySelector('dict-common-module')
+      if (!card) return ''
+
+      const lines = []
+      const groups = card.querySelectorAll('.common-module-group')
+      for (const group of groups) {
+        const pos = (group.querySelector('.common-definitions-pos-inner')?.textContent || 'UNKNOWN').trim().toUpperCase()
+        const defs = []
+        const items = Array.from(group.querySelectorAll('li.common-definition-content')).slice(0, 2)
+        for (const item of items) {
+          const text = (item.querySelector('.common-module-maindef')?.textContent || '').trim()
+          if (text) defs.push(text)
+        }
+
+        if (defs.length === 0) continue
+        lines.push('[' + pos + ']')
+        defs.forEach((def, idx) => {
+          lines.push('  ' + (idx + 1) + '. ' + def)
+        })
+      }
+
+      return lines.join('\\n').trim()
+    })()`,
+    true
+  )
+}
+
+async function fetchEnglishDefinition(word) {
+  const cleanWord = String(word || '').trim()
+  if (!cleanWord) return ''
+
+  const cacheKey = cleanWord.toLowerCase()
+  const cached = definitionCache.get(cacheKey)
+  if (cached) return cached
+
+  const pending = (async () => {
+    try {
+      const candidates = buildLookupCandidates(cleanWord)
+
+      for (const candidate of candidates) {
+        try {
+          const bingDefinition = await fetchBingDefinitionViaPython(candidate)
+          if (bingDefinition) return normalizeBingDefinition(bingDefinition)
+        } catch {
+          // try next candidate
+        }
+      }
+    } catch {
+      // ignore network and parsing errors
+    }
+    return ''
+  })()
+
+  definitionCache.set(cacheKey, pending)
+  const result = await pending
+  if (result) {
+    definitionCache.set(cacheKey, Promise.resolve(result))
+  } else {
+    definitionCache.delete(cacheKey)
+  }
+  return result
+}
+
+async function gemmaTranslateMeaningNoteVie({ key, endpoint, model, word, englishMeaning, contextSentenceEn, signal }) {
+  const source = String(englishMeaning || '').trim()
+  if (!source) return ''
+  const ctx = String(contextSentenceEn || '').trim()
+  const targetWord = String(word || '').trim()
+
+  const prompt =
+    `You are a professional English→Vietnamese dictionary translator.\n` +
+    `Task: Translate the following English dictionary definition into Vietnamese that corresponds exactly to the same meaning.\n` +
+    `Rules:\n` +
+    `- Output ONLY Vietnamese text, no commentary, no markdown.\n` +
+    `- Keep it faithful to the source definition and concise.\n` +
+    `- Do not add, remove, or infer extra senses.\n` +
+    `- If the source contains POS tags (e.g. [NOUN], [VERB]), numbering, or multiple lines, preserve the same structure and line breaks in Vietnamese.\n` +
+    `- Keep dictionary style (plain definition text), do not turn it into explanation or example.\n` +
+    (targetWord ? `- Target word: "${targetWord}"\n` : '') +
+    (ctx ? `- Context sentence: "${ctx}"\n` : '') +
+    `\nENGLISH DEFINITION:\n<<<\n${source}\n>>>`
+
+  const out = await googleAiStudioGenerateContent({ key, endpoint, model, prompt, signal })
+  return String(out || '').replace(/\r/g, '').trim()
+}
+
+async function googleTranslateExplain({ key, endpoint, model, from, to, text, signal }) {
+  const src = String(from || 'en')
+  const dst = String(to || 'vi')
+  const body = String(text || '').trim()
+  if (!body) return { translation: '', explanation: '' }
+
+  const prompt =
+    `You are a professional translator.\n` +
+    `Task: Translate the following text from ${src} to ${dst}, and also provide an explanation.\n` +
+    `Output MUST be valid JSON only (no markdown).\n` +
+    `Schema:\n` +
+    `{\n` +
+    `  "translation": string,\n` +
+    `  "explanation": string\n` +
+    `}\n` +
+    `Rules:\n` +
+    `- translation: only the translation, preserve paragraph breaks.\n` +
+    `- explanation: write in ${dst}. Include BOTH parts:\n` +
+    `  (A) "Ý nghĩa chung": 2-4 sentences summarizing what the passage means in plain language.\n` +
+    `  (B) "Giải thích chi tiết": 3-7 bullet points focusing on tricky phrases/idioms/grammar or key vocabulary.\n` +
+    `- Do NOT repeat the entire translation inside explanation.\n` +
+    `\nTEXT:\n<<<\n${body}\n>>>`
+
+  const raw = await googleAiStudioGenerateContent({ key, endpoint, model, prompt, signal })
+  const obj = safeJsonParseObject(raw) || {}
+  const translation = String(obj.translation || '').trim()
+  let explanation = String(obj.explanation || '').trim()
+
+  // If model didn't follow JSON rules, fall back gracefully.
+  if (!translation && raw) {
+    return { translation: String(raw || '').trim(), explanation: '' }
+  }
+
+  explanation = explanation.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+  return { translation, explanation }
 }
 
 function normalizeMeaningForMatch(s) {
@@ -857,6 +2333,79 @@ function chooseMeaningByContext(candidates, contextSentenceVi) {
   })
 
   return matches[0].vi
+}
+
+function splitMeaningList(s) {
+  const raw = String(s || '').trim()
+  if (!raw) return []
+  const cleaned = raw
+    .replace(/[\r\n]+/g, ';')
+    .replace(/\u2022/g, ';')
+    .replace(/^\s*[-*]\s+/gm, '')
+  return cleaned
+    .split(/\s*(?:;|\/|\||,)+\s*/g)
+    .map((p) => String(p || '').trim())
+    .filter(Boolean)
+}
+
+function meaningsTooClose(a, b) {
+  const na = normalizeMeaningForMatch(a)
+  const nb = normalizeMeaningForMatch(b)
+  if (!na || !nb) return true
+  if (na === nb) return true
+  if (na.includes(nb) || nb.includes(na)) return true
+
+  const ta = na.split(' ').filter(Boolean)
+  const tb = nb.split(' ').filter(Boolean)
+  if (ta.length === 0 || tb.length === 0) return false
+
+  const setA = new Set(ta)
+  const setB = new Set(tb)
+  let inter = 0
+  for (const t of setA) {
+    if (setB.has(t)) inter++
+  }
+  const minSize = Math.min(setA.size, setB.size)
+  if (minSize <= 0) return false
+  const overlap = inter / minSize
+  return overlap >= 0.8
+}
+
+function selectDistinctMeaningsFromCandidates(candidates, maxCount) {
+  const list = Array.isArray(candidates) ? candidates : []
+  const out = []
+  const tryAdd = (c) => {
+    if (!c) return
+    const vi = String(c.vi || '').trim()
+    if (!vi) return
+    if (out.some((x) => meaningsTooClose(x, vi))) return
+    out.push(vi)
+  }
+
+  if (list.length === 0) return out
+
+  tryAdd(list[0])
+  const firstPos = normalizeGemmaPos(list[0] && list[0].pos ? list[0].pos : '') || String(list[0] && list[0].pos ? list[0].pos : '').trim()
+
+  // Prefer adding a meaning with a different POS when available.
+  if (out.length < maxCount && firstPos) {
+    for (const c of list) {
+      const pos = normalizeGemmaPos(c && c.pos ? c.pos : '') || String(c && c.pos ? c.pos : '').trim()
+      if (pos && pos !== firstPos) {
+        tryAdd(c)
+        if (out.length >= maxCount) break
+      }
+    }
+  }
+
+  if (out.length < maxCount) {
+    for (const c of list) {
+      tryAdd(c)
+      if (out.length >= maxCount) break
+    }
+  }
+
+  return out
 }
 
 function splitVietnameseCandidates(s) {
@@ -931,6 +2480,9 @@ async function autoMeaningCore(payload) {
       requestId,
       word: '',
       meaningSuggested: '',
+      meaningNoteEn: '',
+      meaningNoteVi: '',
+      meaningNoteVie: '',
       contextSentenceVi: '',
       candidates: []
     }
@@ -947,6 +2499,8 @@ async function autoMeaningCore(payload) {
     let candidates = []
     let contextSentenceVi = ''
     let meaningSuggested = ''
+    let meaningNoteVi = ''
+    let meaningNoteEn = ''
 
     // 1) Primary: Gemma suggests meanings + POS using context (LLM sense disambiguation).
     // If Google AI Studio key is missing, skip Gemma and rely on Azure dictionary fallback (or return empty).
@@ -992,10 +2546,34 @@ async function autoMeaningCore(payload) {
         const gemma = meaningRes.value
         candidates = Array.isArray(gemma.candidates) ? gemma.candidates : []
         meaningSuggested = String(gemma.meaningSuggested || '').trim()
+        meaningNoteVi = String(gemma.meaningNoteVi || '').trim()
       }
 
       if (ctxRes.status === 'fulfilled') {
         contextSentenceVi = String(ctxRes.value || '').trim()
+      }
+    }
+
+    try {
+      meaningNoteEn = await fetchEnglishDefinition(word)
+    } catch (e) {
+      meaningNoteEn = ''
+    }
+
+    if (meaningNoteEn && g) {
+      try {
+        const translatedNote = await gemmaTranslateMeaningNoteVie({
+          key: g.key,
+          endpoint: g.endpoint,
+          model: g.model,
+          word,
+          englishMeaning: meaningNoteEn,
+          contextSentenceEn,
+          signal: controller.signal
+        })
+        if (translatedNote) meaningNoteVi = translatedNote
+      } catch (e) {
+        // keep fallback note below
       }
     }
 
@@ -1025,13 +2603,46 @@ async function autoMeaningCore(payload) {
     }
 
     if (!meaningSuggested && candidates.length > 0) {
-      meaningSuggested = candidates[0].vi
+      if (!contextSentenceEn) {
+        const picked = selectDistinctMeaningsFromCandidates(candidates, 3)
+        meaningSuggested = (picked && picked.length > 0 ? picked.join('; ') : candidates[0].vi)
+      } else {
+        meaningSuggested = candidates[0].vi
+      }
+    }
+
+    if (!meaningNoteVi && meaningSuggested) {
+      if (g) {
+        try {
+          meaningNoteVi = await gemmaGenerateMeaningNoteVi({
+            key: g.key,
+            endpoint: g.endpoint,
+            model: g.model,
+            word,
+            meaningSuggested,
+            contextSentenceEn,
+            signal: controller.signal
+          })
+        } catch (e) {
+          // ignore and fallback to deterministic text below
+        }
+      }
+      if (!meaningNoteVi) {
+        meaningNoteVi = buildMeaningNoteViFallback(word, meaningSuggested, contextSentenceEn)
+      }
+    }
+
+    if (!meaningSuggested && meaningNoteVi) {
+      meaningSuggested = meaningNoteVi
     }
 
     return {
       requestId,
       word,
       meaningSuggested: meaningSuggested || '',
+      meaningNoteEn: meaningNoteEn || '',
+      meaningNoteVi: meaningNoteVi || '',
+      meaningNoteVie: meaningNoteVi || '',
       contextSentenceVi: contextSentenceVi || '',
       candidates
     }
@@ -1041,6 +2652,9 @@ async function autoMeaningCore(payload) {
         requestId,
         word,
         meaningSuggested: '',
+        meaningNoteEn: '',
+        meaningNoteVi: '',
+        meaningNoteVie: '',
         contextSentenceVi: '',
         candidates: []
       }
@@ -1066,6 +2680,9 @@ async function enrichWordCore(payload) {
       requestId,
       word: '',
       meaningSuggested: '',
+      meaningNoteEn: '',
+      meaningNoteVi: '',
+      meaningNoteVie: '',
       contextSentenceVi: '',
       candidates: [],
       posSuggested: '',
@@ -1086,6 +2703,14 @@ async function enrichWordCore(payload) {
       g = null
     }
 
+    const base = await autoMeaningCore({
+      requestId,
+      word,
+      contextSentenceEn,
+      from,
+      to
+    })
+
     if (g) {
       const enriched = await gemmaEnrichWord({
         key: g.key,
@@ -1102,8 +2727,11 @@ async function enrichWordCore(payload) {
       return {
         requestId,
         word,
-        meaningSuggested: enriched.meaningSuggested || '',
-        contextSentenceVi: enriched.contextSentenceVi || '',
+        meaningSuggested: String(base.meaningSuggested || enriched.meaningSuggested || '').trim(),
+        meaningNoteEn: String(base.meaningNoteEn || '').trim(),
+        meaningNoteVi: String(base.meaningNoteVi || enriched.meaningNoteVi || '').trim(),
+        meaningNoteVie: String(base.meaningNoteVie || base.meaningNoteVi || enriched.meaningNoteVi || '').trim(),
+        contextSentenceVi: String(base.contextSentenceVi || enriched.contextSentenceVi || '').trim(),
         candidates: Array.isArray(enriched.candidates) ? enriched.candidates : [],
         posSuggested: enriched.posSuggested || '',
         ipa: enriched.ipa || '',
@@ -1111,19 +2739,14 @@ async function enrichWordCore(payload) {
       }
     }
 
-    // Fallback: reuse existing autoMeaningCore (Azure dictionary / etc.) and leave ipa/example empty.
-    const base = await autoMeaningCore({
-      requestId,
-      word,
-      contextSentenceEn,
-      from,
-      to
-    })
-
+    // Fallback: reuse autoMeaningCore results and leave ipa/example empty.
     return {
       requestId,
       word,
       meaningSuggested: String(base && base.meaningSuggested ? base.meaningSuggested : '').trim(),
+      meaningNoteEn: String(base && base.meaningNoteEn ? base.meaningNoteEn : '').trim(),
+      meaningNoteVi: String(base && base.meaningNoteVi ? base.meaningNoteVi : '').trim(),
+      meaningNoteVie: String(base && (base.meaningNoteVie || base.meaningNoteVi) ? (base.meaningNoteVie || base.meaningNoteVi) : '').trim(),
       contextSentenceVi: String(base && base.contextSentenceVi ? base.contextSentenceVi : '').trim(),
       candidates: Array.isArray(base && base.candidates) ? base.candidates : [],
       posSuggested: '',
@@ -1136,6 +2759,9 @@ async function enrichWordCore(payload) {
         requestId,
         word,
         meaningSuggested: '',
+        meaningNoteEn: '',
+        meaningNoteVi: '',
+        meaningNoteVie: '',
         contextSentenceVi: '',
         candidates: [],
         posSuggested: '',
@@ -1144,6 +2770,186 @@ async function enrichWordCore(payload) {
       }
     }
     console.error('enrichWord error:', e && e.message ? e.message : e)
+    throw e
+  } finally {
+    pendingAutoMeaning.delete(requestId)
+  }
+}
+
+async function enrichWordBulkCore(payload) {
+  const req = payload || {}
+  const requestId = String(req.requestId || generateUUID())
+  const wordsRaw = Array.isArray(req.words) ? req.words : []
+  const words = wordsRaw
+    .map((x) => String(x || '').trim())
+    .filter(Boolean)
+    .slice(0, 3)
+  const contextSentenceEn = String(req.contextSentenceEn || '').trim()
+  const from = String(req.from || 'en')
+  const to = String(req.to || 'vi')
+  const dialect = (req.dialect === 'UK' ? 'UK' : 'US')
+
+  if (words.length === 0) {
+    return { requestId, items: [] }
+  }
+
+  const controller = new AbortController()
+  pendingAutoMeaning.set(requestId, controller)
+
+  try {
+    let g = null
+    try {
+      g = await getGoogleAiStudioConfig(req)
+    } catch (e) {
+      g = null
+    }
+
+    if (g) {
+      const enrichedList = await gemmaEnrichWordsBulk({
+        key: g.key,
+        endpoint: g.endpoint,
+        model: g.model,
+        words,
+        contextSentenceEn,
+        from,
+        to,
+        dialect,
+        signal: controller.signal
+      })
+
+      const byKey = new Map(enrichedList.map((x) => [String(x.word).toLowerCase(), x]))
+
+      const base = words.map((w) => {
+        const x = byKey.get(String(w).toLowerCase())
+        if (!x) return { word: w, error: 'No result', _needsFallback: true }
+
+        const meaningSuggested = String(x.meaningSuggested || '').trim()
+        const posSuggested = String(x.posSuggested || '').trim()
+        const candidates = Array.isArray(x.candidates) ? x.candidates : []
+
+        // Treat empty meaning/POS as an error so the UI doesn't show "done" for unusable rows.
+        if (!meaningSuggested || !posSuggested) {
+          return {
+            word: w,
+            error: 'Missing meaning/POS from bulk result',
+            partial: {
+              requestId,
+              word: w,
+              meaningSuggested,
+              meaningNoteVi: String(x.meaningNoteVi || '').trim(),
+              contextSentenceVi: String(x.contextSentenceVi || '').trim(),
+              candidates,
+              posSuggested,
+              ipa: String(x.ipa || '').trim(),
+              example: String(x.example || '').trim()
+            },
+            _needsFallback: true
+          }
+        }
+
+        return {
+          word: w,
+          result: {
+            requestId,
+            word: w,
+            meaningSuggested,
+            meaningNoteVi: String(x.meaningNoteVi || '').trim(),
+            contextSentenceVi: String(x.contextSentenceVi || '').trim(),
+            candidates,
+            posSuggested,
+            ipa: String(x.ipa || '').trim(),
+            example: String(x.example || '').trim()
+          }
+        }
+      })
+
+      const needsFallback = base.filter((it) => it && it._needsFallback).map((it) => it.word)
+      if (needsFallback.length > 0) {
+        const fallbackResults = await Promise.allSettled(
+          needsFallback.map((w, idx) =>
+            enrichWordCore({
+              requestId: `${requestId}__fallback__${idx}`,
+              word: w,
+              contextSentenceEn,
+              from,
+              to,
+              dialect
+            })
+          )
+        )
+
+        const fallbackByKey = new Map()
+        for (let i = 0; i < needsFallback.length; i++) {
+          const w = needsFallback[i]
+          const r = fallbackResults[i]
+          if (r && r.status === 'fulfilled') fallbackByKey.set(String(w).toLowerCase(), r.value)
+        }
+
+        return {
+          requestId,
+          items: base.map((it) => {
+            if (!it || !it._needsFallback) {
+              // Strip private fields if present.
+              const { _needsFallback, partial, ...rest } = it || {}
+              return rest
+            }
+
+            const fb = fallbackByKey.get(String(it.word).toLowerCase())
+            if (fb) {
+              const meaning = String(fb.meaningSuggested || '').trim()
+              const posOut = String(fb.posSuggested || '').trim()
+              if (meaning && posOut) return { word: it.word, result: fb }
+            }
+
+            const partial = it.partial ? it.partial : null
+            return {
+              word: it.word,
+              error: it.error || 'Failed to enrich',
+              partial
+            }
+          })
+        }
+      }
+
+      return {
+        requestId,
+        items: base.map((it) => {
+          const { _needsFallback, partial, ...rest } = it || {}
+          return rest
+        })
+      }
+    }
+
+    // Fallback: call single-word enrichWordCore per item.
+    const results = await Promise.allSettled(
+      words.map((w, idx) =>
+        enrichWordCore({
+          requestId: `${requestId}__${idx}`,
+          word: w,
+          contextSentenceEn,
+          from,
+          to,
+          dialect
+        })
+      )
+    )
+
+    return {
+      requestId,
+      items: words.map((w, idx) => {
+        const r = results[idx]
+        if (r && r.status === 'fulfilled') {
+          return { word: w, result: r.value }
+        }
+        const msg = r && r.status === 'rejected' ? (r.reason && r.reason.message ? r.reason.message : String(r.reason || 'Failed')) : 'Failed'
+        return { word: w, error: msg }
+      })
+    }
+  } catch (e) {
+    if (e && e.name === 'AbortError') {
+      return { requestId, items: words.map((w) => ({ word: w, error: 'aborted' })) }
+    }
+    console.error('enrichWordBulk error:', e && e.message ? e.message : e)
     throw e
   } finally {
     pendingAutoMeaning.delete(requestId)
@@ -1183,8 +2989,8 @@ function generateUUID() {
 async function ensureCsvHasHeader(filePath) {
   const text = await fs.readFile(filePath, 'utf8')
   if (!text.trim()) {
-    const header = Papa.unparse([], { header: true, columns: ['word', 'meaning', 'pronunciation', 'pos', 'example'] })
-    await fs.writeFile(filePath, 'word,meaning,pronunciation,pos,example\n', 'utf8')
+    const header = Papa.unparse([], { header: true, columns: ['word', 'meaning', 'meaningNoteVi', 'pronunciation', 'pos', 'example'] })
+    await fs.writeFile(filePath, 'word,meaning,meaningNoteVi,pronunciation,pos,example\n', 'utf8')
   }
 }
 
@@ -1259,6 +3065,39 @@ function listTreeWithPdf() {
 
   return tree
 }
+
+// Export Smart Review (VocabularyStore localStorage payload) to a JSON file
+ipcMain.handle('exportSmartReview', async (ev, rawJson) => {
+  try {
+    const win = BrowserWindow.fromWebContents(ev.sender)
+    const ymd = new Date().toISOString().slice(0, 10)
+    const defaultName = `smart-review-${ymd}.json`
+    const defaultPath = path.join(app.getPath('downloads'), defaultName)
+
+    const { canceled, filePath } = await dialog.showSaveDialog(win, {
+      title: 'Export Smart Review',
+      defaultPath,
+      filters: [{ name: 'JSON', extensions: ['json'] }],
+    })
+
+    if (canceled || !filePath) return null
+
+    let out = String(rawJson ?? '')
+    // Pretty print if possible
+    try {
+      const parsed = JSON.parse(out || '{}')
+      out = JSON.stringify(parsed, null, 2)
+    } catch {
+      // keep raw
+    }
+
+    await fs.writeFile(filePath, out, 'utf8')
+    return filePath
+  } catch (err) {
+    console.error('Error exporting Smart Review:', err)
+    throw err
+  }
+})
 
 function createWindow() {
   const win = new BrowserWindow({
@@ -1400,7 +3239,7 @@ ipcMain.handle('createFile', async (ev, parentRel, name) => {
     const rel = normalizeRel(parentRel)
     const full = rel ? path.join(root, rel, name) : path.join(root, name)
     await fs.mkdir(path.dirname(full), { recursive: true })
-    await fs.writeFile(full, 'word,meaning,pronunciation,pos,example\n', 'utf8')
+    await fs.writeFile(full, 'word,meaning,meaningNoteVi,pronunciation,pos,example\n', 'utf8')
     return true
   } catch (err) {
     console.error('Error creating file:', err)
@@ -1443,6 +3282,8 @@ ipcMain.handle('readCsv', async (ev, filePath) => {
   return (parsed.data || []).map(row => ({
     word: (row.word || '').replace(/"+/g, ''),
     meaning: (row.meaning || '').replace(/"+/g, ''),
+    meaningEn: (row.meaningEn || row.meaningNoteEn || '').replace(/"+/g, ''),
+    meaningVi: (row.meaningVi || row.meaningNoteVi || row.meaningNoteVie || '').replace(/"+/g, ''),
     pronunciation: (row.pronunciation || '').replace(/"+/g, ''),
     pos: (row.pos || '').replace(/"+/g, ''),
     example: (row.example || '').replace(/"+/g, '')
@@ -1455,12 +3296,14 @@ async function writeCsv(fileRelOrAbsPath, rows) {
   const cleanRows = rows.map(r => ({
     word: (r.word || '').replace(/"+/g, ''),
     meaning: (r.meaning || '').replace(/"+/g, ''),
+    meaningEn: (r.meaningEn || r.meaningNoteEn || '').replace(/"+/g, ''),
+    meaningVi: (r.meaningVi || r.meaningNoteVi || r.meaningNoteVie || '').replace(/"+/g, ''),
     pronunciation: (r.pronunciation || '').replace(/"+/g, ''),
     pos: (r.pos || '').replace(/"+/g, ''),
     example: (r.example || '').replace(/"+/g, '')
   }))
   const csv = Papa.unparse(cleanRows, { 
-    columns: ['word', 'meaning', 'pronunciation', 'pos', 'example'],
+    columns: ['word', 'meaning', 'meaningEn', 'meaningVi', 'pronunciation', 'pos', 'example'],
     quotes: false  // Prevent auto-quoting
   })
   // Support both relative paths and absolute paths
@@ -1494,7 +3337,7 @@ ipcMain.handle('addWord', async (ev, fileRelOrAbsPath, row) => {
   // auto create file if missing
   if (!fsSync.existsSync(full)) {
     fsSync.mkdirSync(path.dirname(full), { recursive: true });
-    fsSync.writeFileSync(full, 'word,meaning,pronunciation,pos,example\n', 'utf8');
+    fsSync.writeFileSync(full, 'word,meaning,meaningEn,meaningVi,pronunciation,pos,example\n', 'utf8');
   }
 
   const text = await fs.readFile(full, 'utf8');
@@ -1503,6 +3346,8 @@ ipcMain.handle('addWord', async (ev, fileRelOrAbsPath, row) => {
   rows.push({
     word: row && row.word ? row.word : '',
     meaning: row && row.meaning ? row.meaning : '',
+    meaningEn: row && row.meaningEn ? row.meaningEn : row && row.meaningNoteEn ? row.meaningNoteEn : '',
+    meaningVi: row && row.meaningVi ? row.meaningVi : row && row.meaningNoteVi ? row.meaningNoteVi : row && row.meaningNoteVie ? row.meaningNoteVie : '',
     pronunciation: row && row.pronunciation ? row.pronunciation : '',
     pos: row && row.pos ? row.pos : '',
     example: row && row.example ? row.example : ''
@@ -1510,6 +3355,53 @@ ipcMain.handle('addWord', async (ev, fileRelOrAbsPath, row) => {
 
   await writeCsv(fileRelOrAbsPath, rows);
   return true;
+});
+
+ipcMain.handle('addWordsBulk', async (ev, fileRelOrAbsPath, rowsToAdd) => {
+  const root = getDataRoot();
+  const full = path.isAbsolute(fileRelOrAbsPath)
+    ? fileRelOrAbsPath
+    : path.join(root, normalizeRel(fileRelOrAbsPath));
+
+  const list = Array.isArray(rowsToAdd) ? rowsToAdd : [];
+  const normalized = list
+    .map((row) => ({
+      word: row && row.word ? String(row.word) : '',
+      meaning: row && row.meaning ? String(row.meaning) : '',
+      meaningEn: row && row.meaningEn ? String(row.meaningEn) : row && row.meaningNoteEn ? String(row.meaningNoteEn) : '',
+      meaningVi: row && row.meaningVi ? String(row.meaningVi) : row && row.meaningNoteVi ? String(row.meaningNoteVi) : row && row.meaningNoteVie ? String(row.meaningNoteVie) : '',
+      pronunciation: row && row.pronunciation ? String(row.pronunciation) : '',
+      pos: row && row.pos ? String(row.pos) : '',
+      example: row && row.example ? String(row.example) : ''
+    }))
+    .filter((r) => String(r.word || '').trim());
+
+  if (normalized.length === 0) return { added: 0 };
+
+  // auto create file if missing
+  if (!fsSync.existsSync(full)) {
+    fsSync.mkdirSync(path.dirname(full), { recursive: true });
+    fsSync.writeFileSync(full, 'word,meaning,meaningEn,meaningVi,pronunciation,pos,example\n', 'utf8');
+  }
+
+  const text = await fs.readFile(full, 'utf8');
+  const parsed = Papa.parse(text, { header: true, skipEmptyLines: true });
+  const rows = parsed.data || [];
+
+  for (const r of normalized) {
+    rows.push({
+      word: r.word,
+      meaning: r.meaning,
+      meaningEn: r.meaningEn,
+      meaningVi: r.meaningVi,
+      pronunciation: r.pronunciation,
+      pos: r.pos,
+      example: r.example
+    });
+  }
+
+  await writeCsv(fileRelOrAbsPath, rows);
+  return { added: normalized.length };
 });
 
 // Background enhancement: improve word data if fields are missing
@@ -1659,6 +3551,8 @@ ipcMain.handle('editWord', async (ev, relPath, index, newData) => {
       ...rows[index],
       word: newData.word || rows[index].word,
       meaning: newData.meaning || rows[index].meaning,
+      meaningEn: (typeof newData.meaningEn !== 'undefined') ? newData.meaningEn : (rows[index].meaningEn || rows[index].meaningNoteEn || ''),
+      meaningVi: (typeof newData.meaningVi !== 'undefined') ? newData.meaningVi : (rows[index].meaningVi || rows[index].meaningNoteVi || rows[index].meaningNoteVie || ''),
       pronunciation: newData.pronunciation || rows[index].pronunciation,
       pos: newData.pos || rows[index].pos || '',
       example: (typeof newData.example !== 'undefined') ? newData.example : (rows[index].example || '')
@@ -1666,6 +3560,66 @@ ipcMain.handle('editWord', async (ev, relPath, index, newData) => {
   }
   await writeCsv(relPath, rows)
   return true
+})
+
+ipcMain.handle('dedupeWords', async (ev, relPathOrAbsPath) => {
+  const root = getDataRoot()
+  const full = path.isAbsolute(relPathOrAbsPath) ? relPathOrAbsPath : path.join(root, normalizeRel(relPathOrAbsPath))
+  const text = await fs.readFile(full, 'utf8')
+  const parsed = Papa.parse(text, { header: true, skipEmptyLines: true })
+  const rows = parsed.data || []
+
+  const normalizeKey = (s) => String(s || '').trim().toLowerCase()
+  const scoreRow = (r) => {
+    const hasMeaning = !!String(r && r.meaning ? r.meaning : '').trim()
+    const hasPos = !!String(r && r.pos ? r.pos : '').trim()
+    const hasIpa = !!String(r && r.pronunciation ? r.pronunciation : '').trim()
+    const hasExample = !!String(r && r.example ? r.example : '').trim()
+    // Prefer rows that have meaning+pos; then ipa/example.
+    return (hasMeaning ? 3 : 0) + (hasPos ? 3 : 0) + (hasIpa ? 1 : 0) + (hasExample ? 1 : 0)
+  }
+
+  const bestByKey = new Map()
+  const order = []
+  let removed = 0
+
+  for (const r of rows) {
+    const key = normalizeKey(r && r.word ? r.word : '')
+    if (!key) {
+      // Keep empty-word rows as-is (shouldn't normally happen)
+      order.push(r)
+      continue
+    }
+
+    if (!bestByKey.has(key)) {
+      bestByKey.set(key, r)
+      order.push(r)
+      continue
+    }
+
+    removed++
+    const current = bestByKey.get(key)
+    const nextBest = scoreRow(r) > scoreRow(current) ? r : current
+    bestByKey.set(key, nextBest)
+  }
+
+  // Rebuild rows preserving the first appearance order of each unique word,
+  // but with the best-scoring row for that word.
+  const seen = new Set()
+  const deduped = []
+  for (const r of order) {
+    const key = normalizeKey(r && r.word ? r.word : '')
+    if (!key) {
+      deduped.push(r)
+      continue
+    }
+    if (seen.has(key)) continue
+    seen.add(key)
+    deduped.push(bestByKey.get(key) || r)
+  }
+
+  await writeCsv(relPathOrAbsPath, deduped)
+  return { removed, kept: deduped.length, totalBefore: rows.length }
 })
 
 ipcMain.handle('moveWords', async (ev, srcRel, dstRel, indices) => {
@@ -1745,6 +3699,28 @@ ipcMain.handle('translator:suggestIpa', async (ev, payload) => {
     const word = payload && payload.word ? payload.word : ''
     const dialect = payload && payload.dialect ? payload.dialect : 'US'
     return await gemmaSuggestIpa({ key, endpoint, model, word, dialect, signal: ctrl.signal })
+  } finally {
+    try { ctrl.abort() } catch {}
+  }
+})
+
+ipcMain.handle('translator:getWordFamily', async (ev, payload) => {
+  const ctrl = new AbortController()
+  try {
+    const { key, model, endpoint } = await getGoogleAiStudioConfig(payload)
+    const word = payload && payload.word ? payload.word : ''
+    return await gemmaGetWordFamily({ key, endpoint, model, word, signal: ctrl.signal })
+  } finally {
+    try { ctrl.abort() } catch {}
+  }
+})
+
+ipcMain.handle('translator:getSynonyms', async (ev, payload) => {
+  const ctrl = new AbortController()
+  try {
+    const { key, model, endpoint } = await getGoogleAiStudioConfig(payload)
+    const word = payload && payload.word ? payload.word : ''
+    return await gemmaGetSynonyms({ key, endpoint, model, word, signal: ctrl.signal })
   } finally {
     try { ctrl.abort() } catch {}
   }
@@ -1839,7 +3815,7 @@ ipcMain.handle('pdfImport', async () => {
     await fs.writeFile(path.join(pdfDir, 'meta.json'), JSON.stringify(metaData, null, 2), 'utf8')
 
     // Create vocab CSV
-    await fs.writeFile(deckCsvPath, 'word,meaning,pronunciation,pos,example\n', 'utf8')
+    await fs.writeFile(deckCsvPath, 'word,meaning,meaningNoteVi,pronunciation,pos,example\n', 'utf8')
 
     // Create highlights.json (store as an array)
     const highlightsPath = path.join(pdfDir, 'highlights.json')
@@ -2014,6 +3990,10 @@ ipcMain.handle('translator:enrichWord', async (ev, payload) => {
   return enrichWordCore(payload)
 })
 
+ipcMain.handle('translator:enrichWordBulk', async (ev, payload) => {
+  return enrichWordBulkCore(payload)
+})
+
 ipcMain.handle('translator:translatePlain', async (ev, payload) => {
   const req = payload || {}
   const text = String(req.text || '').trim()
@@ -2023,6 +4003,78 @@ ipcMain.handle('translator:translatePlain', async (ev, payload) => {
 
   const g = await getGoogleAiStudioConfig(req)
   return await googleTranslatePlain({ key: g.key, endpoint: g.endpoint, model: g.model, from, to, text })
+})
+
+ipcMain.handle('translator:translateMeaningNoteVie', async (ev, payload) => {
+  const req = payload || {}
+  const englishMeaning = String(req.englishMeaning || '').trim()
+  if (!englishMeaning) return ''
+
+  const g = await getGoogleAiStudioConfig(req)
+
+  try {
+    const translated = await gemmaTranslateMeaningNoteVie({
+      key: g.key,
+      endpoint: g.endpoint,
+      model: g.model,
+      word: String(req.word || '').trim(),
+      englishMeaning,
+      contextSentenceEn: String(req.contextSentenceEn || '').trim(),
+    })
+    if (translated) return translated
+  } catch {
+    // fallback below
+  }
+
+  return await googleTranslatePlain({
+    key: g.key,
+    endpoint: g.endpoint,
+    model: g.model,
+    from: 'en',
+    to: 'vi',
+    text: englishMeaning,
+  })
+})
+
+ipcMain.handle('translator:fetchEnglishMeaning', async (ev, word) => {
+  const target = String(word || '').trim()
+  if (!target) {
+    console.log('[translator:fetchEnglishMeaning] skip empty word')
+    return ''
+  }
+
+  try {
+    const definition = await fetchEnglishDefinition(target)
+    if (definition) {
+      console.log('[translator:fetchEnglishMeaning] filled', {
+        word: target,
+        definition
+      })
+    } else {
+      console.log('[translator:fetchEnglishMeaning] missing', {
+        word: target,
+        reason: 'empty-definition'
+      })
+    }
+    return definition
+  } catch (err) {
+    console.error('[translator:fetchEnglishMeaning] error', {
+      word: target,
+      error: err && err.message ? err.message : String(err)
+    })
+    throw err
+  }
+})
+
+ipcMain.handle('translator:translateExplain', async (ev, payload) => {
+  const req = payload || {}
+  const text = String(req.text || '').trim()
+  const from = String(req.from || 'en')
+  const to = String(req.to || 'vi')
+  if (!text) return { translation: '', explanation: '' }
+
+  const g = await getGoogleAiStudioConfig(req)
+  return await googleTranslateExplain({ key: g.key, endpoint: g.endpoint, model: g.model, from, to, text })
 })
 
 ipcMain.handle('settings:getGoogleAiStudioStatus', async () => {

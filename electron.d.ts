@@ -3,6 +3,8 @@ export {}
 export type VocabRow = {
   word: string
   meaning: string
+  meaningEn?: string
+  meaningVi?: string
   pronunciation?: string
   pos?: string
   example?: string
@@ -48,6 +50,9 @@ export type AutoMeaningResponse = {
   requestId: string
   word: string
   meaningSuggested: string
+  meaningNoteEn: string
+  meaningNoteVi: string
+  meaningNoteVie: string
   contextSentenceVi: string
   candidates: AutoMeaningCandidate[]
 }
@@ -56,6 +61,34 @@ export type EnrichWordResponse = AutoMeaningResponse & {
   posSuggested: string
   ipa: string
   example: string
+}
+
+export type EnrichWordBulkItem = {
+  word: string
+  result?: EnrichWordResponse
+  error?: string
+}
+
+export type EnrichWordBulkResponse = {
+  requestId: string
+  items: EnrichWordBulkItem[]
+}
+
+export type WordFamilyMember = { word: string; pos?: string; relation?: string }
+
+export type WordFamilyResponse = {
+  word: string
+  family: WordFamilyMember[]
+}
+
+export type SynonymsResponse = {
+  word: string
+  synonyms: WordFamilyMember[]
+}
+
+export type TranslateExplainResponse = {
+  translation: string
+  explanation: string
 }
 
 export interface WindowApi {
@@ -67,8 +100,10 @@ export interface WindowApi {
   readCsv: (relPathOrAbsPath: string) => Promise<VocabRow[]>
   addWord: (relPathOrAbsPath: string, row: VocabRow) => Promise<boolean>
   enhanceWordInBackground: (relPathOrAbsPath: string, word: string, meaning: string, pronunciation: string, pos: string, example: string) => Promise<boolean>
+  addWordsBulk: (relPath: string, rows: any[]) => Promise<{ added: number }>
   deleteWord: (relPathOrAbsPath: string, index: number) => Promise<boolean>
   editWord: (relPathOrAbsPath: string, index: number, newData: Partial<VocabRow>) => Promise<boolean>
+  dedupeWords: (relPathOrAbsPath: string) => Promise<{ removed: number; kept: number; totalBefore: number }>
   moveWords: (srcRelOrAbs: string, dstRelOrAbs: string, indices: number[]) => Promise<boolean>
   copyWords: (srcRelOrAbs: string, dstRelOrAbs: string, indices: number[]) => Promise<boolean>
   copyPath: (srcRel: string, dstRel: string) => Promise<boolean>
@@ -93,11 +128,26 @@ export interface WindowApi {
 
   enrichWord: (payload: { requestId: string; word: string; contextSentenceEn: string; from?: string; to?: string; dialect?: 'US' | 'UK' }) => Promise<EnrichWordResponse>
 
+  enrichWordBulk: (payload: { requestId: string; words: string[]; contextSentenceEn: string; from?: string; to?: string; dialect?: 'US' | 'UK' }) => Promise<EnrichWordBulkResponse>
+
   suggestExampleSentence: (payload: { word: string; meaningVi?: string; pos?: string; contextSentenceEn?: string }) => Promise<string>
 
   suggestIpa: (payload: { word: string; dialect?: 'US' | 'UK' }) => Promise<string>
 
+  getWordFamily: (payload: { word: string }) => Promise<WordFamilyResponse>
+
+  getSynonyms: (payload: { word: string }) => Promise<SynonymsResponse>
+
+  fetchEnglishMeaning: (word: string) => Promise<string>
+
+  translateMeaningNoteVie: (payload: { englishMeaning: string; word?: string; contextSentenceEn?: string }) => Promise<string>
+
   translatePlain: (payload: { text: string; from?: string; to?: string; region?: string }) => Promise<string>
+
+  translateExplain: (payload: { text: string; from?: string; to?: string; region?: string }) => Promise<TranslateExplainResponse>
+
+  // Export Smart Review (VocabularyStore localStorage: vocab_store_v2)
+  exportSmartReview: (rawJson: string) => Promise<string | null>
 
   getGoogleAiStudioStatus: () => Promise<{ hasKey: boolean }>
   getGoogleAiStudioConcurrency: () => Promise<{ concurrency: number }>
@@ -113,6 +163,9 @@ export interface WindowApi {
 
   onDeckUpdated: (cb: (data: { pdfId?: string; deckCsvPath?: string }) => void) => void
   offDeckUpdated: (cb: (data: { pdfId?: string; deckCsvPath?: string }) => void) => void
+
+  onGoogleAiStudioKeyInvalid: (cb: (data: { id: string; name?: string; masked: string; reason?: string }) => void) => void
+  offGoogleAiStudioKeyInvalid: (cb: (data: { id: string; name?: string; masked: string; reason?: string }) => void) => void
 }
 
 declare global {

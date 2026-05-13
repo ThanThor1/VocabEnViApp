@@ -61,6 +61,77 @@
       background: rgba(0,120,255,0.35);
     }
 
+    /* Drawing canvas layer */
+    .drawing-canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      z-index: 5;
+      pointer-events: none;
+    }
+    .drawing-canvas.draw-mode {
+      pointer-events: auto;
+      cursor: crosshair;
+    }
+    .drawing-canvas.erase-mode {
+      pointer-events: auto;
+      cursor: crosshair;
+    }
+    .drawing-canvas.line-mode {
+      pointer-events: auto;
+      cursor: crosshair;
+    }
+
+    /* Drawing toolbar */
+    .drawing-toolbar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 0 8px;
+      border-left: 1px solid #ccc;
+      margin-left: 8px;
+    }
+    .drawing-toolbar button {
+      padding: 4px 8px;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      background: white;
+      cursor: pointer;
+      font-size: 12px;
+    }
+    .drawing-toolbar button:hover {
+      background: #e0e0e0;
+    }
+    .drawing-toolbar button.active {
+      background: #4a90d9;
+      color: white;
+      border-color: #3a7bc8;
+    }
+    .drawing-toolbar input[type="color"] {
+      width: 28px;
+      height: 28px;
+      padding: 0;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    .drawing-toolbar input[type="range"] {
+      width: 60px;
+      cursor: pointer;
+    }
+    .drawing-toolbar .size-label {
+      font-size: 11px;
+      color: #666;
+      min-width: 20px;
+      text-align: center;
+    }
+    .drawing-toolbar .separator {
+      width: 1px;
+      height: 20px;
+      background: #ccc;
+      margin: 0 4px;
+    }
+
     .vocab-highlight {
       z-index: 10;
       position: absolute;
@@ -75,6 +146,14 @@
       background-color: rgba(255,213,79,0.5);
       border: 1px solid rgba(251,192,45,0.9);
       box-shadow: 0 0 8px rgba(251,192,45,0.5);
+    }
+
+    /* Disable highlight interactions when drawing */
+    .page.drawing-active .vocab-highlight {
+      pointer-events: none !important;
+    }
+    .page.drawing-active .textLayer {
+      pointer-events: none !important;
     }
 
     .vocab-tooltip {
@@ -171,6 +250,21 @@
           <option value="150">150%</option>
           <option value="200">200%</option>
         </select>
+
+        <div class="drawing-toolbar">
+          <button id="drawPenBtn" title="Bút vẽ (P)">✏️ Vẽ</button>
+          <button id="drawLineBtn" title="Đường thẳng ngang (L)">➖ Thẳng</button>
+          <input type="color" id="drawColor" value="#ff0000" title="Màu bút">
+          <span class="size-label" id="penSizeLabel">3</span>
+          <input type="range" id="penSize" min="1" max="20" value="3" title="Kích thước bút">
+          <div class="separator"></div>
+          <button id="drawEraserBtn" title="Tẩy (E)">🧹 Tẩy</button>
+          <span class="size-label" id="eraserSizeLabel">20</span>
+          <input type="range" id="eraserSize" min="5" max="60" value="20" title="Kích thước tẩy">
+          <div class="separator"></div>
+          <button id="drawClearBtn" title="Xóa tất cả trên trang này">🗑️</button>
+          <button id="drawClearAllBtn" title="Xóa toàn bộ vẽ">🗑️ All</button>
+        </div>
       </div>
     </div>
 
@@ -201,6 +295,8 @@
     let estimatedPageHeight = 800;
 
     let selectionTimeout = null;
+    let lastSelectionText = '';
+    let lastSelectionSentAt = 0;
     let pageUpdateTimer = null;
     let isNavigating = false;
 
@@ -213,6 +309,438 @@
 
     let viewerGen = 0;
     const renderingPages = new Map();
+
+    // ===== DRAWING STATE =====
+    let drawingMode = null; // null | 'pen' | 'line' | 'eraser'
+    let drawingColor = '#ff0000';
+    let penSize = 3;
+    let eraserSize = 20;
+    // Store drawings per page: Map<pageNumber, Array<{type, points, color, size}>>
+    const pageDrawings = new Map();
+    // Current stroke being drawn
+    let currentStroke = null;
+    let isDrawing = false;
+    // For line tool: start position
+    let lineStartPos = null;
+
+    function getDrawingStorageKey() {
+      return pdfIdFromParent ? `pdf-drawings-${pdfIdFromParent}` : null;
+    }
+
+    function saveDrawingsToStorage() {
+      const key = getDrawingStorageKey();
+      if (!key) return;
+      const data = {};
+      for (const [pg, strokes] of pageDrawings) {
+        data[pg] = strokes;
+      }
+      try {
+        localStorage.setItem(key, JSON.stringify(data));
+      } catch (e) { console.warn('Failed to save drawings', e); }
+    }
+
+    function loadDrawingsFromStorage() {
+      const key = getDrawingStorageKey();
+      if (!key) return;
+      try {
+        const raw = localStorage.getItem(key);
+        if (raw) {
+          const data = JSON.parse(raw);
+          pageDrawings.clear();
+          for (const pg in data) {
+            pageDrawings.set(parseInt(pg, 10), data[pg]);
+          }
+        }
+      } catch (e) { console.warn('Failed to load drawings', e); }
+    }
+
+    function setDrawingMode(mode) {
+      drawingMode = mode;
+      const penBtn = document.getElementById('drawPenBtn');
+      const lineBtn = document.getElementById('drawLineBtn');
+      const eraserBtn = document.getElementById('drawEraserBtn');
+      penBtn.classList.toggle('active', mode === 'pen');
+      lineBtn.classList.toggle('active', mode === 'line');
+      eraserBtn.classList.toggle('active', mode === 'eraser');
+
+      // When entering drawing mode, clear any text selection to prevent accidental translation
+      if (mode) {
+        try {
+          const selection = window.getSelection();
+          if (selection) selection.removeAllRanges();
+        } catch (e) {}
+        // Also reset last selection tracking to prevent duplicate sends
+        lastSelectionText = '';
+        lastSelectionSentAt = 0;
+      }
+
+      // Update all drawing canvases
+      document.querySelectorAll('.drawing-canvas').forEach(canvas => {
+        canvas.classList.remove('draw-mode', 'erase-mode', 'line-mode');
+        if (mode === 'pen') canvas.classList.add('draw-mode');
+        else if (mode === 'line') canvas.classList.add('line-mode');
+        else if (mode === 'eraser') canvas.classList.add('erase-mode');
+      });
+      
+      // Toggle drawing-active class on all pages to disable highlight interactions
+      document.querySelectorAll('.page').forEach(page => {
+        if (mode) {
+          page.classList.add('drawing-active');
+        } else {
+          page.classList.remove('drawing-active');
+        }
+      });
+    }
+
+    function getOrCreateDrawingCanvas(pageDiv) {
+      let canvas = pageDiv.querySelector('.drawing-canvas');
+      if (!canvas) {
+        canvas = document.createElement('canvas');
+        canvas.className = 'drawing-canvas';
+        pageDiv.appendChild(canvas);
+        setupDrawingCanvasEvents(canvas, pageDiv);
+      }
+      // Ensure canvas size matches page
+      const w = pageDiv.offsetWidth;
+      const h = pageDiv.offsetHeight;
+      if (canvas.width !== w || canvas.height !== h) {
+        canvas.width = w;
+        canvas.height = h;
+        // Redraw existing strokes after resize
+        const pgNum = parseInt(pageDiv.getAttribute('data-page-number'), 10);
+        redrawPageCanvas(canvas, pgNum);
+      }
+      // Apply current mode
+      canvas.classList.remove('draw-mode', 'erase-mode', 'line-mode');
+      if (drawingMode === 'pen') canvas.classList.add('draw-mode');
+      else if (drawingMode === 'line') canvas.classList.add('line-mode');
+      else if (drawingMode === 'eraser') canvas.classList.add('erase-mode');
+      return canvas;
+    }
+
+    function setupDrawingCanvasEvents(canvas, pageDiv) {
+      const pgNum = parseInt(pageDiv.getAttribute('data-page-number'), 10);
+      
+      // Create eraser cursor indicator
+      let eraserCursor = null;
+      function showEraserCursor(x, y) {
+        if (!eraserCursor) {
+          eraserCursor = document.createElement('div');
+          eraserCursor.style.position = 'fixed';
+          eraserCursor.style.border = '2px solid #333';
+          eraserCursor.style.background = 'rgba(255,255,255,0.5)';
+          eraserCursor.style.pointerEvents = 'none';
+          eraserCursor.style.zIndex = '10000';
+          document.body.appendChild(eraserCursor);
+        }
+        eraserCursor.style.width = eraserSize + 'px';
+        eraserCursor.style.height = eraserSize + 'px';
+        eraserCursor.style.left = (x - eraserSize / 2) + 'px';
+        eraserCursor.style.top = (y - eraserSize / 2) + 'px';
+        eraserCursor.style.display = 'block';
+      }
+      function hideEraserCursor() {
+        if (eraserCursor) eraserCursor.style.display = 'none';
+      }
+
+      function getPos(e) {
+        const rect = canvas.getBoundingClientRect();
+        const x = (e.clientX - rect.left) / rect.width;
+        const y = (e.clientY - rect.top) / rect.height;
+        return { x, y };
+      }
+      
+      canvas.addEventListener('mouseleave', () => {
+        hideEraserCursor();
+      });
+
+      canvas.addEventListener('mousedown', (e) => {
+        if (!drawingMode) return;
+        e.preventDefault();
+        isDrawing = true;
+        const pos = getPos(e);
+        if (drawingMode === 'pen') {
+          currentStroke = { type: 'pen', color: drawingColor, size: penSize, points: [pos] };
+        } else if (drawingMode === 'line') {
+          lineStartPos = pos;
+        } else if (drawingMode === 'eraser') {
+          eraseAt(pgNum, pos, eraserSize, canvas);
+          redrawPageCanvas(canvas, pgNum);
+        }
+      });
+
+      canvas.addEventListener('mousemove', (e) => {
+        // Always update eraser cursor position when in eraser mode
+        if (drawingMode === 'eraser') {
+          showEraserCursor(e.clientX, e.clientY);
+        }
+        
+        if (!isDrawing || !drawingMode) return;
+        const pos = getPos(e);
+        if (drawingMode === 'pen' && currentStroke) {
+          currentStroke.points.push(pos);
+          drawStrokeOnCanvas(canvas, currentStroke);
+        } else if (drawingMode === 'line' && lineStartPos) {
+          // Preview horizontal line (y stays same as start)
+          redrawPageCanvas(canvas, pgNum);
+          drawLinePreview(canvas, lineStartPos, pos);
+        } else if (drawingMode === 'eraser') {
+          eraseAt(pgNum, pos, eraserSize, canvas);
+          redrawPageCanvas(canvas, pgNum);
+        }
+      });
+
+      const endDraw = (e) => {
+        if (isDrawing && drawingMode === 'pen' && currentStroke && currentStroke.points.length > 0) {
+          if (!pageDrawings.has(pgNum)) pageDrawings.set(pgNum, []);
+          pageDrawings.get(pgNum).push(currentStroke);
+          saveDrawingsToStorage();
+        }
+        if (isDrawing && drawingMode === 'line' && lineStartPos && e) {
+          const pos = getPos(e);
+          // Create horizontal line stroke (y = start y)
+          const lineStroke = {
+            type: 'line',
+            color: drawingColor,
+            size: penSize,
+            points: [lineStartPos, { x: pos.x, y: lineStartPos.y }]
+          };
+          if (!pageDrawings.has(pgNum)) pageDrawings.set(pgNum, []);
+          pageDrawings.get(pgNum).push(lineStroke);
+          saveDrawingsToStorage();
+          redrawPageCanvas(canvas, pgNum);
+        }
+        if (isDrawing && drawingMode === 'eraser') {
+          finalizeEraseStroke(pgNum);
+        }
+        isDrawing = false;
+        currentStroke = null;
+        lineStartPos = null;
+      };
+
+      canvas.addEventListener('mouseup', endDraw);
+      canvas.addEventListener('mouseleave', endDraw);
+
+      // Touch support
+      canvas.addEventListener('touchstart', (e) => {
+        if (!drawingMode) return;
+        e.preventDefault();
+        const touch = e.touches[0];
+        const rect = canvas.getBoundingClientRect();
+        const pos = { x: (touch.clientX - rect.left) / rect.width, y: (touch.clientY - rect.top) / rect.height };
+        isDrawing = true;
+        if (drawingMode === 'pen') {
+          currentStroke = { type: 'pen', color: drawingColor, size: penSize, points: [pos] };
+        } else if (drawingMode === 'line') {
+          lineStartPos = pos;
+        } else if (drawingMode === 'eraser') {
+          eraseAt(pgNum, pos, eraserSize, canvas);
+          redrawPageCanvas(canvas, pgNum);
+        }
+      }, { passive: false });
+
+      canvas.addEventListener('touchmove', (e) => {
+        if (!isDrawing || !drawingMode) return;
+        e.preventDefault();
+        const touch = e.touches[0];
+        const rect = canvas.getBoundingClientRect();
+        const pos = { x: (touch.clientX - rect.left) / rect.width, y: (touch.clientY - rect.top) / rect.height };
+        if (drawingMode === 'pen' && currentStroke) {
+          currentStroke.points.push(pos);
+          drawStrokeOnCanvas(canvas, currentStroke);
+        } else if (drawingMode === 'line' && lineStartPos) {
+          redrawPageCanvas(canvas, pgNum);
+          drawLinePreview(canvas, lineStartPos, pos);
+        } else if (drawingMode === 'eraser') {
+          eraseAt(pgNum, pos, eraserSize, canvas);
+          redrawPageCanvas(canvas, pgNum);
+        }
+      }, { passive: false });
+
+      canvas.addEventListener('touchend', endDraw);
+      canvas.addEventListener('touchcancel', endDraw);
+    }
+
+    function drawStrokeOnCanvas(canvas, stroke) {
+      const ctx = canvas.getContext('2d');
+      if (stroke.points.length < 2) return;
+      ctx.save();
+      ctx.strokeStyle = stroke.color;
+      ctx.lineWidth = stroke.size;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.beginPath();
+      const first = stroke.points[0];
+      ctx.moveTo(first.x * canvas.width, first.y * canvas.height);
+      for (let i = 1; i < stroke.points.length; i++) {
+        const pt = stroke.points[i];
+        ctx.lineTo(pt.x * canvas.width, pt.y * canvas.height);
+      }
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    function drawLinePreview(canvas, startPos, endPos) {
+      const ctx = canvas.getContext('2d');
+      ctx.save();
+      ctx.strokeStyle = drawingColor;
+      ctx.lineWidth = penSize;
+      ctx.lineCap = 'round';
+      ctx.setLineDash([5, 5]); // Dashed preview
+      ctx.beginPath();
+      ctx.moveTo(startPos.x * canvas.width, startPos.y * canvas.height);
+      // Horizontal line: y stays same as start
+      ctx.lineTo(endPos.x * canvas.width, startPos.y * canvas.height);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    function redrawPageCanvas(canvas, pgNum) {
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      const strokes = pageDrawings.get(pgNum) || [];
+      for (const stroke of strokes) {
+        if (stroke.type === 'erase') {
+          drawEraseStrokeOnCanvas(canvas, stroke);
+        } else {
+          drawStrokeOnCanvas(canvas, stroke);
+        }
+      }
+    }
+    
+    function drawEraseStrokeOnCanvas(canvas, stroke) {
+      const ctx = canvas.getContext('2d');
+      ctx.save();
+      ctx.globalCompositeOperation = 'destination-out';
+      const size = stroke.size;
+      const halfSize = size / 2;
+      for (const pt of stroke.points) {
+        const x = pt.x * canvas.width - halfSize;
+        const y = pt.y * canvas.height - halfSize;
+        ctx.fillRect(x, y, size, size);
+      }
+      ctx.restore();
+    }
+
+    function eraseAt(pgNum, pos, size, canvas) {
+      // Paint-style eraser: erase pixels with a square shape
+      if (!canvas) return;
+      const ctx = canvas.getContext('2d');
+      const halfSize = size / 2;
+      const x = pos.x * canvas.width - halfSize;
+      const y = pos.y * canvas.height - halfSize;
+      
+      ctx.save();
+      ctx.globalCompositeOperation = 'destination-out'; // Erase pixels
+      ctx.fillRect(x, y, size, size);
+      ctx.restore();
+      
+      // Also store erase stroke for persistence
+      if (!pageDrawings.has(pgNum)) pageDrawings.set(pgNum, []);
+      const strokes = pageDrawings.get(pgNum);
+      // Check if last stroke is an ongoing erase stroke
+      const lastStroke = strokes[strokes.length - 1];
+      if (lastStroke && lastStroke.type === 'erase' && lastStroke._ongoing) {
+        lastStroke.points.push(pos);
+      } else {
+        strokes.push({ type: 'erase', size: size, points: [pos], _ongoing: true });
+      }
+    }
+    
+    function finalizeEraseStroke(pgNum) {
+      const strokes = pageDrawings.get(pgNum);
+      if (!strokes) return;
+      const lastStroke = strokes[strokes.length - 1];
+      if (lastStroke && lastStroke.type === 'erase' && lastStroke._ongoing) {
+        delete lastStroke._ongoing;
+        saveDrawingsToStorage();
+      }
+    }
+
+    function clearPageDrawings(pgNum) {
+      pageDrawings.set(pgNum, []);
+      saveDrawingsToStorage();
+      const pageDiv = document.querySelector(`.page[data-page-number="${pgNum}"]`);
+      if (pageDiv) {
+        const canvas = pageDiv.querySelector('.drawing-canvas');
+        if (canvas) {
+          const ctx = canvas.getContext('2d');
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+        }
+      }
+    }
+
+    function clearAllDrawings() {
+      pageDrawings.clear();
+      saveDrawingsToStorage();
+      document.querySelectorAll('.drawing-canvas').forEach(canvas => {
+        const ctx = canvas.getContext('2d');
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+      });
+    }
+
+    function initDrawingToolbar() {
+      const penBtn = document.getElementById('drawPenBtn');
+      const eraserBtn = document.getElementById('drawEraserBtn');
+      const colorInput = document.getElementById('drawColor');
+      const penSizeInput = document.getElementById('penSize');
+      const penSizeLabel = document.getElementById('penSizeLabel');
+      const eraserSizeInput = document.getElementById('eraserSize');
+      const eraserSizeLabel = document.getElementById('eraserSizeLabel');
+      const clearBtn = document.getElementById('drawClearBtn');
+      const clearAllBtn = document.getElementById('drawClearAllBtn');
+
+      penBtn.addEventListener('click', () => {
+        setDrawingMode(drawingMode === 'pen' ? null : 'pen');
+      });
+
+      const lineBtn = document.getElementById('drawLineBtn');
+      lineBtn.addEventListener('click', () => {
+        setDrawingMode(drawingMode === 'line' ? null : 'line');
+      });
+
+      eraserBtn.addEventListener('click', () => {
+        setDrawingMode(drawingMode === 'eraser' ? null : 'eraser');
+      });
+
+      colorInput.addEventListener('input', (e) => {
+        drawingColor = e.target.value;
+      });
+
+      penSizeInput.addEventListener('input', (e) => {
+        penSize = parseInt(e.target.value, 10);
+        penSizeLabel.textContent = penSize;
+      });
+
+      eraserSizeInput.addEventListener('input', (e) => {
+        eraserSize = parseInt(e.target.value, 10);
+        eraserSizeLabel.textContent = eraserSize;
+      });
+
+      clearBtn.addEventListener('click', () => {
+        clearPageDrawings(pageNum);
+      });
+
+      clearAllBtn.addEventListener('click', () => {
+        if (confirm('Xóa toàn bộ nét vẽ trên tất cả các trang?')) {
+          clearAllDrawings();
+        }
+      });
+
+      // Keyboard shortcuts
+      document.addEventListener('keydown', (e) => {
+        if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+        if (e.key.toLowerCase() === 'p') {
+          setDrawingMode(drawingMode === 'pen' ? null : 'pen');
+        } else if (e.key.toLowerCase() === 'l') {
+          setDrawingMode(drawingMode === 'line' ? null : 'line');
+        } else if (e.key.toLowerCase() === 'e') {
+          setDrawingMode(drawingMode === 'eraser' ? null : 'eraser');
+        } else if (e.key === 'Escape') {
+          setDrawingMode(null);
+        }
+      });
+    }
 
     function bumpViewerGen() {
       viewerGen += 1;
@@ -463,39 +991,58 @@
     }
 
     function extractContextSentence(plainText, selectedText) {
-      const p = (plainText || '').toLowerCase().replace(/\s+/g, ' ').trim();
+      const p = (plainText || '').replace(/\s+/g, ' ').trim();
+      const pLower = p.toLowerCase();
       const t = (selectedText || '').toLowerCase().replace(/\s+/g, ' ').trim();
       if (!p || !t) return '';
 
-      const idx = p.indexOf(t);
+      const idx = pLower.indexOf(t);
       if (idx < 0) return '';
 
-      // sentence boundaries: . ? ! or newline
-      const leftBound = Math.max(
-        p.lastIndexOf('.', idx - 1),
-        p.lastIndexOf('?', idx - 1),
-        p.lastIndexOf('!', idx - 1),
-        p.lastIndexOf('\n', idx - 1)
-      );
-      let start = leftBound >= 0 ? leftBound + 1 : Math.max(0, idx - 90);
-
-      const after = idx + t.length;
-      const candidates = [
-        p.indexOf('.', after),
-        p.indexOf('?', after),
-        p.indexOf('!', after),
-        p.indexOf('\n', after)
-      ].filter(n => n >= 0);
-      let end = candidates.length > 0 ? Math.min(...candidates) + 1 : Math.min(p.length, after + 90);
-
-      let sentence = p.slice(start, end).trim();
-      // Clamp very long outputs to a compact window
-      if (sentence.length > 220) {
-        const winStart = Math.max(0, idx - 90);
-        const winEnd = Math.min(p.length, after + 90);
-        sentence = p.slice(winStart, winEnd).trim();
+      // Helper: find previous sentence boundary
+      function findPrevBoundary(pos) {
+        if (pos <= 0) return 0;
+        const chars = ['.', '?', '!', '\n'];
+        let best = -1;
+        for (const ch of chars) {
+          const found = pLower.lastIndexOf(ch, pos - 1);
+          if (found > best) best = found;
+        }
+        return best >= 0 ? best + 1 : 0;
       }
-      return sentence;
+
+      // Helper: find next sentence boundary
+      function findNextBoundary(pos) {
+        const chars = ['.', '?', '!', '\n'];
+        let best = p.length;
+        for (const ch of chars) {
+          const found = pLower.indexOf(ch, pos);
+          if (found >= 0 && found < best) best = found;
+        }
+        return best < p.length ? best + 1 : p.length;
+      }
+
+      // Get the sentence containing the word
+      const sentStart = findPrevBoundary(idx);
+      const sentEnd = findNextBoundary(idx + t.length);
+
+      // Expand to include 2 sentences before
+      const prev1Start = findPrevBoundary(sentStart - 1);
+      const prev2Start = findPrevBoundary(prev1Start - 1);
+
+      // Expand to include 2 sentences after
+      const next1End = findNextBoundary(sentEnd);
+      const next2End = findNextBoundary(next1End);
+
+      let context = p.slice(prev2Start, next2End).trim();
+
+      // Clamp very long outputs
+      if (context.length > 600) {
+        const winStart = Math.max(0, idx - 250);
+        const winEnd = Math.min(p.length, idx + t.length + 250);
+        context = p.slice(winStart, winEnd).trim();
+      }
+      return context;
     }
 
     function findFirstTextDescendant(node) {
@@ -559,31 +1106,50 @@
       const lower = s.toLowerCase();
       const idx = Math.max(0, Math.min(Number.isFinite(index) ? index : 0, lower.length - 1));
 
-      // sentence boundaries: . ? ! or newline
-      const leftBound = Math.max(
-        lower.lastIndexOf('.', idx),
-        lower.lastIndexOf('?', idx),
-        lower.lastIndexOf('!', idx),
-        lower.lastIndexOf('\n', idx)
-      );
-      let start = leftBound >= 0 ? leftBound + 1 : Math.max(0, idx - 90);
-
-      const candidates = [
-        lower.indexOf('.', idx + 1),
-        lower.indexOf('?', idx + 1),
-        lower.indexOf('!', idx + 1),
-        lower.indexOf('\n', idx + 1)
-      ].filter(n => n >= 0);
-      let end = candidates.length > 0 ? Math.min(...candidates) + 1 : Math.min(lower.length, idx + 90);
-
-      let sentence = s.slice(start, end).trim();
-      // Clamp very long outputs to a compact window
-      if (sentence.length > 220) {
-        const winStart = Math.max(0, idx - 90);
-        const winEnd = Math.min(lower.length, idx + 90);
-        sentence = s.slice(winStart, winEnd).trim();
+      // Helper: find previous sentence boundary
+      function findPrevBoundary(pos) {
+        if (pos <= 0) return 0;
+        const chars = ['.', '?', '!', '\n'];
+        let best = -1;
+        for (const ch of chars) {
+          const found = lower.lastIndexOf(ch, pos - 1);
+          if (found > best) best = found;
+        }
+        return best >= 0 ? best + 1 : 0;
       }
-      return sentence;
+
+      // Helper: find next sentence boundary
+      function findNextBoundary(pos) {
+        const chars = ['.', '?', '!', '\n'];
+        let best = s.length;
+        for (const ch of chars) {
+          const found = lower.indexOf(ch, pos);
+          if (found >= 0 && found < best) best = found;
+        }
+        return best < s.length ? best + 1 : s.length;
+      }
+
+      // Get the sentence containing the word
+      const sentStart = findPrevBoundary(idx);
+      const sentEnd = findNextBoundary(idx + 1);
+
+      // Expand to include 2 sentences before
+      const prev1Start = findPrevBoundary(sentStart - 1);
+      const prev2Start = findPrevBoundary(prev1Start - 1);
+
+      // Expand to include 2 sentences after
+      const next1End = findNextBoundary(sentEnd);
+      const next2End = findNextBoundary(next1End);
+
+      let context = s.slice(prev2Start, next2End).trim();
+
+      // Clamp very long outputs
+      if (context.length > 600) {
+        const winStart = Math.max(0, idx - 250);
+        const winEnd = Math.min(s.length, idx + 250);
+        context = s.slice(winStart, winEnd).trim();
+      }
+      return context;
     }
 
     function renderHighlightsForPage(pageDiv, pageNumber) {
@@ -766,6 +1332,9 @@
           if (viewerGen !== genAtStart) return;
 
           renderHighlightsForPage(pageDiv, num);
+
+          // Add drawing canvas for this page
+          getOrCreateDrawingCanvas(pageDiv);
 
           renderedPages.add(num);
           observePage(pageDiv);
@@ -1091,6 +1660,9 @@
       if (event.data.type === "PDF_OPEN_BYTES" && event.data.bytes) {
         pdfIdFromParent = event.data.pdfId || null;
 
+        // Load saved drawings for this PDF
+        loadDrawingsFromStorage();
+
         waitForPdfJs().then(function () {
           const uint8Array = new Uint8Array(event.data.bytes);
           pdfjsLib.getDocument({ data: uint8Array }).promise.then(function (doc) {
@@ -1145,43 +1717,87 @@
       }
     });
 
-    document.addEventListener("mouseup", function () {
+    // Clear selection on any mousedown to prevent duplicate translations
+    document.addEventListener("mousedown", function () {
+      if (lastSelectionText) {
+        try {
+          const selection = window.getSelection();
+          if (selection) selection.removeAllRanges();
+        } catch (e) {}
+        lastSelectionText = '';
+        lastSelectionSentAt = 0;
+      }
+    });
+
+    document.addEventListener("mouseup", function (e) {
       if (selectionTimeout) return;
+      
+      // Skip translation if in drawing mode or clicking on drawing toolbar
+      if (drawingMode) return;
+      const toolbar = document.getElementById('drawingToolbar');
+      if (toolbar && toolbar.contains(e.target)) return;
 
       selectionTimeout = setTimeout(() => {
         selectionTimeout = null;
       }, 150);
 
-      const selection = window.getSelection();
-      if (!selection) return;
+      // Defer reading selection until after the browser finishes updating/clearing it.
+      // Without this, clicking elsewhere to clear a highlight can re-send the previous selection.
+      setTimeout(() => {
+        // Double-check drawing mode wasn't activated during the timeout
+        if (drawingMode) return;
+        
+        const selection = window.getSelection();
+        if (!selection) return;
 
-      const text = selection.toString().trim();
-      if (!text) return;
+        const text = selection.toString().trim();
+        if (!text) return;
 
-      try {
-        if (selection.rangeCount === 0) return;
+        // Prevent duplicate sends when a click elsewhere clears selection.
+        // Some browsers clear the visual highlight after the mouseup handler runs.
+        const now = Date.now();
+        if (text === lastSelectionText && now - lastSelectionSentAt < 800) {
+          return;
+        }
+        lastSelectionText = text;
+        lastSelectionSentAt = now;
 
-        const range = selection.getRangeAt(0);
+        try {
+          if (selection.rangeCount === 0) return;
 
-        const commonAncestor = range.commonAncestorContainer;
-        const pageDiv = commonAncestor.nodeType === 3
-          ? commonAncestor.parentElement?.closest(".page")
-          : commonAncestor.closest(".page");
+          const range = selection.getRangeAt(0);
+          const rects = range.getClientRects();
+          if (!rects || rects.length === 0) return;
 
-        if (!pageDiv) return;
+        // Get all page elements for multi-page detection
+        const allPages = document.querySelectorAll('.page[data-page-number]');
+        const pageRectsMap = new Map(); // pageNumber -> { pageDiv, rects: [] }
 
-        const pageNumber = parseInt(pageDiv.getAttribute("data-page-number") || "0", 10);
-        if (!pageNumber) return;
-
-        const pageRect = pageDiv.getBoundingClientRect();
-        if (pageRect.width === 0 || pageRect.height === 0) return;
-
-        const rects = range.getClientRects();
-        if (!rects || rects.length === 0) return;
-
-        const pctRects = [];
         for (let i = 0; i < rects.length; i++) {
           const r = rects[i];
+          if (r.width < 1 || r.height < 1) continue;
+
+          // Find which page contains this rect
+          let foundPageDiv = null;
+          const rectCenterX = r.left + r.width / 2;
+          const rectCenterY = r.top + r.height / 2;
+
+          for (const pageElement of allPages) {
+            const pageRect = pageElement.getBoundingClientRect();
+            if (rectCenterX >= pageRect.left && rectCenterX <= pageRect.right &&
+                rectCenterY >= pageRect.top && rectCenterY <= pageRect.bottom) {
+              foundPageDiv = pageElement;
+              break;
+            }
+          }
+
+          if (!foundPageDiv) continue;
+
+          const pageNumber = parseInt(foundPageDiv.getAttribute("data-page-number") || "0", 10);
+          if (!pageNumber) continue;
+
+          const pageRect = foundPageDiv.getBoundingClientRect();
+          if (pageRect.width === 0 || pageRect.height === 0) continue;
 
           const xPct = (r.left - pageRect.left) / pageRect.width;
           const yPct = (r.top - pageRect.top) / pageRect.height;
@@ -1189,16 +1805,40 @@
           const hPct = r.height / pageRect.height;
 
           if (wPct > 0 && hPct > 0 && xPct >= -0.01 && xPct <= 1.01) {
-            pctRects.push({
+            const rectData = {
               xPct: Math.max(0, Math.min(1, xPct)),
               yPct: Math.max(0, Math.min(1, yPct)),
               wPct,
               hPct
+            };
+
+            if (!pageRectsMap.has(pageNumber)) {
+              pageRectsMap.set(pageNumber, { pageDiv: foundPageDiv, rects: [] });
+            }
+            pageRectsMap.get(pageNumber).rects.push(rectData);
+          }
+        }
+
+        if (pageRectsMap.size === 0) return;
+
+        // Get sorted page numbers
+        const pageNumbers = Array.from(pageRectsMap.keys()).sort((a, b) => a - b);
+        const startPageNumber = pageNumbers[0];
+        const pageDiv = pageRectsMap.get(startPageNumber).pageDiv;
+        const pctRects = pageRectsMap.get(startPageNumber).rects;
+
+        // Build rectsWithPage for multi-page support
+        const allRectsWithPage = [];
+        for (const [pageNum, data] of pageRectsMap) {
+          for (const rect of data.rects) {
+            allRectsWithPage.push({
+              ...rect,
+              pageNumber: pageNum
             });
           }
         }
 
-        if (pctRects.length > 0) {
+        if (pctRects.length > 0 || allRectsWithPage.length > 0) {
           let contextSentenceEn = '';
 
           // Prefer sentence extraction based on the exact clicked/ended position in the text layer.
@@ -1210,23 +1850,29 @@
 
           // Fallback: old behavior (first occurrence search in cached plain text)
           if (!contextSentenceEn) {
-            const plainText = pagePlainTextByNumber.get(pageNumber) || '';
+            const plainText = pagePlainTextByNumber.get(startPageNumber) || '';
             contextSentenceEn = plainText ? extractContextSentence(plainText, text) : '';
           }
 
-          window.parent.postMessage({
-            type: "PDF_SELECTION",
-            text,
-            pageNumber,
-            rects: pctRects,
-            rectsPdf: pctRects,
-            contextSentenceEn
-          }, "*");
-        }
-      } catch (err) {
-        console.error('Selection error:', err);
-      }
+            window.parent.postMessage({
+              type: "PDF_SELECTION",
+              text,
+              pageNumber: startPageNumber,
+              rects: pctRects,
+              rectsPdf: pctRects,
+              rectsWithPage: allRectsWithPage,
+              pageNumbers: pageNumbers,
+              contextSentenceEn
+            }, "*");
+          }
+          } catch (err) {
+            console.error('Selection error:', err);
+          }
+        }, 0);
     });
+
+    // Initialize drawing toolbar
+    initDrawingToolbar();
 
     window.parent.postMessage({ type: "PDF_VIEWER_READY" }, "*");
   </script>

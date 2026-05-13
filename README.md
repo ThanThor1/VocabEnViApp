@@ -156,7 +156,7 @@ Các chức năng chính:
 	- **Edit**: sửa Word/Meaning/IPA/POS
 	- **Delete**
 	- **Speak**: phát âm bằng Web Speech API
-	- **Move selected / Copy selected**: chọn nhiều dòng và chuyển/copy sang file CSV khác
+	- **Move selected / Copy selected / Delete selected**: chọn nhiều dòng và chuyển/copy sang file CSV khác hoặc xóa
 
 ### 2.2. PDF Library + PDF Reader
 

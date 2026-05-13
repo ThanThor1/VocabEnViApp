@@ -13,13 +13,20 @@ const crypto = require('crypto')
 // Set stable, writable paths as early as possible and reduce noisy GPU cache errors.
 try {
   const STABLE_APP_NAME = app.isPackaged ? 'FunnyApp' : 'FunnyApp-dev'
-  const stableUserData = path.join(app.getPath('appData'), STABLE_APP_NAME)
-  app.setPath('userData', stableUserData)
+  const baseUserData = path.join(app.getPath('appData'), STABLE_APP_NAME)
+  // Keep userData stable so local app data (vocabulary, settings) is persistent.
+  try { fsSync.mkdirSync(baseUserData, { recursive: true }) } catch {}
+  app.setPath('userData', baseUserData)
   const cacheBase = path.join(app.getPath('temp'), `${STABLE_APP_NAME}-cache`)
   const cacheDir = app.isPackaged ? cacheBase : `${cacheBase}-${process.pid}`
+  try { fsSync.mkdirSync(cacheDir, { recursive: true }) } catch {}
   app.setPath('cache', cacheDir)
   // Explicitly tell Chromium where to put its disk cache.
   try { app.commandLine.appendSwitch('disk-cache-dir', cacheDir) } catch {}
+  if (!app.isPackaged) {
+    // Dev-only: avoid noisy cache write failures for Vite module URLs.
+    app.commandLine.appendSwitch('disable-http-cache')
+  }
   // Reduce noisy GPU cache errors without disabling GPU rendering entirely.
   app.commandLine.appendSwitch('disable-gpu-shader-disk-cache')
   app.commandLine.appendSwitch('disable-gpu-program-cache')
@@ -351,13 +358,67 @@ function sleepMs(ms, signal) {
   })
 }
 
+// Model priority list - try free-tier models first, then fallback
+const GOOGLE_AI_MODEL_PRIORITY = [
+  'gemini-2.5-flash-lite-preview',    // Gemini 2.5 Flash Lite (free tier, 10 RPM)
+  'gemini-2.5-flash-preview-05-20',   // Gemini 2.5 Flash (free tier, 5 RPM)
+  'gemini-3.0-flash-preview',         // Gemini 3 Flash (free tier, 5 RPM)
+  'gemma-3-27b-it',                   // Fallback: Gemma 3 27B
+]
+
 function getGoogleAiStudioConfig(payload) {
-  const model = process.env.GOOGLE_AI_STUDIO_MODEL || 'gemma-3-27b-it'
+  const model = process.env.GOOGLE_AI_STUDIO_MODEL || GOOGLE_AI_MODEL_PRIORITY[0]
   const endpoint = process.env.GOOGLE_AI_STUDIO_ENDPOINT || 'https://generativelanguage.googleapis.com/v1beta'
-  return { model, endpoint }
+  return { model, endpoint, modelPriority: GOOGLE_AI_MODEL_PRIORITY }
 }
 
-async function googleAiStudioGenerateContent({ key, endpoint, model, prompt, signal }) {
+// Try to generate content with model fallback
+async function googleAiStudioGenerateContentWithFallback({ key, endpoint, models, prompt, signal }) {
+  let lastError = null
+  
+  for (const model of models) {
+    try {
+      const result = await googleAiStudioGenerateContentSingle({ key, endpoint, model, prompt, signal })
+      return result
+    } catch (err) {
+      lastError = err
+      const errMsg = String(err?.message || err || '').toLowerCase()
+      // Retry with next model if:
+      // - Rate limit (429, RPM exceeded)
+      // - Daily quota exhausted (RPD exceeded)
+      // - Resource exhausted
+      // - Server temporarily unavailable (503)
+      // - Model not found
+      const shouldTryNextModel = 
+        errMsg.includes('429') || 
+        errMsg.includes('503') || 
+        errMsg.includes('quota') ||
+        errMsg.includes('resource_exhausted') ||
+        errMsg.includes('resourceexhausted') ||
+        errMsg.includes('rate limit') ||
+        errMsg.includes('rate_limit') ||
+        errMsg.includes('ratelimit') ||
+        errMsg.includes('daily limit') ||
+        errMsg.includes('per day') ||
+        errMsg.includes('requests per') ||
+        errMsg.includes('exceeded') ||
+        errMsg.includes('too many requests') ||
+        (errMsg.includes('model') && errMsg.includes('not found')) ||
+        (errMsg.includes('model') && errMsg.includes('not available'))
+      
+      if (!shouldTryNextModel) {
+        throw err // Other errors should propagate immediately
+      }
+      // Continue to next model
+      console.log(`[GoogleAI] Model ${model} exhausted/unavailable (${errMsg.slice(0, 100)}...), trying next model...`)
+    }
+  }
+  
+  throw lastError || new Error('All models exhausted')
+}
+
+// Single model generation (renamed from original)
+async function googleAiStudioGenerateContentSingle({ key, endpoint, model, prompt, signal }) {
   if (typeof fetch !== 'function') throw new Error('Global fetch is not available in Electron main process')
 
   const base = String(endpoint || '').replace(/\/+$/, '')
@@ -420,6 +481,16 @@ async function googleAiStudioGenerateContent({ key, endpoint, model, prompt, sig
   })
 }
 
+// Main entry point - uses model fallback
+async function googleAiStudioGenerateContent({ key, endpoint, model, prompt, signal }) {
+  // Build priority list: specified model first, then fallback models
+  const models = [model]
+  for (const m of GOOGLE_AI_MODEL_PRIORITY) {
+    if (!models.includes(m)) models.push(m)
+  }
+  return googleAiStudioGenerateContentWithFallback({ key, endpoint, models, prompt, signal })
+}
+
 function stripCodeFences(s) {
   const t = String(s || '').trim()
   if (!t) return ''
@@ -472,6 +543,180 @@ async function gemmaSuggestIpa({ key, endpoint, model, word, dialect, signal }) 
 
   const raw = await googleAiStudioGenerateContent({ key, endpoint, model, prompt, signal })
   return sanitizeIpaOutput(raw)
+}
+
+async function gemmaGetWordFamily({ key, endpoint, model, word, signal }) {
+  const wRaw = String(word || '').trim()
+  if (!wRaw) return { word: '', family: [] }
+  const w = wRaw
+
+  const isLikelyInflectedVerbForm = (s) => {
+    const t = String(s || '').trim().toLowerCase()
+    if (!t || t.length < 4) return false
+    if (t.includes(' ')) return false
+    // Extra safety: if Gemini returns inflected surface forms, drop them.
+    // (User requirement) If POS is Verb and ends with -ing/-ed => drop.
+    if (t.endsWith('ing') && t.length >= 5) return true
+    if (t.endsWith('ed') && t.length >= 4) return true
+    return false
+  }
+
+  const isInflectionRelation = (rel) => {
+    const r = String(rel || '').toLowerCase()
+    return (
+      r.includes('past') ||
+      r.includes('present') ||
+      r.includes('participle') ||
+      r.includes('gerund') ||
+      r.includes('3rd') ||
+      r.includes('third person') ||
+      r.includes('plural') ||
+      r.includes('inflection')
+    )
+  }
+
+  const normalizeFamilyWord = (wordOut, posOut) => {
+    let s = String(wordOut || '').trim()
+    s = s.replace(/^"+|"+$/g, '').replace(/\s+/g, ' ').trim()
+    const pos = normalizeGemmaPos(posOut || '') || ''
+    if (pos === 'Verb') {
+      s = s.replace(/^to\s+/i, '').trim()
+    }
+    return s
+  }
+
+  const allowedPos = [
+    'Noun',
+    'Verb',
+    'Adjective',
+    'Adverb',
+    'Pronoun',
+    'Preposition',
+    'Conjunction',
+    'Determiner',
+    'Interjection',
+    'Phrase',
+    'Other'
+  ]
+
+  const prompt =
+    `You are an English morphology expert.\n` +
+    `Task: Given an English headword, list its common word-family members (DERIVATIONAL lemmas learners should study).\n` +
+    `Headword: "${w}"\n` +
+    `\n` +
+    `Output MUST be valid JSON only (no markdown, no commentary).\n` +
+    `Schema:\n` +
+    `{\n` +
+    `  "word": string,\n` +
+    `  "family": [\n` +
+    `    { "word": string, "pos": one of ${JSON.stringify(allowedPos)}, "relation": string }\n` +
+    `  ]\n` +
+    `}\n` +
+    `Rules:\n` +
+    `- Include 0 to 8 items.\n` +
+    `- Exclude the headword itself.\n` +
+    `- Prefer the most common forms learners should study.\n` +
+    `- IMPORTANT: Do NOT include inflected forms (NO past tense, NO -ing, NO 3rd person -s, NO plural nouns).\n` +
+    `- If a family member is a VERB: output the BASE FORM/LEMMA only (e.g., "address", not "addresses", "addressed", "addressing").\n` +
+    `- If a family member is a NOUN: output the SINGULAR form only (e.g., "address", not "addresses").\n` +
+    `- relation should be short (e.g., "noun form", "verb form", "adjective form", "adverb form").\n`
+
+  const raw = await googleAiStudioGenerateContent({ key, endpoint, model, prompt, signal })
+  const obj = safeJsonParseObject(raw)
+  const list = Array.isArray(obj && obj.family) ? obj.family : []
+
+  const baseKey = String(w).toLowerCase()
+  const out = []
+  const seen = new Set()
+
+  for (const item of list) {
+    const ww = String(item && item.word ? item.word : '').trim()
+    if (!ww) continue
+    const pos = normalizeGemmaPos(item && item.pos ? item.pos : '') || ''
+    const relationRaw = String(item && item.relation ? item.relation : '').trim().slice(0, 64)
+    if (isInflectionRelation(relationRaw)) continue
+
+    const normalizedWord = normalizeFamilyWord(ww, pos)
+    if (!normalizedWord) continue
+    if (pos === 'Verb' && isLikelyInflectedVerbForm(normalizedWord)) continue
+    const keyWord = normalizedWord.toLowerCase()
+    if (keyWord === baseKey) continue
+    if (seen.has(keyWord)) continue
+    seen.add(keyWord)
+
+    out.push({ word: normalizedWord, pos, relation: relationRaw })
+    if (out.length >= 8) break
+  }
+
+  return { word: w, family: out }
+}
+
+async function gemmaGetSynonyms({ key, endpoint, model, word, signal }) {
+  const wRaw = String(word || '').trim()
+  if (!wRaw) return { word: '', synonyms: [] }
+  const w = wRaw
+
+  const allowedPos = [
+    'Noun',
+    'Verb',
+    'Adjective',
+    'Adverb',
+    'Pronoun',
+    'Preposition',
+    'Conjunction',
+    'Determiner',
+    'Interjection',
+    'Phrase',
+    'Other'
+  ]
+
+  const prompt =
+    `You are an English vocabulary teacher.\n` +
+    `Task: Given an English headword, list its common synonyms (words with similar meaning).\n` +
+    `Headword: "${w}"\n` +
+    `\n` +
+    `Output MUST be valid JSON only (no markdown, no commentary).\n` +
+    `Schema:\n` +
+    `{\n` +
+    `  "word": string,\n` +
+    `  "synonyms": [\n` +
+    `    { "word": string, "pos": one of ${JSON.stringify(allowedPos)}, "relation": string }\n` +
+    `  ]\n` +
+    `}\n` +
+    `Rules:\n` +
+    `- Include 0 to 8 items.\n` +
+    `- Exclude the headword itself.\n` +
+    `- Prefer single words (avoid multi-word phrases unless truly common).\n` +
+    `- relation should be short (e.g., "synonym").\n`
+
+  const raw = await googleAiStudioGenerateContent({ key, endpoint, model, prompt, signal })
+  const obj = safeJsonParseObject(raw)
+  const list = Array.isArray(obj && obj.synonyms) ? obj.synonyms : []
+
+  const baseKey = String(w).toLowerCase()
+  const out = []
+  const seen = new Set()
+
+  for (const item of list) {
+    const ww = String(item && item.word ? item.word : '').trim()
+    if (!ww) continue
+    const normalizedWord = ww
+      .replace(/^"+|"+$/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+    if (!normalizedWord) continue
+    const keyWord = normalizedWord.toLowerCase()
+    if (keyWord === baseKey) continue
+    if (seen.has(keyWord)) continue
+    seen.add(keyWord)
+
+    const pos = normalizeGemmaPos(item && item.pos ? item.pos : '') || ''
+    const relation = String(item && item.relation ? item.relation : 'synonym').trim().slice(0, 64) || 'synonym'
+    out.push({ word: normalizedWord, pos, relation })
+    if (out.length >= 8) break
+  }
+
+  return { word: w, synonyms: out }
 }
 
 function extractFirstJsonObject(s) {
@@ -596,23 +841,47 @@ async function gemmaSuggestMeaningCandidates({ key, endpoint, model, word, conte
     `}\n` +
     `Rules:\n` +
     `- Provide 3 to 7 candidates if possible.\n` +
+    `- Candidates should represent DISTINCT senses. Do NOT list minor synonym variations as separate candidates; merge them.\n` +
     `- Each candidate.vi should be a short Vietnamese gloss (not a full sentence).\n` +
     `- back: short English hints/synonyms (0-5 items).\n` +
-    `- meaningSuggested must exactly equal one of candidates[i].vi (best for the context).\n` +
+    (ctx
+      ? `- meaningSuggested must exactly equal one of candidates[i].vi (best for the context).\n`
+      : `- If NO context sentence is provided: meaningSuggested should be a semicolon-separated list of 1 to 3 DISTINCT senses, and each sense must exactly equal one of candidates[i].vi.\n`) +
     `- If the selected term is a multi-word expression, use pos="Phrase".\n`
 
   const raw = await googleAiStudioGenerateContent({ key, endpoint, model, prompt, signal })
   const obj = safeJsonParseObject(raw)
   const candidates = dedupeCandidates(obj && obj.candidates)
-  let meaningSuggested = obj && obj.meaningSuggested ? String(obj.meaningSuggested || '').trim() : ''
-  if (meaningSuggested) {
-    const found = candidates.find((c) => normalizeMeaningForMatch(c.vi) === normalizeMeaningForMatch(meaningSuggested))
-    if (found) meaningSuggested = found.vi
-    else meaningSuggested = ''
+  const hasContext = !!ctx
+  const meaningSuggestedRaw = obj && obj.meaningSuggested ? String(obj.meaningSuggested || '').trim() : ''
+  let meaningSuggested = ''
+
+  if (meaningSuggestedRaw) {
+    const exact = candidates.find((c) => normalizeMeaningForMatch(c.vi) === normalizeMeaningForMatch(meaningSuggestedRaw))
+    if (exact) {
+      meaningSuggested = exact.vi
+    } else if (!hasContext) {
+      const parts = splitMeaningList(meaningSuggestedRaw)
+      const picked = []
+      for (const p of parts) {
+        const found = candidates.find((c) => normalizeMeaningForMatch(c.vi) === normalizeMeaningForMatch(p))
+        if (!found) continue
+        if (picked.some((x) => meaningsTooClose(x, found.vi))) continue
+        picked.push(found.vi)
+        if (picked.length >= 3) break
+      }
+      if (picked.length > 0) meaningSuggested = picked.join('; ')
+    }
   }
 
-  // If model didn't follow the rule, pick the first candidate.
-  if (!meaningSuggested && candidates.length > 0) meaningSuggested = candidates[0].vi
+  if (!meaningSuggested && candidates.length > 0) {
+    if (!hasContext) {
+      const picked = selectDistinctMeaningsFromCandidates(candidates, 3)
+      meaningSuggested = picked.join('; ')
+    } else {
+      meaningSuggested = candidates[0].vi
+    }
+  }
 
   return { candidates, meaningSuggested, contextSentenceVi: '' }
 }
@@ -633,6 +902,293 @@ async function googleTranslatePlain({ key, endpoint, model, from, to, text, sign
 
   const out = await googleAiStudioGenerateContent({ key, endpoint, model, prompt, signal })
   return String(out || '').trim()
+}
+
+function normalizeLookupWord(word) {
+  return String(word || '')
+    .trim()
+    .replace(/^\s+|\s+$/g, '')
+    .replace(/^[^a-z0-9]+|[^a-z0-9]+$/gi, '')
+}
+
+function uniqueWords(words) {
+  const seen = new Set()
+  const result = []
+  for (const item of words) {
+    const clean = normalizeLookupWord(item)
+    const key = clean.toLowerCase()
+    if (!clean || seen.has(key)) continue
+    seen.add(key)
+    result.push(clean)
+  }
+  return result
+}
+
+function buildLookupCandidates(word) {
+  const cleanWord = normalizeLookupWord(word)
+  if (!cleanWord) return []
+
+  const lower = cleanWord.toLowerCase()
+  const candidates = [cleanWord, lower, lower.replace(/[’']s$/i, '')]
+
+  if (lower.endsWith('ies') && lower.length > 3) candidates.push(lower.slice(0, -3) + 'y')
+  if (lower.endsWith('ves') && lower.length > 3) {
+    candidates.push(lower.slice(0, -3) + 'f')
+    candidates.push(lower.slice(0, -3) + 'fe')
+  }
+  if (lower.endsWith('ing') && lower.length > 4) {
+    candidates.push(lower.slice(0, -3))
+    candidates.push(lower.slice(0, -3).replace(/([a-z])\1$/i, '$1'))
+  }
+  if (lower.endsWith('ed') && lower.length > 3) {
+    candidates.push(lower.slice(0, -2))
+    candidates.push(lower.slice(0, -1))
+  }
+  if (lower.endsWith('es') && lower.length > 3) candidates.push(lower.slice(0, -2))
+  if (lower.endsWith('s') && lower.length > 2) candidates.push(lower.slice(0, -1))
+
+  return uniqueWords(candidates)
+}
+
+function escapeRegex(text) {
+  return String(text || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function decodeHtmlEntities(text) {
+  return String(text || '')
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCharCode(parseInt(n, 16)))
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+}
+
+function cleanHtmlText(text) {
+  return decodeHtmlEntities(String(text || '').replace(/<[^>]+>/g, ' '))
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function extractClassBlocks(html, className) {
+  const source = String(html || '')
+  if (!source || !className) return []
+  const cls = escapeRegex(className)
+  const regex = new RegExp(`<([a-z0-9-]+)[^>]*class=["'][^"']*\\b${cls}\\b[^"']*["'][^>]*>([\\s\\S]*?)<\\/\\1>`, 'gi')
+  const out = []
+  let match
+  while ((match = regex.exec(source))) {
+    out.push(match[2] || '')
+  }
+  return out
+}
+
+function extractFirstClassText(html, className) {
+  const blocks = extractClassBlocks(html, className)
+  if (blocks.length === 0) return ''
+  return cleanHtmlText(blocks[0])
+}
+
+function parseBingDefinitionText(html) {
+  const source = String(html || '')
+  if (!source) return ''
+
+  const rootMatch = source.match(/<dict-common-module[\s\S]*?<\/dict-common-module>/i)
+  const root = rootMatch ? rootMatch[0] : source
+  const groups = extractClassBlocks(root, 'common-module-group')
+  const lines = []
+
+  for (const group of groups) {
+    const pos = extractFirstClassText(group, 'common-definitions-pos-inner') || 'other'
+    const itemBlocks = extractClassBlocks(group, 'common-definition-content')
+    const defs = []
+
+    for (const item of itemBlocks) {
+      const mainDef = extractFirstClassText(item, 'common-module-maindef') || cleanHtmlText(item)
+      if (!mainDef) continue
+      defs.push(mainDef)
+      if (defs.length >= 3) break
+    }
+
+    if (defs.length === 0) continue
+    lines.push(`[${pos}]`)
+    defs.forEach((def, idx) => {
+      lines.push(`  ${idx + 1}. ${def}`)
+    })
+  }
+
+  return lines.join('\n').trim()
+}
+
+let bingLookupWindow = null
+let bingLookupQueue = Promise.resolve()
+
+function queueBingLookup(task) {
+  const run = () => Promise.resolve().then(task)
+  const next = bingLookupQueue.then(run, run)
+  bingLookupQueue = next.catch(() => {})
+  return next
+}
+
+function getBingLookupWindow() {
+  if (bingLookupWindow && !bingLookupWindow.isDestroyed()) return bingLookupWindow
+  bingLookupWindow = new BrowserWindow({
+    show: false,
+    width: 1200,
+    height: 900,
+    webPreferences: {
+      sandbox: false,
+      contextIsolation: true,
+    },
+  })
+  bingLookupWindow.on('closed', () => {
+    bingLookupWindow = null
+  })
+  return bingLookupWindow
+}
+
+async function waitForBingDictCard(win, timeoutMs = 12000) {
+  const startedAt = Date.now()
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      const exists = await win.webContents.executeJavaScript(
+        "Boolean(document.querySelector('dict-common-module'))",
+        true
+      )
+      if (exists) return true
+    } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 250))
+  }
+  return false
+}
+
+async function extractBingDefinitionFromRenderedDom(win) {
+  return await win.webContents.executeJavaScript(
+    `(() => {
+      const card = document.querySelector('dict-common-module')
+      if (!card) return ''
+
+      const lines = []
+      const groups = card.querySelectorAll('.common-module-group')
+      for (const group of groups) {
+        const pos = (group.querySelector('.common-definitions-pos-inner')?.textContent || 'UNKNOWN').trim().toUpperCase()
+        const defs = []
+        const items = Array.from(group.querySelectorAll('li.common-definition-content')).slice(0, 2)
+        for (const item of items) {
+          const text = (item.querySelector('.common-module-maindef')?.textContent || '').trim()
+          if (text) defs.push(text)
+        }
+
+        if (defs.length === 0) continue
+        lines.push('[' + pos + ']')
+        defs.forEach((def, idx) => {
+          lines.push('  ' + (idx + 1) + '. ' + def)
+        })
+      }
+
+      return lines.join('\\n').trim()
+    })()`,
+    true
+  )
+}
+
+async function fetchBingDefinitionForCandidate(word) {
+  const query = `${word} meaning`
+  const url = `https://www.bing.com/search?q=${encodeURIComponent(query)}&setlang=en-US`
+  const resp = await fetch(url, {
+    headers: {
+      'accept-language': 'en-US,en;q=0.9',
+      'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    },
+  })
+  if (resp.ok) {
+    const html = await resp.text()
+    const parsed = parseBingDefinitionText(html)
+    if (parsed) return parsed
+  }
+
+  return await queueBingLookup(async () => {
+    try {
+      const win = getBingLookupWindow()
+      await win.loadURL(url, {
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      })
+      const hasCard = await waitForBingDictCard(win)
+      if (!hasCard) return ''
+      return String(await extractBingDefinitionFromRenderedDom(win) || '').trim()
+    } catch {
+      return ''
+    }
+  })
+}
+
+async function fetchEnglishDefinition(word) {
+  const cleanWord = String(word || '').trim()
+  if (!cleanWord) return ''
+
+  for (const candidate of buildLookupCandidates(cleanWord)) {
+    try {
+      const bingDefinition = await fetchBingDefinitionForCandidate(candidate)
+      if (bingDefinition) return bingDefinition
+    } catch {}
+  }
+
+  return ''
+}
+
+async function gemmaTranslateMeaningNoteVie({ key, endpoint, model, word, englishMeaning, contextSentenceEn, signal }) {
+  const source = String(englishMeaning || '').trim()
+  if (!source) return ''
+  const ctx = String(contextSentenceEn || '').trim()
+  const targetWord = String(word || '').trim()
+
+  const prompt =
+    `You are a professional English→Vietnamese dictionary translator.\n` +
+    `Task: Translate the following English dictionary definition into natural Vietnamese for a vocabulary note.\n` +
+    `Rules:\n` +
+    `- Output ONLY Vietnamese text, no commentary, no markdown.\n` +
+    `- Keep it faithful to the source definition and concise.\n` +
+    `- Do not add unrelated senses.\n` +
+    (targetWord ? `- Target word: "${targetWord}"\n` : '') +
+    (ctx ? `- Context sentence: "${ctx}"\n` : '') +
+    `\nENGLISH DEFINITION:\n<<<\n${source}\n>>>`
+
+  const out = await googleAiStudioGenerateContent({ key, endpoint, model, prompt, signal })
+  return String(out || '').trim().replace(/\s+/g, ' ')
+}
+
+async function gemmaGenerateMeaningNoteVi({ key, endpoint, model, word, meaningSuggested, contextSentenceEn, signal }) {
+  const w = String(word || '').trim()
+  const m = String(meaningSuggested || '').trim()
+  const ctx = String(contextSentenceEn || '').trim()
+  if (!w || !m) return ''
+
+  const prompt =
+    `You are a professional English->Vietnamese dictionary note writer.\n` +
+    `Task: Convert the given meaning into a short Vietnamese note for a vocabulary card.\n` +
+    `Rules:\n` +
+    `- Output ONLY Vietnamese text, no commentary, no markdown.\n` +
+    `- Keep the result concise and natural.\n` +
+    `- Preserve the intended sense.\n` +
+    (w ? `- Target word: "${w}"\n` : '') +
+    (ctx ? `- Context sentence: "${ctx}"\n` : '') +
+    `\nMEANING:\n<<<\n${m}\n>>>`
+
+  const out = await googleAiStudioGenerateContent({ key, endpoint, model, prompt, signal })
+  return String(out || '').trim().replace(/\s+/g, ' ')
+}
+
+function buildMeaningNoteViFallback(word, meaningSuggested, contextSentenceEn) {
+  const w = String(word || '').trim()
+  const m = String(meaningSuggested || '').trim()
+  const ctx = String(contextSentenceEn || '').trim()
+
+  if (m) return m
+  if (ctx) return ctx
+  if (w) return w
+  return ''
 }
 
 function normalizeMeaningForMatch(s) {
@@ -668,6 +1224,79 @@ function chooseMeaningByContext(candidates, contextSentenceVi) {
   })
 
   return matches[0].vi
+}
+
+function splitMeaningList(s) {
+  const raw = String(s || '').trim()
+  if (!raw) return []
+  const cleaned = raw
+    .replace(/[\r\n]+/g, ';')
+    .replace(/\u2022/g, ';')
+    .replace(/^\s*[-*]\s+/gm, '')
+  return cleaned
+    .split(/\s*(?:;|\/|\||,)+\s*/g)
+    .map((p) => String(p || '').trim())
+    .filter(Boolean)
+}
+
+function meaningsTooClose(a, b) {
+  const na = normalizeMeaningForMatch(a)
+  const nb = normalizeMeaningForMatch(b)
+  if (!na || !nb) return true
+  if (na === nb) return true
+  if (na.includes(nb) || nb.includes(na)) return true
+
+  const ta = na.split(' ').filter(Boolean)
+  const tb = nb.split(' ').filter(Boolean)
+  if (ta.length === 0 || tb.length === 0) return false
+
+  const setA = new Set(ta)
+  const setB = new Set(tb)
+  let inter = 0
+  for (const t of setA) {
+    if (setB.has(t)) inter++
+  }
+  const minSize = Math.min(setA.size, setB.size)
+  if (minSize <= 0) return false
+  const overlap = inter / minSize
+  return overlap >= 0.8
+}
+
+function selectDistinctMeaningsFromCandidates(candidates, maxCount) {
+  const list = Array.isArray(candidates) ? candidates : []
+  const out = []
+  const tryAdd = (c) => {
+    if (!c) return
+    const vi = String(c.vi || '').trim()
+    if (!vi) return
+    if (out.some((x) => meaningsTooClose(x, vi))) return
+    out.push(vi)
+  }
+
+  if (list.length === 0) return out
+
+  tryAdd(list[0])
+  const firstPos = normalizeGemmaPos(list[0] && list[0].pos ? list[0].pos : '') || String(list[0] && list[0].pos ? list[0].pos : '').trim()
+
+  // Prefer adding a meaning with a different POS when available.
+  if (out.length < maxCount && firstPos) {
+    for (const c of list) {
+      const pos = normalizeGemmaPos(c && c.pos ? c.pos : '') || String(c && c.pos ? c.pos : '').trim()
+      if (pos && pos !== firstPos) {
+        tryAdd(c)
+        if (out.length >= maxCount) break
+      }
+    }
+  }
+
+  if (out.length < maxCount) {
+    for (const c of list) {
+      tryAdd(c)
+      if (out.length >= maxCount) break
+    }
+  }
+
+  return out
 }
 
 function splitVietnameseCandidates(s) {
@@ -742,6 +1371,9 @@ async function autoMeaningCore(payload) {
       requestId,
       word: '',
       meaningSuggested: '',
+      meaningNoteEn: '',
+      meaningNoteVi: '',
+      meaningNoteVie: '',
       contextSentenceVi: '',
       candidates: []
     }
@@ -758,6 +1390,8 @@ async function autoMeaningCore(payload) {
     let candidates = []
     let contextSentenceVi = ''
     let meaningSuggested = ''
+    let meaningNoteEn = ''
+    let meaningNoteVi = ''
 
     // 1) Primary: Gemma suggests meanings + POS using context (LLM sense disambiguation).
     // If Google AI Studio key is missing, skip Gemma and rely on Azure dictionary fallback (or return empty).
@@ -787,6 +1421,29 @@ async function autoMeaningCore(payload) {
         meaningSuggested = String(gemma.meaningSuggested || '').trim()
       } catch (e) {
         // ignore Gemma errors; allow Azure fallback below
+      }
+
+      try {
+        meaningNoteEn = await fetchEnglishDefinition(word)
+      } catch (e) {
+        meaningNoteEn = ''
+      }
+
+      if (meaningNoteEn) {
+        try {
+          const translatedNote = await gemmaTranslateMeaningNoteVie({
+            key: sel.key,
+            endpoint: g.endpoint,
+            model: g.model,
+            word,
+            englishMeaning: meaningNoteEn,
+            contextSentenceEn,
+            signal: controller.signal
+          })
+          if (translatedNote) meaningNoteVi = translatedNote
+        } catch (e) {
+          // keep fallback below
+        }
       }
 
       // 2) Translate context sentence for display (still Gemma).
@@ -833,13 +1490,44 @@ async function autoMeaningCore(payload) {
     }
 
     if (!meaningSuggested && candidates.length > 0) {
-      meaningSuggested = candidates[0].vi
+      if (!contextSentenceEn) {
+        const picked = selectDistinctMeaningsFromCandidates(candidates, 3)
+        meaningSuggested = (picked && picked.length > 0 ? picked.join('; ') : candidates[0].vi)
+      } else {
+        meaningSuggested = candidates[0].vi
+      }
+    }
+
+    if (!meaningNoteVi && meaningSuggested) {
+      if (g && sel) {
+        try {
+          meaningNoteVi = await gemmaGenerateMeaningNoteVi({
+            key: sel.key,
+            endpoint: g.endpoint,
+            model: g.model,
+            word,
+            meaningSuggested,
+            contextSentenceEn,
+            signal: controller.signal
+          })
+        } catch (e) {
+          // ignore and fallback below
+        }
+      }
+      if (!meaningNoteVi) meaningNoteVi = buildMeaningNoteViFallback(word, meaningSuggested, contextSentenceEn)
+    }
+
+    if (!meaningSuggested && meaningNoteVi) {
+      meaningSuggested = meaningNoteVi
     }
 
     return {
       requestId,
       word,
       meaningSuggested: meaningSuggested || '',
+      meaningNoteEn: meaningNoteEn || '',
+      meaningNoteVi: meaningNoteVi || '',
+      meaningNoteVie: meaningNoteVi || '',
       contextSentenceVi: contextSentenceVi || '',
       candidates
     }
@@ -849,6 +1537,9 @@ async function autoMeaningCore(payload) {
         requestId,
         word,
         meaningSuggested: '',
+        meaningNoteEn: '',
+        meaningNoteVi: '',
+        meaningNoteVie: '',
         contextSentenceVi: '',
         candidates: []
       }
@@ -1441,6 +2132,30 @@ ipcMain.handle('translator:suggestIpa', async (ev, payload) => {
   }
 })
 
+ipcMain.handle('translator:getWordFamily', async (ev, payload) => {
+  const ctrl = new AbortController()
+  try {
+    const { model, endpoint } = getGoogleAiStudioConfig(payload)
+    const sel = await selectGoogleAiStudioKey(payload)
+    const word = payload && payload.word ? payload.word : ''
+    return await gemmaGetWordFamily({ key: sel.key, endpoint, model, word, signal: ctrl.signal })
+  } finally {
+    try { ctrl.abort() } catch {}
+  }
+})
+
+ipcMain.handle('translator:getSynonyms', async (ev, payload) => {
+  const ctrl = new AbortController()
+  try {
+    const { model, endpoint } = getGoogleAiStudioConfig(payload)
+    const sel = await selectGoogleAiStudioKey(payload)
+    const word = payload && payload.word ? payload.word : ''
+    return await gemmaGetSynonyms({ key: sel.key, endpoint, model, word, signal: ctrl.signal })
+  } finally {
+    try { ctrl.abort() } catch {}
+  }
+})
+
 // Copy a file or folder (relative paths)
 ipcMain.handle('copyPath', async (ev, srcRel, dstRel) => {
   try {
@@ -1707,6 +2422,12 @@ ipcMain.handle('translator:translatePlain', async (ev, payload) => {
   const g = getGoogleAiStudioConfig(req)
   const sel = await selectGoogleAiStudioKey(req)
   return await googleTranslatePlain({ key: sel.key, endpoint: g.endpoint, model: g.model, from, to, text })
+})
+
+ipcMain.handle('translator:fetchEnglishMeaning', async (ev, word) => {
+  const target = String(word || '').trim()
+  if (!target) return ''
+  return await fetchEnglishDefinition(target)
 })
 
 ipcMain.handle('settings:getGoogleAiStudioConcurrency', async () => {

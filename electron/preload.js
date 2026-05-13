@@ -2,6 +2,7 @@ const { contextBridge, ipcRenderer } = require('electron')
 
 // Keep track of wrappers so removeListener can remove the correct function
 const deckUpdatedWrappers = new Map();
+const googleAiKeyInvalidWrappers = new Map();
 
 contextBridge.exposeInMainWorld('api', {
   listTree: () => ipcRenderer.invoke('listTree'),
@@ -12,10 +13,12 @@ contextBridge.exposeInMainWorld('api', {
   deleteFolder: (relPath) => ipcRenderer.invoke('deleteFolder', relPath),
   readCsv: (relPath) => ipcRenderer.invoke('readCsv', relPath),
   addWord: (relPath, row) => ipcRenderer.invoke('addWord', relPath, row),
+  addWordsBulk: (relPath, rows) => ipcRenderer.invoke('addWordsBulk', relPath, rows),
   enhanceWordInBackground: (relPath, word, meaning, pronunciation, pos, example) =>
     ipcRenderer.invoke('enhanceWordInBackground', relPath, word, meaning, pronunciation, pos, example),
   deleteWord: (relPath, index) => ipcRenderer.invoke('deleteWord', relPath, index),
   editWord: (relPath, index, newData) => ipcRenderer.invoke('editWord', relPath, index, newData),
+  dedupeWords: (relPathOrAbs) => ipcRenderer.invoke('dedupeWords', relPathOrAbs),
   moveWords: (srcRel, dstRel, indices) => ipcRenderer.invoke('moveWords', srcRel, dstRel, indices),
   copyWords: (srcRel, dstRel, indices) => ipcRenderer.invoke('copyWords', srcRel, dstRel, indices),
   // file/folder operations
@@ -44,11 +47,26 @@ contextBridge.exposeInMainWorld('api', {
   ,
   enrichWord: (payload) => ipcRenderer.invoke('translator:enrichWord', payload)
   ,
+  enrichWordBulk: (payload) => ipcRenderer.invoke('translator:enrichWordBulk', payload)
+  ,
   suggestExampleSentence: (payload) => ipcRenderer.invoke('translator:suggestExampleSentence', payload)
   ,
   suggestIpa: (payload) => ipcRenderer.invoke('translator:suggestIpa', payload)
   ,
+  getWordFamily: (payload) => ipcRenderer.invoke('translator:getWordFamily', payload)
+  ,
+  getSynonyms: (payload) => ipcRenderer.invoke('translator:getSynonyms', payload)
+  ,
+  fetchEnglishMeaning: (word) => ipcRenderer.invoke('translator:fetchEnglishMeaning', word)
+  ,
+  translateMeaningNoteVie: (payload) => ipcRenderer.invoke('translator:translateMeaningNoteVie', payload)
+  ,
   translatePlain: (payload) => ipcRenderer.invoke('translator:translatePlain', payload)
+  ,
+  translateExplain: (payload) => ipcRenderer.invoke('translator:translateExplain', payload)
+  ,
+  // Export Smart Review (VocabularyStore localStorage) to a JSON file via main process
+  exportSmartReview: (rawJson) => ipcRenderer.invoke('exportSmartReview', rawJson)
   ,
   // Per-user settings (stored in userData/.env)
   getGoogleAiStudioStatus: () => ipcRenderer.invoke('settings:getGoogleAiStudioStatus'),
@@ -75,6 +93,19 @@ contextBridge.exposeInMainWorld('api', {
     if (wrapper) {
       ipcRenderer.removeListener('deck-updated', wrapper);
       deckUpdatedWrappers.delete(cb);
+    }
+  }
+  ,
+  onGoogleAiStudioKeyInvalid: (cb) => {
+    const wrapper = (ev, data) => cb && cb(data);
+    googleAiKeyInvalidWrappers.set(cb, wrapper);
+    ipcRenderer.on('google-ai-studio:key-invalid', wrapper);
+  },
+  offGoogleAiStudioKeyInvalid: (cb) => {
+    const wrapper = googleAiKeyInvalidWrappers.get(cb);
+    if (wrapper) {
+      ipcRenderer.removeListener('google-ai-studio:key-invalid', wrapper);
+      googleAiKeyInvalidWrappers.delete(cb);
     }
   }
 })

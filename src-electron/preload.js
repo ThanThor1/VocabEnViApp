@@ -46,6 +46,12 @@ contextBridge.exposeInMainWorld('api', {
   ,
   suggestIpa: (payload) => ipcRenderer.invoke('translator:suggestIpa', payload)
   ,
+  getWordFamily: (payload) => ipcRenderer.invoke('translator:getWordFamily', payload)
+  ,
+  getSynonyms: (payload) => ipcRenderer.invoke('translator:getSynonyms', payload)
+  ,
+  fetchEnglishMeaning: (word) => ipcRenderer.invoke('translator:fetchEnglishMeaning', word)
+  ,
   translatePlain: (payload) => ipcRenderer.invoke('translator:translatePlain', payload)
   ,
   // Per-user settings (stored in userData/.env)
